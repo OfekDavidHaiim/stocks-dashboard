@@ -1,0 +1,48 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyCharm / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+Active_Resources/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Operating System Files
+desktop.ini
+Thumbs.db
+.DS_Store
