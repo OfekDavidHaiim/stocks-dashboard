@@ -1,0 +1,39 @@
+{
+    "MY PROTFOLIO": [
+        {
+            "title": "DISCOUNT",
+            "tickers": [
+                "ORCL",
+                "CRM",
+                "ADBE",
+                "AUDC.TA",
+                "DSCT.TA",
+                "RSEL.TA",
+                "IMCO.TA",
+                "SLRM.TA"
+            ]
+        },
+        {
+            "title": "TRADESTATION",
+            "tickers": [
+                "MSFT",
+                "NKE",
+                "CELH",
+                "SOFI",
+                "V",
+                "SHAK",
+                "BABA",
+                "SPOT"
+            ]
+        }
+    ],
+    "מניות מצויינות שאני רוצה לקנות": [
+        {
+            "title": "General",
+            "tickers": [
+                "DXCM",
+                "AIZ"
+            ]
+        }
+    ]
+}

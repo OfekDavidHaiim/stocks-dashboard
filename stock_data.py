@@ -4,14 +4,76 @@ import pandas as pd
 import plotly.graph_objects as go
 import urllib.parse
 import requests
+import os
+import json
+
+WATCHLISTS_FILE = "watchlists.json"
+
+def load_watchlists():
+    default_watchlists = {
+        "Main Watchlist": [{"title": "General", "tickers": ['MSFT', 'SPOT', 'MELI', 'SOFI', 'SHAK', 'CELH', 'CRM', 'ADBE', 'V', 'NKE', 'ORCL', 'AUDC']}],
+        "Semiconductors": [{"title": "General", "tickers": ['NVDA', 'AMD', 'TSM', 'ASML', 'AVGO', 'INTC']}],
+        "Finance": [{"title": "General", "tickers": ['JPM', 'BAC', 'MS', 'GS', 'V', 'MA']}]
+    }
+    if not os.path.exists(WATCHLISTS_FILE):
+        return default_watchlists
+    try:
+        with open(WATCHLISTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cleaned_data = {}
+            for name, content in data.items():
+                if isinstance(content, list):
+                    # Check if it is the new format (list of dicts with title & tickers)
+                    # or the old format (list of strings)
+                    is_new_format = True
+                    for item in content:
+                        if not isinstance(item, dict) or "title" not in item or "tickers" not in item:
+                            is_new_format = False
+                            break
+                    
+                    if is_new_format:
+                        sections = []
+                        for section in content:
+                            cleaned_tickers = [str(t).upper().strip() for t in section.get("tickers", []) if t]
+                            sections.append({
+                                "title": str(section.get("title", "General")),
+                                "tickers": cleaned_tickers
+                            })
+                        cleaned_data[str(name)] = sections
+                    else:
+                        # Old format: flat list of tickers
+                        cleaned_tickers = [str(t).upper().strip() for t in content if t]
+                        cleaned_data[str(name)] = [{"title": "General", "tickers": cleaned_tickers}]
+                else:
+                    cleaned_data[str(name)] = [{"title": "General", "tickers": []}]
+            return cleaned_data if cleaned_data else default_watchlists
+        return default_watchlists
+    except Exception:
+        return default_watchlists
+
+def save_watchlists(watchlists_dict):
+    try:
+        with open(WATCHLISTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(watchlists_dict, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
 
 # --- Internationalization ---
 from translations import TRANSLATIONS
 
+def cs() -> str:
+    """Get dynamic currency symbol based on current stock currency."""
+    return st.session_state.get("currency_symbol", "$")
+
 def tr(key: str) -> str:
-    """Translate UI string based on selected language."""
+    """Translate UI string based on selected language and handle dynamic currency symbols."""
     lang = st.session_state.get("language", "en")
-    return TRANSLATIONS.get(lang, {}).get(key, key)
+    val = TRANSLATIONS.get(lang, {}).get(key, key)
+    symbol = cs()
+    if symbol != "$" and isinstance(val, str):
+        val = val.replace("$", symbol)
+    return val
 
 @st.cache_data
 def translate_text(text: str, sl: str = "en", tl: str = "he") -> str:
@@ -51,9 +113,14 @@ def get_label(label_en: str) -> str:
     return translate_text(label_en) if st.session_state.get("language", "en") == "he" else label_en
 
 # --- Session State Initialization ---
-if 'watchlist' not in st.session_state:
-    st.session_state.watchlist = ['MSFT', 'SPOT', 'MELI', 'SOFI', 'SHAK', 'CELH', 'CRM', 'ADBE', 'V', 'NKE', 'ORCL',
-                                  'AUDC']
+if 'watchlists' not in st.session_state:
+    st.session_state.watchlists = load_watchlists()
+
+if 'active_watchlist' not in st.session_state:
+    st.session_state.active_watchlist = list(st.session_state.watchlists.keys())[0]
+
+# Maintain reference list for read functions
+st.session_state.watchlist = st.session_state.watchlists.get(st.session_state.active_watchlist, [])
 
 if 'selected_ticker' not in st.session_state:
     st.session_state.selected_ticker = 'MSFT'
@@ -65,11 +132,131 @@ if 'page_selector' not in st.session_state:
 if "country" not in st.session_state:
     st.session_state.country = "USA"
 
+if "currency_symbol" not in st.session_state:
+    st.session_state.currency_symbol = "$"
+
 country_options = [tr("usa"), tr("israel")]
 country_index = 0 if st.session_state.country == "USA" else 1
 selected_country_label = st.sidebar.selectbox(tr("select_country"), country_options, index=country_index)
-st.session_state.country = "USA" if selected_country_label == tr("usa") else "Israel"
+
+new_country = "USA" if selected_country_label == tr("usa") else "Israel"
+if new_country != st.session_state.country:
+    st.session_state.country = new_country
+    st.session_state.language = "en" if new_country == "USA" else "he"
+    st.session_state.selected_ticker = "MSFT" if new_country == "USA" else "NICE.TA"
+    st.session_state.currency_symbol = "$" if new_country == "USA" else "₪"
+    st.rerun()
+
 st.session_state.language = "en" if st.session_state.country == "USA" else "he"
+
+# --- Global Premium Styling & Typography Injection ---
+st.markdown(
+    """
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Rubik:wght@300;400;500;600;700&display=swap');
+        
+        /* Global TradingView Dark Theme styling */
+        html, body, [data-testid="stAppViewContainer"], .main {
+            background-color: #131722 !important;
+            color: #d1d4dc !important;
+            font-family: 'Outfit', 'Rubik', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+        }
+        
+        /* Sidebar styling */
+        section[data-testid="stSidebar"] {
+            background-color: #1c2030 !important;
+            border-right: 1px solid #2a2e39 !important;
+        }
+        section[data-testid="stSidebar"] * {
+            color: #d1d4dc !important;
+            font-family: 'Outfit', 'Rubik', sans-serif !important;
+        }
+        
+        /* Headers */
+        h1, h2, h3, h4, h5, h6 {
+            color: #ffffff !important;
+            font-family: 'Outfit', 'Rubik', sans-serif !important;
+            font-weight: 600 !important;
+        }
+        
+        /* Inputs & Selectboxes */
+        input, select, textarea, div[data-baseweb="input"], div[data-baseweb="select"], .stSelectbox, .stTextInput {
+            background-color: #1c2030 !important;
+            color: #ffffff !important;
+        }
+        
+        /* Styled sub-elements of selects & inputs */
+        div[role="listbox"], div[role="option"], ul {
+            background-color: #1c2030 !important;
+            color: #ffffff !important;
+            border: 1px solid #2a2e39 !important;
+        }
+        
+        /* Buttons */
+        div.stButton > button {
+            background-color: #2962ff !important;
+            color: #ffffff !important;
+            border: none !important;
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+            font-family: 'Outfit', 'Rubik', sans-serif !important;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        }
+        div.stButton > button:hover {
+            background-color: #1e4bd8 !important;
+            color: #ffffff !important;
+            transform: translateY(-1px) !important;
+            box-shadow: 0 4px 12px rgba(41, 98, 255, 0.3) !important;
+        }
+        
+        /* Expanders */
+        div[data-testid="stExpander"] {
+            background-color: #1c2030 !important;
+            border: 1px solid #2a2e39 !important;
+            border-radius: 8px !important;
+        }
+        
+        /* Tabs navigation */
+        button[data-testid="stTabBarTab"] {
+            color: #848e9c !important;
+            background-color: transparent !important;
+            border: none !important;
+            font-weight: 500 !important;
+            font-family: 'Outfit', 'Rubik', sans-serif !important;
+            transition: all 0.2s ease !important;
+        }
+        button[data-testid="stTabBarTab"]:hover {
+            color: #ffffff !important;
+        }
+        button[data-testid="stTabBarTab"][aria-selected="true"] {
+            color: #2962ff !important;
+            border-bottom: 2px solid #2962ff !important;
+        }
+        
+        /* Metric cards */
+        div[data-testid="metric-container"] {
+            background-color: #1c2030 !important;
+            border: 1px solid #2a2e39 !important;
+            border-radius: 8px !important;
+            padding: 15px !important;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3) !important;
+        }
+        div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+        div[data-testid="metric-container"] [data-testid="stMetricLabel"] {
+            color: #848e9c !important;
+        }
+        
+        /* Horizontal Rule */
+        hr {
+            border-top: 1px solid #2a2e39 !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # --- RTL Styling Injection if Hebrew is Selected ---
 if st.session_state.language == "he":
@@ -88,6 +275,9 @@ if st.session_state.language == "he":
                 display: block;
             }
             /* Correct column visual ordering in RTL */
+            [data-testid="stHorizontalBlock"] {
+                flex-direction: row-reverse !important;
+            }
             [data-testid="column"] {
                 direction: rtl !important;
                 text-align: right !important;
@@ -96,13 +286,526 @@ if st.session_state.language == "he":
             [data-testid="stSidebarNav"] {
                 direction: rtl !important;
             }
+            /* Adjust tabs alignment in RTL */
+            [data-testid="stTabBar"] {
+                direction: rtl !important;
+            }
         </style>
         """,
         unsafe_allow_html=True
     )
 
 
+# --- TradingView Plotly Custom Styling & Monkeypatch ---
+_orig_plotly_chart = st.plotly_chart
+
+def apply_tradingview_plotly_style(fig):
+    if fig is None:
+        return None
+    
+    bg_color = '#1c2030'
+    grid_color = '#2a2e39'
+    text_color = '#d1d4dc'
+    title_color = '#ffffff'
+    
+    if hasattr(fig, 'update_layout'):
+        fig.update_layout(
+            paper_bgcolor=bg_color,
+            plot_bgcolor=bg_color,
+            font=dict(
+                family="'Outfit', 'Rubik', -apple-system, sans-serif",
+                color=text_color,
+                size=12
+            ),
+            title_font=dict(
+                family="'Outfit', 'Rubik', -apple-system, sans-serif",
+                color=title_color,
+                size=15
+            )
+        )
+        # Update legend
+        fig.update_layout(
+            legend=dict(
+                bgcolor='rgba(28, 32, 48, 0.8)',
+                bordercolor=grid_color,
+                borderwidth=1,
+                font=dict(color=text_color, size=10)
+            )
+        )
+        
+    if hasattr(fig, 'update_xaxes'):
+        fig.update_xaxes(
+            showgrid=True,
+            gridcolor=grid_color,
+            linecolor=grid_color,
+            zerolinecolor=grid_color,
+            title_font=dict(color=text_color, size=11),
+            tickfont=dict(color=text_color, size=10)
+        )
+        
+    if hasattr(fig, 'update_yaxes'):
+        fig.update_yaxes(
+            showgrid=True,
+            gridcolor=grid_color,
+            linecolor=grid_color,
+            zerolinecolor=grid_color,
+            title_font=dict(color=text_color, size=11),
+            tickfont=dict(color=text_color, size=10)
+        )
+        
+    if hasattr(fig, 'layout'):
+        if hasattr(fig.layout, 'annotations') and fig.layout.annotations:
+            for ann in fig.layout.annotations:
+                if hasattr(ann, 'font') and ann.font:
+                    if getattr(ann.font, 'color', None) in ['#4A5568', '#1A365D', 'black', 'rgba(0,0,0,1)', 'rgba(0,0,0,0.8)']:
+                        ann.font.color = '#848e9c'
+                    ann.font.family = "'Outfit', 'Rubik', sans-serif"
+                    
+    return fig
+
+def plotly_chart_styled(fig, use_container_width=True, **kwargs):
+    styled_fig = apply_tradingview_plotly_style(fig)
+    return _orig_plotly_chart(styled_fig, use_container_width=use_container_width, **kwargs)
+
+st.plotly_chart = plotly_chart_styled
+
+@st.cache_data(ttl=86400)
+def get_company_name(ticker_symbol: str) -> str:
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        if stock.info and 'longName' in stock.info:
+            return stock.info['longName']
+    except Exception:
+        pass
+    return ticker_symbol
+
+def calculate_technical_consensus(df: pd.DataFrame):
+    if df.empty or len(df) < 14:
+        return 50.0, tr("hold"), 50.0, 0.0, 0.0, 0.0
+        
+    close = df['Close']
+    current_price = close.iloc[-1]
+    
+    sma_50 = close.rolling(window=50).mean().iloc[-1] if len(close) >= 50 else current_price
+    sma_200 = close.rolling(window=200).mean().iloc[-1] if len(close) >= 200 else current_price
+    
+    # RSI
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ema_up = up.ewm(com=13, adjust=False).mean()
+    ema_down = down.ewm(com=13, adjust=False).mean()
+    rs = ema_up / (ema_down + 1e-10)
+    rsi_series = 100 - (100 / (1 + rs))
+    rsi = rsi_series.iloc[-1]
+    
+    buy_signals = 0
+    sell_signals = 0
+    neutral_signals = 0
+    
+    if rsi < 30:
+        buy_signals += 2
+    elif rsi < 45:
+        buy_signals += 1
+    elif rsi > 70:
+        sell_signals += 2
+    elif rsi > 55:
+        sell_signals += 1
+    else:
+        neutral_signals += 1
+        
+    if current_price > sma_50:
+        buy_signals += 1
+    else:
+        sell_signals += 1
+        
+    if current_price > sma_200:
+        buy_signals += 1
+    else:
+        sell_signals += 1
+        
+    if sma_50 > sma_200:
+        buy_signals += 1
+    else:
+        sell_signals += 1
+        
+    total_signals = buy_signals + sell_signals + neutral_signals
+    if total_signals > 0:
+        gauge_value = (buy_signals / total_signals) * 100
+    else:
+        gauge_value = 50.0
+        
+    if gauge_value >= 80:
+        rec = tr("strong_buy")
+    elif gauge_value >= 60:
+        rec = tr("buy")
+    elif gauge_value >= 40:
+        rec = tr("hold")
+    elif gauge_value >= 20:
+        rec = tr("sell")
+    else:
+        rec = tr("strong_sell")
+        
+    return gauge_value, rec, rsi, sma_50, sma_200, current_price
+
+def create_technical_gauge(gauge_value, recommendation):
+    title_text = "קונצנזוס טכני" if st.session_state.language == "he" else "Technical Consensus"
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = gauge_value,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': f"<b>{title_text}: {recommendation}</b>", 'font': {'size': 14, 'color': '#ffffff'}},
+        gauge = {
+            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "#848e9c", 'tickvals': [10, 30, 50, 70, 90], 'ticktext': [tr("strong_sell"), tr("sell"), tr("hold"), tr("buy"), tr("strong_buy")]},
+            'bar': {'color': "#2962ff", 'thickness': 0.25},
+            'bgcolor': "#1c2030",
+            'borderwidth': 2,
+            'bordercolor': "#2a2e39",
+            'steps': [
+                {'range': [0, 30], 'color': 'rgba(242, 54, 69, 0.15)'},
+                {'range': [30, 45], 'color': 'rgba(242, 54, 69, 0.08)'},
+                {'range': [45, 55], 'color': 'rgba(132, 142, 156, 0.08)'},
+                {'range': [55, 70], 'color': 'rgba(8, 153, 129, 0.08)'},
+                {'range': [70, 100], 'color': 'rgba(8, 153, 129, 0.15)'}
+            ],
+            'threshold': {
+                'line': {'color': "#2962ff", 'width': 4},
+                'thickness': 0.75,
+                'value': gauge_value
+            }
+        }
+    ))
+    fig.update_layout(
+        paper_bgcolor='#1c2030',
+        plot_bgcolor='#1c2030',
+        height=280,
+        margin=dict(l=30, r=30, t=50, b=20)
+    )
+    return fig
+
+
+def render_financial_forecasting_tab(df_fin_a):
+    if df_fin_a is None or df_fin_a.empty:
+        st.info("נתוני דוחות פיננסיים שנתיים אינם זמינים עבור מניה זו לצורך חישוב תחזיות." if st.session_state.language == 'he' else "Annual financial statement data is not available for this stock to calculate projections.")
+        return
+
+    # Check for columns
+    rev_col = 'Total Revenue' if 'Total Revenue' in df_fin_a.columns else ('Operating Revenue' if 'Operating Revenue' in df_fin_a.columns else None)
+    ni_col = 'Net Income' if 'Net Income' in df_fin_a.columns else None
+
+    if not rev_col and not ni_col:
+        st.info("לא נמצאו עמודות הכנסות או רווח נקי בדוחות השנתיים." if st.session_state.language == 'he' else "No revenue or net income columns found in annual reports.")
+        return
+
+    title_text = "תחזית צמיחה פיננסית" if st.session_state.language == 'he' else "Financial Growth Projections"
+    st.markdown(f"### 🔮 {title_text}")
+    
+    methodology_desc = (
+        "תחזית זו מבוססת על ממוצע רבעוני שנתי (הכנסות ורווחים שנתיים חלקי 4). "
+        "המערכת מחשבת את קצב הצמיחה ההיסטורי ומאפשרת לך להשליך אותו קדימה רבעון אחר רבעון."
+        if st.session_state.language == 'he' else
+        "This projection is based on the annual values divided by 4 to get the average quarterly figures. "
+        "It calculates historical growth rates and projects them forward quarter by quarter."
+    )
+    st.info(methodology_desc)
+
+    # Prepare historical data (sort years ascending, up to last 4 years)
+    df_sorted = df_fin_a.sort_index(ascending=True)
+    # Filter years with valid data
+    valid_years = df_sorted.index.tolist()
+    if len(valid_years) < 2:
+        st.warning("נדרשת היסטוריה של שנתיים לפחות כדי לחשב קצב צמיחה." if st.session_state.language == 'he' else "At least 2 years of history are required to calculate growth rates.")
+        return
+        
+    hist_years = valid_years[-4:]
+    df_hist = df_sorted.loc[hist_years]
+    
+    sym = cs()
+    
+    # Calculate historical growth rates
+    hist_rev = []
+    rev_growths = []
+    if rev_col and rev_col in df_hist.columns:
+        hist_rev = df_hist[rev_col].dropna().tolist()
+        for i in range(1, len(hist_rev)):
+            if hist_rev[i-1] != 0:
+                rev_growths.append((hist_rev[i] - hist_rev[i-1]) / abs(hist_rev[i-1]))
+    
+    hist_ni = []
+    ni_growths = []
+    if ni_col and ni_col in df_hist.columns:
+        hist_ni = df_hist[ni_col].dropna().tolist()
+        for i in range(1, len(hist_ni)):
+            if hist_ni[i-1] != 0:
+                ni_growths.append((hist_ni[i] - hist_ni[i-1]) / abs(hist_ni[i-1]))
+
+    avg_rev_growth = sum(rev_growths) / len(rev_growths) if rev_growths else 0.10
+    avg_ni_growth = sum(ni_growths) / len(ni_growths) if ni_growths else 0.10
+    
+    avg_rev_growth = max(-0.5, min(1.0, avg_rev_growth))
+    avg_ni_growth = max(-0.5, min(1.0, avg_ni_growth))
+    
+    col_c1, col_c2, col_c3 = st.columns(3)
+    
+    with col_c1:
+        rev_growth_pct = st.slider(
+            "קצב צמיחה שנתי חזוי להכנסות (%)" if st.session_state.language == 'he' else "Projected Revenue Annual Growth (%)",
+            min_value=-50.0, max_value=100.0,
+            value=float(round(avg_rev_growth * 100, 1)),
+            step=0.1,
+            key="proj_rev_growth"
+        ) / 100.0
+
+    with col_c2:
+        ni_growth_pct = st.slider(
+            "קצב צמיחה שנתי חזוי לרווח נקי (%)" if st.session_state.language == 'he' else "Projected Net Income Annual Growth (%)",
+            min_value=-50.0, max_value=100.0,
+            value=float(round(avg_ni_growth * 100, 1)),
+            step=0.1,
+            key="proj_ni_growth"
+        ) / 100.0
+
+    with col_c3:
+        horizon_quarters = st.selectbox(
+            "טווח תחזית (רבעונים)" if st.session_state.language == 'he' else "Forecasting Horizon (Quarters)",
+            options=[4, 8, 12, 16],
+            index=2,
+            key="proj_horizon"
+        )
+
+    view_mode = st.radio(
+        "בחר אופן תצוגה:" if st.session_state.language == 'he' else "Select Visualization Mode:",
+        options=["רבעוני (ממוצע לרבעון)" if st.session_state.language == 'he' else "Quarterly (Average per Quarter)",
+                 "שנתי (סך הכל שנתי)" if st.session_state.language == 'he' else "Annual (Annual Total)"],
+        horizontal=True,
+        key="proj_view_mode"
+    )
+    is_quarterly_mode = "רבעוני" in view_mode or "Quarterly" in view_mode
+
+    last_year = hist_years[-1]
+    last_rev = df_hist.loc[last_year, rev_col] if (rev_col and rev_col in df_hist.columns and not pd.isna(df_hist.loc[last_year, rev_col])) else 0
+    last_ni = df_hist.loc[last_year, ni_col] if (ni_col and ni_col in df_hist.columns and not pd.isna(df_hist.loc[last_year, ni_col])) else 0
+    
+    divisor = 1e9 if max(abs(last_rev), abs(last_ni)) > 1e9 else 1e6
+    if st.session_state.language == 'he':
+        unit_label = "מיליארד" if divisor == 1e9 else "מיליון"
+    else:
+        unit_label = "Billion" if divisor == 1e9 else "Million"
+
+    rev_q_growth = (1 + rev_growth_pct)**(0.25) - 1 if rev_growth_pct > -1 else rev_growth_pct / 4.0
+    ni_q_growth = (1 + ni_growth_pct)**(0.25) - 1 if ni_growth_pct > -1 else ni_growth_pct / 4.0
+
+    hist_labels = [f"{y}" for y in hist_years]
+    
+    hist_rev_vals = [r / (1.0 if not is_quarterly_mode else 4.0) for r in df_hist[rev_col].tolist()] if rev_col else []
+    hist_ni_vals = [n / (1.0 if not is_quarterly_mode else 4.0) for n in df_hist[ni_col].tolist()] if ni_col else []
+    
+    proj_rev_q = []
+    proj_ni_q = []
+    
+    base_rev_q = last_rev / 4.0
+    base_ni_q = last_ni / 4.0
+    
+    for q in range(1, horizon_quarters + 1):
+        proj_rev_q.append(base_rev_q * ((1 + rev_q_growth) ** q))
+        proj_ni_q.append(base_ni_q * ((1 + ni_q_growth) ** q))
+        
+    forecast_labels = []
+    forecast_rev_vals = []
+    forecast_ni_vals = []
+    
+    if is_quarterly_mode:
+        for q in range(1, horizon_quarters + 1):
+            q_num = ((q - 1) % 4) + 1
+            yr_offset = (q - 1) // 4 + 1
+            forecast_labels.append(f"Q{q_num} {last_year + yr_offset}")
+            forecast_rev_vals.append(proj_rev_q[q - 1])
+            forecast_ni_vals.append(proj_ni_q[q - 1])
+    else:
+        num_years = horizon_quarters // 4
+        for y_offset in range(1, num_years + 1):
+            forecast_labels.append(f"{last_year + y_offset} (Est)")
+            q_start = (y_offset - 1) * 4
+            forecast_rev_vals.append(sum(proj_rev_q[q_start:q_start+4]))
+            forecast_ni_vals.append(sum(proj_ni_q[q_start:q_start+4]))
+
+    all_labels = hist_labels + forecast_labels
+    
+    hist_rev_scaled = [v / divisor for v in hist_rev_vals]
+    hist_ni_scaled = [v / divisor for v in hist_ni_vals]
+    
+    fore_rev_scaled = [v / divisor for v in forecast_rev_vals]
+    fore_ni_scaled = [v / divisor for v in forecast_ni_vals]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=hist_labels,
+        y=hist_rev_scaled,
+        name="הכנסות (היסטוריה)" if st.session_state.language == 'he' else "Revenue (History)",
+        marker_color="#2962ff",
+        opacity=0.85
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=forecast_labels,
+        y=fore_rev_scaled,
+        name="הכנסות (תחזית)" if st.session_state.language == 'he' else "Revenue (Forecast)",
+        marker_color="#089981",
+        opacity=0.85
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=hist_labels,
+        y=hist_ni_scaled,
+        mode="lines+markers",
+        name="רווח נקי (היסטוריה)" if st.session_state.language == 'he' else "Net Income (History)",
+        line=dict(color="#f23645", width=3),
+        marker=dict(size=8, color="#f23645")
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=forecast_labels,
+        y=fore_ni_scaled,
+        mode="lines+markers",
+        name="רווח נקי (תחזית)" if st.session_state.language == 'he' else "Net Income (Forecast)",
+        line=dict(color="#ff7f0e", width=3, dash="dash"),
+        marker=dict(size=8, color="#ff7f0e")
+    ))
+    
+    title_text = (
+        f"תחזית הכנסות ורווח נקי - {unit_label} {sym}"
+        if st.session_state.language == 'he' else
+        f"Revenue & Net Income Forecast - {unit_label} {sym}"
+    )
+    
+    fig.update_layout(
+        title=f"<b>{title_text}</b>",
+        xaxis_title="רבעון / שנה" if st.session_state.language == 'he' else "Quarter / Year",
+        yaxis_title=f"{unit_label} {sym}",
+        barmode="group",
+        hovermode="x unified",
+        margin=dict(t=60, b=40, l=40, r=40),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5)
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown(f"#### {'טבלת נתוני תחזית' if st.session_state.language == 'he' else 'Projection Data Table'}")
+    
+    table_data = []
+    for idx, yr in enumerate(hist_years):
+        table_data.append({
+            "Period": str(yr),
+            "Type": "היסטוריה" if st.session_state.language == 'he' else "History",
+            "Revenue": hist_rev_vals[idx],
+            "Net Income": hist_ni_vals[idx]
+        })
+    for idx, lbl in enumerate(forecast_labels):
+        table_data.append({
+            "Period": str(lbl),
+            "Type": "תחזית" if st.session_state.language == 'he' else "Forecast",
+            "Revenue": forecast_rev_vals[idx],
+            "Net Income": forecast_ni_vals[idx]
+        })
+        
+    df_table = pd.DataFrame(table_data)
+    df_table["Period"] = df_table["Period"].astype(str)
+    
+    rev_growths_table = []
+    ni_growths_table = []
+    for i in range(len(df_table)):
+        row_type = df_table.loc[i, "Type"]
+        if row_type in ["היסטוריה", "History"]:
+            if i == 0:
+                rev_growths_table.append("-")
+                ni_growths_table.append("-")
+            else:
+                prev_r = df_table.loc[i-1, "Revenue"]
+                curr_r = df_table.loc[i, "Revenue"]
+                prev_n = df_table.loc[i-1, "Net Income"]
+                curr_n = df_table.loc[i, "Net Income"]
+                
+                r_change = ((curr_r - prev_r) / prev_r * 100) if prev_r != 0 else 0
+                n_change = ((curr_n - prev_n) / prev_n * 100) if prev_n != 0 else 0
+                
+                rev_growths_table.append(f"{r_change:+.1f}%")
+                ni_growths_table.append(f"{n_change:+.1f}%")
+        else:
+            r_change = rev_growth_pct * 100.0
+            n_change = ni_growth_pct * 100.0
+            label_suffix = " (שנתי)" if st.session_state.language == 'he' else " (YoY)"
+            rev_growths_table.append(f"{r_change:+.1f}%{label_suffix}")
+            ni_growths_table.append(f"{n_change:+.1f}%{label_suffix}")
+            
+    df_table["Revenue Growth"] = rev_growths_table
+    df_table["Net Income Growth"] = ni_growths_table
+    
+    df_table["Revenue"] = df_table["Revenue"].apply(lambda x: f"{sym}{x/divisor:.2f} {unit_label}")
+    df_table["Net Income"] = df_table["Net Income"].apply(lambda x: f"{sym}{x/divisor:.2f} {unit_label}")
+    
+    if st.session_state.language == 'he':
+        df_table.columns = ["תקופה", "סוג", "הכנסות", "רווח נקי", "צמיחת הכנסות", "צמיחת רווח"]
+    else:
+        df_table.columns = ["Period", "Type", "Revenue", "Net Income", "Revenue Growth", "Net Income Growth"]
+        
+    st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+
 # --- Helper Functions ---
+@st.cache_data(ttl=300)
+def get_ticker_tape_prices():
+    tickers = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "NICE.TA", "TEVA"]
+    tape_data = []
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="2d")
+            symbol_upper = ticker.upper()
+            is_tase = symbol_upper.endswith(".TA")
+            scale = 0.01 if is_tase else 1.0
+            currency_sym = "₪" if is_tase else "$"
+            
+            if len(hist) >= 2:
+                price = hist['Close'].iloc[-1] * scale
+                prev = hist['Close'].iloc[-2] * scale
+                change = ((price - prev) / prev) * 100
+                tape_data.append({"ticker": ticker, "price": price, "change": change, "symbol": currency_sym})
+            elif len(hist) == 1:
+                price = hist['Close'].iloc[-1] * scale
+                tape_data.append({"ticker": ticker, "price": price, "change": 0.0, "symbol": currency_sym})
+        except Exception:
+            pass
+    return tape_data
+
+def render_ticker_tape():
+    tape_data = get_ticker_tape_prices()
+    if not tape_data:
+        return
+    
+    html_items = []
+    for item in tape_data:
+        color = "#089981" if item['change'] >= 0 else "#f23645"
+        sign = "+" if item['change'] >= 0 else ""
+        html_items.append(
+            f'<span style="color: #ffffff; margin-left: 30px;">{item["ticker"]}</span> &nbsp;'
+            f'<span style="color: #d1d4dc;">{item["symbol"]}{item["price"]:.2f}</span> &nbsp;'
+            f'<span style="color: {color};">{sign}{item["change"]:.2f}%</span>'
+        )
+    
+    joined_items = " &nbsp;&nbsp;|&nbsp;&nbsp; ".join(html_items)
+    
+    st.markdown(
+        f"""
+        <div style="background-color: #1c2030; border: 1px solid #2a2e39; border-radius: 8px; padding: 8px 15px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.15); overflow: hidden;">
+            <marquee scrollamount="4" scrolldelay="20" direction="left" onmouseover="this.stop();" onmouseout="this.start();" style="font-family: 'Outfit', 'Rubik', sans-serif; font-size: 13px; font-weight: bold; vertical-align: middle;">
+                {joined_items}
+            </marquee>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 def fetch_financial_data(ticker_symbol: str):
     stock = yf.Ticker(ticker_symbol)
 
@@ -114,9 +817,35 @@ def fetch_financial_data(ticker_symbol: str):
         quarterly_balance_sheet = stock.quarterly_balance_sheet.T
         quarterly_cashflow = stock.quarterly_cashflow.T
         history = stock.history(period="10y")
-        info = stock.info
+        info = dict(stock.info) if stock.info else {}
     except Exception:
         return None, None, None, None, None, None, None, None
+
+    # Handle ILA Agora currency scaling to standard Shekels (ILS)
+    try:
+        if info:
+            currency = info.get("currency", "USD")
+            if currency == "ILA":
+                scale = 0.01
+                if history is not None and not history.empty:
+                    for col in ['Open', 'High', 'Low', 'Close']:
+                        if col in history.columns:
+                            history[col] = history[col] * scale
+                # Scale info price-related fields
+                price_keys = [
+                    'currentPrice', 'trailingEps', 'dividendRate', 'fiftyTwoWeekHigh', 
+                    'fiftyTwoWeekLow', 'fiftyDayAverage', 'twoHundredDayAverage',
+                    'targetHighPrice', 'targetLowPrice', 'targetMeanPrice', 'targetMedianPrice',
+                    'bookValue', 'navPrice'
+                ]
+                for key in price_keys:
+                    if key in info and info[key] is not None:
+                        try:
+                            info[key] = info[key] * scale
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
     df_fin_a = financials.sort_index() if not financials.empty else pd.DataFrame()
     df_bs_a = balance_sheet.sort_index() if not balance_sheet.empty else pd.DataFrame()
@@ -156,16 +885,21 @@ def get_live_price_info(ticker_symbol: str):
     try:
         stock = yf.Ticker(ticker_symbol)
         hist = stock.history(period="2d")
+        symbol_upper = ticker_symbol.upper().strip()
+        is_tase = symbol_upper.endswith(".TA")
+        scale = 0.01 if is_tase else 1.0
+        symbol = "₪" if is_tase else "$"
+        
         if len(hist) >= 2:
-            current_price = hist['Close'].iloc[-1]
-            prev_close = hist['Close'].iloc[-2]
+            current_price = hist['Close'].iloc[-1] * scale
+            prev_close = hist['Close'].iloc[-2] * scale
             daily_change = ((current_price - prev_close) / prev_close) * 100
-            return current_price, daily_change
+            return current_price, daily_change, symbol
         elif len(hist) == 1:
-            return hist['Close'].iloc[-1], 0.0
+            return hist['Close'].iloc[-1] * scale, 0.0, symbol
     except Exception:
-        return None, None
-    return None, None
+        return None, None, "$"
+    return None, None, "$"
 
 
 def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: str, change_label: str = None, x_label: str = None, value_label: str = None, y_title: str = None, divisor: float = 1e9):
@@ -251,40 +985,45 @@ def create_line_chart(series: pd.Series, title: str, y_label: str):
 def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, years=5):
     valuations = {}
     shares_out = info.get('sharesOutstanding', 1)
-    if not shares_out or shares_out <= 0:
+    if not shares_out or pd.isna(shares_out) or shares_out <= 0:
         shares_out = 1
 
     current_price = info.get('currentPrice')
-    if not current_price:
+    if not current_price or pd.isna(current_price) or current_price <= 0:
         return valuations
 
     trailing_eps = info.get('trailingEps')
     book_value = info.get('bookValue')
 
+    # Detect currency to format description strings
+    currency = info.get("currency", "USD") if info else "USD"
+    sym = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
+
     # Clamped baseline growth rates for safety
-    pe_g = min(max(growth_rate, -10.0), 30.0)
+    growth_rate_val = growth_rate if (growth_rate is not None and not pd.isna(growth_rate)) else 10.0
+    pe_g = min(max(growth_rate_val, -10.0), 30.0)
     
     rev_growth = info.get('revenueGrowth')
-    rev_g = (rev_growth * 100) if (rev_growth is not None) else growth_rate
+    rev_g = (rev_growth * 100) if (rev_growth is not None and not pd.isna(rev_growth)) else growth_rate_val
     rev_g = min(max(rev_g, -10.0), 30.0)
 
     fcf_growth = info.get('earningsGrowth')
-    fcf_g = (fcf_growth * 100) if (fcf_growth is not None) else growth_rate
+    fcf_g = (fcf_growth * 100) if (fcf_growth is not None and not pd.isna(fcf_growth)) else growth_rate_val
     fcf_g = min(max(fcf_g, -10.0), 30.0)
 
     # 1. P/E Earnings Projection Model
     is_eps_normalized = False
     eps = trailing_eps
-    if not eps or eps <= 0:
+    if eps is None or pd.isna(eps) or eps <= 0:
         eps = current_price / 15.0
         is_eps_normalized = True
 
-    conservative_pe = min(max(avg_pe, 10.0), 25.0) if avg_pe else 15.0
+    conservative_pe = min(max(avg_pe, 10.0), 25.0) if (avg_pe and not pd.isna(avg_pe)) else 15.0
     future_eps = eps * ((1 + (pe_g / 100)) ** years)
     future_price_pe = future_eps * conservative_pe
     intrinsic_value_pe = future_price_pe / ((1 + (discount_rate / 100)) ** years)
 
-    eps_desc = f"Projects trailing EPS (${eps:.2f}) [Normalized]" if is_eps_normalized else f"Projects trailing EPS (${eps:.2f})"
+    eps_desc = f"Projects trailing EPS ({sym}{eps:.2f}) [Normalized]" if is_eps_normalized else f"Projects trailing EPS ({sym}{eps:.2f})"
     valuations['P/E Earnings Projection'] = {
         'intrinsic_value': intrinsic_value_pe,
         'future_price_5y': future_price_pe,
@@ -294,14 +1033,14 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
 
     # 2. P/S Revenue Projection Model
     total_revenue = info.get('totalRevenue')
-    if not total_revenue and df_fin is not None and not df_fin.empty:
+    if (total_revenue is None or pd.isna(total_revenue)) and df_fin is not None and not df_fin.empty:
         rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
             'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
         if rev_col:
             total_revenue = df_fin[rev_col].iloc[-1]
 
     is_rev_normalized = False
-    if not total_revenue or total_revenue <= 0:
+    if total_revenue is None or pd.isna(total_revenue) or total_revenue <= 0:
         total_revenue = (current_price * shares_out) / 3.0
         is_rev_normalized = True
 
@@ -309,14 +1048,14 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     future_rev_per_share = current_rev_per_share * ((1 + (rev_g / 100)) ** years)
 
     target_ps = info.get('priceToSalesTrailing12Months')
-    if not target_ps or target_ps <= 0:
+    if target_ps is None or pd.isna(target_ps) or target_ps <= 0:
         target_ps = current_price / current_rev_per_share if current_rev_per_share > 0 else 3.0
     target_ps = min(max(target_ps, 0.5), 10.0)
 
     future_price_ps = future_rev_per_share * target_ps
     intrinsic_value_ps = future_price_ps / ((1 + (discount_rate / 100)) ** years)
 
-    rev_desc = f"Projects Revenue Per Share (${current_rev_per_share:.2f}) [Normalized]" if is_rev_normalized else f"Projects Revenue Per Share (${current_rev_per_share:.2f})"
+    rev_desc = f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f}) [Normalized]" if is_rev_normalized else f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f})"
     valuations['P/S Revenue Projection'] = {
         'intrinsic_value': intrinsic_value_ps,
         'future_price_5y': future_price_ps,
@@ -328,7 +1067,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     fcf = info.get('freeCashflow')
     is_fcf_normalized = False
 
-    if not fcf or fcf <= 0:
+    if fcf is None or pd.isna(fcf) or fcf <= 0:
         if total_revenue and total_revenue > 0:
             fcf = total_revenue * 0.10
         else:
@@ -339,14 +1078,14 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     future_fcf_per_share = fcf_per_share * ((1 + (fcf_g / 100)) ** years)
     
     target_fcf_multiple = info.get('priceToFreeCashflow')
-    if not target_fcf_multiple or target_fcf_multiple <= 0:
-        target_fcf_multiple = avg_pe if avg_pe else 18.0
+    if target_fcf_multiple is None or pd.isna(target_fcf_multiple) or target_fcf_multiple <= 0:
+        target_fcf_multiple = avg_pe if (avg_pe and not pd.isna(avg_pe)) else 18.0
     target_fcf_multiple = min(max(target_fcf_multiple, 12.0), 25.0)
 
     future_price_fcf = future_fcf_per_share * target_fcf_multiple
     intrinsic_value_fcf = future_price_fcf / ((1 + (discount_rate / 100)) ** years)
 
-    fcf_desc = f"Projects FCF Per Share (${fcf_per_share:.2f}) [Normalized]" if is_fcf_normalized else f"Projects FCF Per Share (${fcf_per_share:.2f})"
+    fcf_desc = f"Projects FCF Per Share ({sym}{fcf_per_share:.2f}) [Normalized]" if is_fcf_normalized else f"Projects FCF Per Share ({sym}{fcf_per_share:.2f})"
     valuations['FCF Projection'] = {
         'intrinsic_value': intrinsic_value_fcf,
         'future_price_5y': future_price_fcf,
@@ -357,7 +1096,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     # 4. EV/EBITDA Projection Model
     ebitda = info.get('ebitda')
     is_ebitda_normalized = False
-    if not ebitda or ebitda <= 0:
+    if ebitda is None or pd.isna(ebitda) or ebitda <= 0:
         ebitda = total_revenue * 0.15
         is_ebitda_normalized = True
 
@@ -365,21 +1104,21 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     future_ebitda_per_share = ebitda_per_share * ((1 + (fcf_g / 100)) ** years)
     
     target_ev_ebitda = info.get('enterpriseToEbitda')
-    if not target_ev_ebitda or target_ev_ebitda <= 0:
+    if target_ev_ebitda is None or pd.isna(target_ev_ebitda) or target_ev_ebitda <= 0:
         target_ev_ebitda = 10.0
     target_ev_ebitda = min(max(target_ev_ebitda, 6.0), 18.0)
 
     total_debt = info.get('totalDebt', 0)
-    if not total_debt: total_debt = 0
+    if total_debt is None or pd.isna(total_debt): total_debt = 0
     total_cash = info.get('totalCash', 0)
-    if not total_cash: total_cash = 0
+    if total_cash is None or pd.isna(total_cash): total_cash = 0
     net_debt_per_share = (total_debt - total_cash) / shares_out
 
     future_ev_per_share = future_ebitda_per_share * target_ev_ebitda
     future_price_ev = max(future_ev_per_share - net_debt_per_share, current_price * 0.2)
     intrinsic_value_ev = future_price_ev / ((1 + (discount_rate / 100)) ** years)
 
-    ebitda_desc = f"Projects EBITDA Per Share (${ebitda_per_share:.2f}) [Normalized]" if is_ebitda_normalized else f"Projects EBITDA Per Share (${ebitda_per_share:.2f})"
+    ebitda_desc = f"Projects EBITDA Per Share ({sym}{ebitda_per_share:.2f}) [Normalized]" if is_ebitda_normalized else f"Projects EBITDA Per Share ({sym}{ebitda_per_share:.2f})"
     valuations['EV/EBITDA Projection'] = {
         'intrinsic_value': intrinsic_value_ev,
         'future_price_5y': future_price_ev,
@@ -388,26 +1127,26 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     }
 
     # 5. P/B Book Value Projection Model
-    bv = book_value if book_value and book_value > 0 else info.get('bookValue')
+    bv = book_value if (book_value and not pd.isna(book_value) and book_value > 0) else info.get('bookValue')
     is_bv_normalized = False
-    if not bv or bv <= 0:
+    if bv is None or pd.isna(bv) or bv <= 0:
         bv = current_price / 3.0
         is_bv_normalized = True
 
     roe = info.get('returnOnEquity')
-    book_g = roe * 100 if roe and roe > 0 else 12.0
+    book_g = roe * 100 if (roe and not pd.isna(roe) and roe > 0) else 12.0
     book_g = min(max(book_g, 4.0), 15.0)
 
     future_bv = bv * ((1 + (book_g / 100)) ** years)
     target_pb = info.get('priceToBook')
-    if not target_pb or target_pb <= 0:
+    if target_pb is None or pd.isna(target_pb) or target_pb <= 0:
         target_pb = 2.0
     target_pb = min(max(target_pb, 1.0), 6.0)
 
     future_price_pb = future_bv * target_pb
     intrinsic_value_pb = future_price_pb / ((1 + (discount_rate / 100)) ** years)
 
-    bv_desc = f"Projects Book Value per share (${bv:.2f}) [Normalized]" if is_bv_normalized else f"Projects Book Value per share (${bv:.2f})"
+    bv_desc = f"Projects Book Value per share ({sym}{bv:.2f}) [Normalized]" if is_bv_normalized else f"Projects Book Value per share ({sym}{bv:.2f})"
     valuations['P/B Book Value Projection'] = {
         'intrinsic_value': intrinsic_value_pb,
         'future_price_5y': future_price_pb,
@@ -445,7 +1184,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         'intrinsic_value': intrinsic_value_epv,
         'future_price_5y': future_price_epv,
         'future_price': future_price_epv,
-        'description': f"Calculates no-growth value based on adjusted EPS (${adjusted_eps:.2f}) capitalized at the discount rate ({discount_rate:.1f}%)."
+        'description': f"Calculates no-growth value based on adjusted EPS ({sym}{adjusted_eps:.2f}) capitalized at the discount rate ({discount_rate:.1f}%)."
     }
 
     # 8. Revised Benjamin Graham Formula
@@ -477,7 +1216,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     # 10. Buffett Owner Earnings Model
     oe_per_share = fcf_per_share
     future_oe_ps = oe_per_share * ((1 + (fcf_g / 100)) ** years)
-    target_oe_multiple = min(max(avg_pe if avg_pe else 15.0, 12.0), 22.0)
+    target_oe_multiple = min(max(avg_pe if (avg_pe and not pd.isna(avg_pe)) else 15.0, 12.0), 22.0)
     future_price_oe = future_oe_ps * target_oe_multiple
     intrinsic_value_oe = future_price_oe / ((1 + (discount_rate / 100)) ** years)
 
@@ -485,7 +1224,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         'intrinsic_value': intrinsic_value_oe,
         'future_price_5y': future_price_oe,
         'future_price': future_price_oe,
-        'description': f"Buffett owner earnings projection (${oe_per_share:.2f}/share) growing at {fcf_g:.2f}% and applying multiple of {target_oe_multiple:.1f}x."
+        'description': f"Buffett owner earnings projection ({sym}{oe_per_share:.2f}/share) growing at {fcf_g:.2f}% and applying multiple of {target_oe_multiple:.1f}x."
     }
 
     return valuations
@@ -501,6 +1240,7 @@ def create_valuation_chart(valuations, current_price, years=5):
 
     avg_intrinsic = sum(intrinsic_values) / len(intrinsic_values)
     avg_future = sum(future_prices) / len(future_prices)
+    sym = cs()
 
     fig = go.Figure()
 
@@ -509,7 +1249,7 @@ def create_valuation_chart(valuations, current_price, years=5):
         y=intrinsic_values,
         name=tr("intrinsic_value_pv_column"),
         marker_color='#48BB78',
-        text=[f"${v:.2f}" for v in intrinsic_values],
+        text=[f"{sym}{v:.2f}" for v in intrinsic_values],
         textposition='auto',
         opacity=0.8
     ))
@@ -519,7 +1259,7 @@ def create_valuation_chart(valuations, current_price, years=5):
         y=future_prices,
         name=tr("target_price_fv_column").replace("{years}", str(years)),
         marker_color='#4299E1',
-        text=[f"${v:.2f}" for v in future_prices],
+        text=[f"{sym}{v:.2f}" for v in future_prices],
         textposition='auto',
         opacity=0.8
     ))
@@ -529,7 +1269,7 @@ def create_valuation_chart(valuations, current_price, years=5):
         line_dash="dash",
         line_color="#4A5568",
         line_width=2,
-        annotation_text=f"{tr('current_price')}: ${current_price:.2f}",
+        annotation_text=f"{tr('current_price')}: {sym}{current_price:.2f}",
         annotation_position="bottom right",
         annotation_font=dict(color="#4A5568", size=11, family="Arial")
     )
@@ -539,7 +1279,7 @@ def create_valuation_chart(valuations, current_price, years=5):
         line_dash="dash",
         line_color="#E53E3E",
         line_width=2.5,
-        annotation_text=f"{tr('consensus_intrinsic_value')}: ${avg_intrinsic:.2f}",
+        annotation_text=f"{tr('consensus_intrinsic_value')}: {sym}{avg_intrinsic:.2f}",
         annotation_position="top left",
         annotation_font=dict(color="#E53E3E", size=12, family="Arial")
     )
@@ -549,7 +1289,7 @@ def create_valuation_chart(valuations, current_price, years=5):
         line_dash="dash",
         line_color="#1A365D",
         line_width=2.5,
-        annotation_text=f"{tr('projected_target_price')}: ${avg_future:.2f}",
+        annotation_text=f"{tr('projected_target_price')}: {sym}{avg_future:.2f}",
         annotation_position="top right",
         annotation_font=dict(color="#1A365D", size=12, family="Arial")
     )
@@ -791,17 +1531,19 @@ def check_ratio(val, ratio_type):
 
 def render_ratio_card(label, value_str, status, description):
     colors = {
-        'good': {'bg': '#E6F4EA', 'border': '#34A853', 'text': '#137333'},
-        'warning': {'bg': '#FEF7E0', 'border': '#FBBC04', 'text': '#B06000'},
-        'critical': {'bg': '#FCE8E6', 'border': '#EA4335', 'text': '#C5221F'},
-        'neutral': {'bg': '#F1F3F4', 'border': '#BDC1C6', 'text': '#3C4043'}
+        'good': {'bg': '#1c2030', 'border': '#089981', 'text': '#089981'},
+        'warning': {'bg': '#1c2030', 'border': '#ff7f0e', 'text': '#ff7f0e'},
+        'critical': {'bg': '#1c2030', 'border': '#f23645', 'text': '#f23645'},
+        'neutral': {'bg': '#1c2030', 'border': '#848e9c', 'text': '#ffffff'}
     }
     c = colors[status]
+    lang = st.session_state.get("language", "en")
+    border_style = f"border-right: 5px solid {c['border']};" if lang == "he" else f"border-left: 5px solid {c['border']};"
     card_html = f"""
-    <div style="background-color: {c['bg']}; border-left: 5px solid {c['border']}; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); height: 160px;">
-        <h4 style="margin: 0; color: #5F6368; font-size: 13px; font-weight: 500; text-transform: uppercase;">{label}</h4>
-        <h2 style="margin: 5px 0; color: {c['text']}; font-size: 26px; font-weight: 700;">{value_str}</h2>
-        <p style="margin: 0; color: #5F6368; font-size: 11px; line-height: 1.4;">{description}</p>
+    <div style="background-color: {c['bg']} !important; border: 1px solid #2a2e39 !important; {border_style} padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.15); height: 160px; box-sizing: border-box;">
+        <h4 style="margin: 0; color: #848e9c !important; font-size: 12px; font-weight: 600; text-transform: uppercase; font-family: 'Outfit', 'Rubik', sans-serif; text-align: {'right' if lang == 'he' else 'left'} !important;">{label}</h4>
+        <h2 style="margin: 5px 0; color: {c['text']} !important; font-size: 24px; font-weight: 700; font-family: 'Outfit', 'Rubik', sans-serif; text-align: {'right' if lang == 'he' else 'left'} !important;">{value_str}</h2>
+        <p style="margin: 0; color: #d1d4dc !important; font-size: 11px; line-height: 1.4; font-family: 'Outfit', 'Rubik', sans-serif; text-align: {'right' if lang == 'he' else 'left'} !important;">{description}</p>
     </div>
     """
     return card_html
@@ -820,6 +1562,9 @@ except ValueError:
 selected_page = st.sidebar.radio(tr("select_view"), pages, index=page_index, format_func=page_format_func)
 st.session_state.page_selector = selected_page
 
+# Render top ticker tape
+render_ticker_tape()
+
 # ==========================================
 # PAGE 1: DASHBOARD
 # ==========================================
@@ -833,6 +1578,9 @@ if st.session_state.page_selector == "Dashboard":
         st.session_state.selected_ticker = ticker_input
         with st.spinner(tr("pulling_data").format(ticker=ticker_input)):
             df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q, history, info = fetch_financial_data(ticker_input)
+            if info:
+                currency = info.get("currency", "USD")
+                st.session_state.currency_symbol = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
 
             if history is not None and not history.empty:
                 # --- Precompute Valuation & Financial Metrics ---
@@ -876,19 +1624,19 @@ if st.session_state.page_selector == "Dashboard":
                     if summary != 'No business summary available.': summary = translate_text(summary)
 
                 st.markdown(f"""
-                <div style="background-color: #F8F9FA; border: 1px solid #E2E8F0; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
-                    <h2 style="margin: 0; color: #1A202C;">{long_name} ({ticker_input})</h2>
-                    <p style="margin: 5px 0 15px 0; color: #4A5568; font-size: 14px;">
-                        <strong>{tr('sector')}:</strong> {sector} &nbsp;|&nbsp; <strong>{tr('industry')}:</strong> {industry} &nbsp;|&nbsp; <strong>{tr('employees')}:</strong> {employees if isinstance(employees, int) else employees}
+                <div style="background-color: #1c2030; border: 1px solid #2a2e39; padding: 20px; border-radius: 10px; margin-bottom: 20px;">
+                    <h2 style="margin: 0; color: #ffffff; font-family: 'Outfit', 'Rubik', sans-serif;">{long_name} ({ticker_input})</h2>
+                    <p style="margin: 5px 0 15px 0; color: #d1d4dc; font-size: 14px; font-family: 'Outfit', 'Rubik', sans-serif;">
+                        <strong style="color: #848e9c;">{tr('sector')}:</strong> {sector} &nbsp;|&nbsp; <strong style="color: #848e9c;">{tr('industry')}:</strong> {industry} &nbsp;|&nbsp; <strong style="color: #848e9c;">{tr('employees')}:</strong> {employees if isinstance(employees, int) else employees}
                     </p>
-                    {f'<a href="{website}" target="_blank" style="background-color: #3182CE; color: white; padding: 8px 16px; border-radius: 5px; text-decoration: none; font-size: 14px; font-weight: bold;">{tr("visit_website")}</a>' if website else ''}
+                    {f'<a href="{website}" target="_blank" style="background-color: #2962ff; color: white; padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 14px; font-weight: bold; font-family: \'Outfit\', \'Rubik\', sans-serif; display: inline-block;">{tr("visit_website")}</a>' if website else ''}
                 </div>
                 """, unsafe_allow_html=True)
 
                 with st.expander(tr("company_description")):
                     st.write(summary)
                 # --- 2. Create Tabs ---
-                tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+                tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
                     tr("price_market_trend"),
                     tr("financial_statements"),
                     tr("financial_health_check"),
@@ -896,7 +1644,8 @@ if st.session_state.page_selector == "Dashboard":
                     tr("time_machine_backtest"),
                     tr("news_market_sentiment"),
                     get_label("💰 Dividends"),
-                    tr("insider_ownership_tab")
+                    tr("insider_ownership_tab"),
+                    get_label("🔮 Projections")
                 ])
 
                 # ==========================================
@@ -917,28 +1666,58 @@ if st.session_state.page_selector == "Dashboard":
                         history_slice = history
 
                     st.markdown("##### " + tr("technical_analysis"))
-                    col_chk1, col_chk2, col_chk3 = st.columns(3)
-                    chk_rsi = col_chk1.checkbox(tr("show_rsi"), value=False, key="chk_rsi")
-                    chk_macd = col_chk2.checkbox(tr("show_macd"), value=False, key="chk_macd")
-                    chk_boll = col_chk3.checkbox(tr("show_bollinger"), value=False, key="chk_boll")
+                    
+                    # Compute technical consensus
+                    gauge_val, rec, rsi_val, sma_50, sma_200, curr_pr = calculate_technical_consensus(history_slice)
+                    
+                    col_chart, col_gauge = st.columns([7, 3])
+                    
+                    with col_chart:
+                        col_chk1, col_chk2, col_chk3 = st.columns(3)
+                        chk_rsi = col_chk1.checkbox(tr("show_rsi"), value=False, key="chk_rsi")
+                        chk_macd = col_chk2.checkbox(tr("show_macd"), value=False, key="chk_macd")
+                        chk_boll = col_chk3.checkbox(tr("show_bollinger"), value=False, key="chk_boll")
 
-                    fig_price = create_stock_price_chart(history_slice, ticker_input, show_bollinger=chk_boll)
-                    if fig_price:
-                        st.plotly_chart(fig_price, use_container_width=True)
+                        fig_price = create_stock_price_chart(history_slice, ticker_input, show_bollinger=chk_boll)
+                        if fig_price:
+                            st.plotly_chart(fig_price, use_container_width=True)
 
-                    if chk_rsi:
-                        fig_rsi = create_rsi_chart(history_slice)
-                        if fig_rsi:
-                            st.plotly_chart(fig_rsi, use_container_width=True)
+                        if chk_rsi:
+                            fig_rsi = create_rsi_chart(history_slice)
+                            if fig_rsi:
+                                st.plotly_chart(fig_rsi, use_container_width=True)
 
-                    if chk_macd:
-                        fig_macd = create_macd_chart(history_slice)
-                        if fig_macd:
-                            st.plotly_chart(fig_macd, use_container_width=True)
+                        if chk_macd:
+                            fig_macd = create_macd_chart(history_slice)
+                            if fig_macd:
+                                st.plotly_chart(fig_macd, use_container_width=True)
 
-                    fig_vol = create_volume_chart(history_slice)
-                    if fig_vol:
-                        st.plotly_chart(fig_vol, use_container_width=True)
+                        fig_vol = create_volume_chart(history_slice)
+                        if fig_vol:
+                            st.plotly_chart(fig_vol, use_container_width=True)
+                    
+                    with col_gauge:
+                        fig_gauge = create_technical_gauge(gauge_val, rec)
+                        if fig_gauge:
+                            st.plotly_chart(fig_gauge, use_container_width=True)
+                            
+                        # Detail card for technical indicators
+                        st.markdown(f"""
+                        <div style="background-color: #131722; border: 1px solid #2a2e39; border-radius: 8px; padding: 15px; font-size: 13px; font-family: 'Outfit', 'Rubik', sans-serif;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px solid #2a2e39; padding-bottom: 4px;">
+                                <span style="color: #848e9c; font-weight: 500;">RSI (14):</span>
+                                <span style="font-weight: bold; color: {'#089981' if rsi_val < 30 else ('#f23645' if rsi_val > 70 else '#ffffff')}">{rsi_val:.2f}</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px solid #2a2e39; padding-bottom: 4px;">
+                                <span style="color: #848e9c; font-weight: 500;">SMA (50):</span>
+                                <span style="font-weight: bold; color: {'#089981' if curr_pr > sma_50 else '#f23645'}">{cs()}{sma_50:.2f}</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; padding-bottom: 4px;">
+                                <span style="color: #848e9c; font-weight: 500;">SMA (200):</span>
+                                <span style="font-weight: bold; color: {'#089981' if curr_pr > sma_200 else '#f23645'}">{cs()}{sma_200:.2f}</span>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
 
                     st.markdown("---")
                     st.subheader(tr("market_cap_pe_history"))
@@ -1113,7 +1892,7 @@ if st.session_state.page_selector == "Dashboard":
                             y_title=tr("billions")
                         )
                         if fig_shares:
-                            st.plotly_chart(fig_shares, width="stretch")
+                            st.plotly_chart(fig_shares, use_container_width=True)
 
                         historical_shares = df_fin[share_col].dropna()
                         if len(historical_shares) > 1:
@@ -1380,10 +2159,10 @@ if st.session_state.page_selector == "Dashboard":
                         upside_low = ((target_low - current_price) / current_price) * 100
 
                         metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
-                        metric_col1.metric(tr("current_price"), f"${current_price:.2f}")
-                        metric_col2.metric(tr("mean_target"), f"${target_mean:.2f}", f"{upside_mean:.2f}%")
-                        metric_col3.metric(tr("high_target"), f"${target_high:.2f}", f"{upside_high:.2f}%")
-                        metric_col4.metric(tr("low_target"), f"${target_low:.2f}", f"{upside_low:.2f}%")
+                        metric_col1.metric(tr("current_price"), f"{cs()}{current_price:.2f}")
+                        metric_col2.metric(tr("mean_target"), f"{cs()}{target_mean:.2f}", f"{upside_mean:.2f}%")
+                        metric_col3.metric(tr("high_target"), f"{cs()}{target_high:.2f}", f"{upside_high:.2f}%")
+                        metric_col4.metric(tr("low_target"), f"{cs()}{target_low:.2f}", f"{upside_low:.2f}%")
                         metric_col5.metric(tr("consensus"), recommendation_translated, f"{analyst_count} {tr('analysts')}", delta_color="off")
                     else:
                         st.info(tr("analyst_targets_unavailable"))
@@ -1488,15 +2267,18 @@ if st.session_state.page_selector == "Dashboard":
                             tr("multi_model_description").format(years=5, growth_rate=growth_rate, discount_rate=discount_rate, num_models=len(valuations))
                         )
 
-                        val_res_col1, val_res_col2, val_res_col3 = st.columns(3)
-                        val_res_col1.metric(tr("consensus_intrinsic_value"), f"${avg_intrinsic:.2f}")
-
+                        val_res_col1, val_res_col2, val_res_col3, val_res_col4 = st.columns(4)
+                        val_res_col1.metric(tr("consensus_intrinsic_value"), f"{cs()}{avg_intrinsic:.2f}")
                         if avg_intrinsic > current_price:
                             val_res_col2.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", tr("undervalued"))
                         else:
                             val_res_col2.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", tr("overvalued_sign"))
 
-                        val_res_col3.metric(tr("current_market_price"), f"${current_price:.2f}")
+                        val_res_col3.metric(tr("current_market_price"), f"{cs()}{current_price:.2f}")
+
+                        avg_future = sum(v.get('future_price_5y', v.get('future_price', 0)) for v in valuations.values()) / len(valuations)
+                        consensus_cagr = (((avg_future / current_price) ** (1 / 5) - 1) * 100) if (current_price > 0 and avg_future > 0) else 0.0
+                        val_res_col4.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
 
                         st.markdown("---")
                         chart_col, details_col = st.columns([3, 2])
@@ -1508,18 +2290,24 @@ if st.session_state.page_selector == "Dashboard":
                             st.subheader(tr("individual_model_targets").format(years=5))
                             for idx, (name, val_data) in enumerate(valuations.items(), 1):
                                 st.markdown("#### " + tr("valuation_number").format(idx=idx, name=name))
-                                desc_translated = translate_text(val_data['description'])
+                                desc_translated = translate_text(val_data['description']) if st.session_state.get("language", "en") == "he" else val_data['description']
                                 st.markdown(tr("calculation_method").format(desc=desc_translated))
                                 st.markdown(tr("target_price_fv").format(years=5, val=val_data['future_price_5y']))
+                                future_val = val_data.get('future_price_5y', val_data.get('future_price', 0))
+                                model_cagr = (((future_val / current_price) ** (1 / 5) - 1) * 100) if (current_price > 0 and future_val > 0) else 0.0
+                                st.markdown(tr("projected_cagr").format(cagr=model_cagr))
                                 st.markdown(tr("intrinsic_value_pv").format(val=val_data['intrinsic_value']))
                                 st.markdown("---")
                     elif current_price and current_price > 0:
                         st.warning(tr("minimum_models_warning").format(num_models=len(valuations)))
                         for idx, (name, val_data) in enumerate(valuations.items(), 1):
                             st.markdown("### " + tr("valuation_number").format(idx=idx, name=name))
-                            desc_translated = translate_text(val_data['description'])
+                            desc_translated = translate_text(val_data['description']) if st.session_state.get("language", "en") == "he" else val_data['description']
                             st.markdown(desc_translated)
                             st.markdown(tr("target_price_fv").format(years=5, val=val_data['future_price_5y']))
+                            future_val = val_data.get('future_price_5y', val_data.get('future_price', 0))
+                            model_cagr = (((future_val / current_price) ** (1 / 5) - 1) * 100) if (current_price > 0 and future_val > 0) else 0.0
+                            st.markdown(tr("projected_cagr").format(cagr=model_cagr))
                             st.markdown(tr("intrinsic_value_pv").format(val=val_data['intrinsic_value']))
                     else:
                         st.warning(tr("valuation_requirements_warning"))
@@ -2088,6 +2876,12 @@ if st.session_state.page_selector == "Dashboard":
                         st.dataframe(df_formatted, use_container_width=True)
                     else:
                         st.info(tr("no_insider_data"))
+
+                # ==========================================
+                # TAB 9: FINANCIAL PROJECTIONS
+                # ==========================================
+                with tab9:
+                    render_financial_forecasting_tab(df_fin_a)
             else:
                 st.error(tr("error_failed_retrieve_data"))
 
@@ -2138,7 +2932,7 @@ elif st.session_state.page_selector == "Compare":
             
             metrics_data = []
             
-            def format_val(val, fmt_type):
+            def format_val(val, fmt_type, info_dict=None):
                 if val is None or pd.isna(val) or val == 'N/A':
                     return 'N/A'
                 if fmt_type == "pct":
@@ -2146,12 +2940,16 @@ elif st.session_state.page_selector == "Compare":
                 elif fmt_type == "x":
                     return f"{val:.2f}x"
                 elif fmt_type == "currency":
-                    return f"${val:.2f}"
+                    symbol = "$"
+                    if info_dict:
+                        currency = info_dict.get("currency", "USD")
+                        symbol = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
+                    return f"{symbol}{val:.2f}"
                 return str(val)
 
             def add_comparison_row(label_en, val1, val2, fmt_type):
-                v1_str = format_val(val1, fmt_type)
-                v2_str = format_val(val2, fmt_type)
+                v1_str = format_val(val1, fmt_type, info1)
+                v2_str = format_val(val2, fmt_type, info2)
                 metrics_data.append({
                     tr("metric_column"): get_label(label_en),
                     t1: v1_str,
@@ -2305,51 +3103,282 @@ elif st.session_state.page_selector == "Compare":
 elif st.session_state.page_selector == "Watchlist":
     st.title(tr("my_stock_watchlist"))
 
-
     # Callback function to handle navigation safely
     def navigate_to_dashboard(target_ticker: str):
         st.session_state.selected_ticker = target_ticker
         st.session_state.page_selector = "Dashboard"
 
+    # Multiple watchlist selection and deletion
+    col_sel, col_del = st.columns([3, 2])
+    watchlist_options = list(st.session_state.watchlists.keys())
+    try:
+        active_idx = watchlist_options.index(st.session_state.active_watchlist)
+    except ValueError:
+        active_idx = 0
 
+    selected_wl = col_sel.selectbox(
+        tr("select_watchlist"),
+        watchlist_options,
+        index=active_idx,
+        key="active_watchlist_selector"
+    )
+
+    if selected_wl != st.session_state.active_watchlist:
+        st.session_state.active_watchlist = selected_wl
+        st.session_state.watchlist = st.session_state.watchlists[selected_wl]
+        st.rerun()
+
+    # Align delete button layout offset depending on language to look professional
+    col_del.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    if col_del.button(tr("delete_watchlist_btn"), key="btn_del_wl", use_container_width=True):
+        if len(st.session_state.watchlists) > 1:
+            del st.session_state.watchlists[st.session_state.active_watchlist]
+            save_watchlists(st.session_state.watchlists)
+            st.session_state.active_watchlist = list(st.session_state.watchlists.keys())[0]
+            st.session_state.watchlist = st.session_state.watchlists[st.session_state.active_watchlist]
+            st.success(tr("watchlist_deleted"))
+            st.rerun()
+        else:
+            st.error(tr("cannot_delete_last_watchlist"))
+
+    # Expanders for Watchlist Creation and Section Creation
+    col_exp1, col_exp2 = st.columns(2)
+    
+    with col_exp1.expander("➕ " + tr("create_watchlist")):
+        with st.form(key="create_watchlist_form", clear_on_submit=True):
+            new_wl_name = st.text_input(tr("enter_watchlist_name")).strip()
+            submit_wl = st.form_submit_button(label=tr("add_watchlist_btn"))
+            if submit_wl and new_wl_name:
+                if new_wl_name not in st.session_state.watchlists:
+                    # New watchlist starts with a default "General" section
+                    st.session_state.watchlists[new_wl_name] = [{"title": "General", "tickers": []}]
+                    save_watchlists(st.session_state.watchlists)
+                    st.session_state.active_watchlist = new_wl_name
+                    st.session_state.watchlist = st.session_state.watchlists[new_wl_name]
+                    st.success(tr("watchlist_created").format(name=new_wl_name))
+                    st.rerun()
+                else:
+                    st.warning(tr("watchlist_exists"))
+
+    with col_exp2.expander("📁 " + tr("create_section")):
+        with st.form(key="create_section_form", clear_on_submit=True):
+            new_sec_name = st.text_input(tr("enter_section_name")).strip()
+            submit_sec = st.form_submit_button(label=tr("add_section_btn"))
+            if submit_sec and new_sec_name:
+                # Add section to active watchlist sections
+                existing_titles = [s["title"] for s in st.session_state.watchlist]
+                if new_sec_name not in existing_titles:
+                    st.session_state.watchlist.append({"title": new_sec_name, "tickers": []})
+                    st.session_state.last_selected_section = new_sec_name
+                    save_watchlists(st.session_state.watchlists)
+                    st.success(tr("section_created").format(name=new_sec_name))
+                    st.rerun()
+                else:
+                    st.warning(tr("section_exists"))
+
+    # Drag and Drop Reordering & Moving Tickers between Sections
+    if st.session_state.watchlist:
+        with st.expander(tr("reorder_drag_drop"), expanded=False):
+            from streamlit_sortables import sort_items
+            sortable_data = [
+                {"header": section["title"], "items": section["tickers"]}
+                for section in st.session_state.watchlist
+            ]
+            sort_key = f"sort_wl_{st.session_state.active_watchlist}"
+            sorted_data = sort_items(sortable_data, multi_containers=True, key=sort_key)
+            
+            data_changed = False
+            if sorted_data:
+                for idx, sec in enumerate(st.session_state.watchlist):
+                    if idx < len(sorted_data):
+                        new_title = sorted_data[idx].get("header", sec["title"])
+                        new_tickers = sorted_data[idx].get("items", sec["tickers"])
+                        new_tickers = [str(t).upper().strip() for t in new_tickers if t]
+                        
+                        if sec["title"] != new_title or sec["tickers"] != new_tickers:
+                            sec["title"] = new_title
+                            sec["tickers"] = new_tickers
+                            data_changed = True
+            
+            if data_changed:
+                save_watchlists(st.session_state.watchlists)
+                st.rerun()
+
+    # Add ticker to a specific section of the active watchlist
     with st.form(key="add_ticker_form", clear_on_submit=True):
-        new_ticker = st.text_input(tr("enter_ticker_to_add")).upper().strip()
+        col_t1, col_t2 = st.columns(2)
+        new_ticker = col_t1.text_input(tr("enter_ticker_to_add")).upper().strip()
+        
+        # Select target section
+        section_options = [s["title"] for s in st.session_state.watchlist] if st.session_state.watchlist else ["General"]
+        
+        # Get active index for the section selectbox to keep the user on the same section
+        default_sec_idx = 0
+        if "last_selected_section" in st.session_state and st.session_state.last_selected_section in section_options:
+            default_sec_idx = section_options.index(st.session_state.last_selected_section)
+            
+        target_section_title = col_t2.selectbox(
+            tr("select_section_to_add"), 
+            section_options,
+            index=default_sec_idx
+        )
+        
         submit_button = st.form_submit_button(label=tr("add_to_watchlist"))
 
-        if submit_button and new_ticker:
-            if new_ticker not in st.session_state.watchlist:
-                st.session_state.watchlist.append(new_ticker)
-                st.success(tr("ticker_added_success").format(ticker=new_ticker))
+        if submit_button and new_ticker and target_section_title:
+            # If the watchlist has no sections (should not happen, but safe fallback)
+            if not st.session_state.watchlist:
+                st.session_state.watchlist.append({"title": "General", "tickers": []})
+            
+            # Find the section and append the ticker
+            for section in st.session_state.watchlist:
+                if section["title"] == target_section_title:
+                    # Check if ticker already exists in any section of this watchlist
+                    ticker_exists = any(new_ticker in s["tickers"] for s in st.session_state.watchlist)
+                    if not ticker_exists:
+                        section["tickers"].append(new_ticker)
+                        st.session_state.last_selected_section = target_section_title
+                        save_watchlists(st.session_state.watchlists)
+                        st.success(tr("ticker_added_success").format(ticker=new_ticker))
+                        st.rerun()
+                    else:
+                        st.warning(tr("ticker_already_watchlist"))
+
+    # Fetch live price data once per ticker (across all sections) to optimize loading speed
+    all_tickers = []
+    for section in st.session_state.watchlist:
+        all_tickers.extend(section["tickers"])
+    all_tickers = list(dict.fromkeys(all_tickers)) # Deduplicate
+
+    price_cache = {}
+    if all_tickers:
+        with st.spinner(tr("pulling_data").format(ticker="watchlist")):
+            for ticker in all_tickers:
+                price, change, symbol = get_live_price_info(ticker)
+                price_cache[ticker] = {"Price": price, "Change (%)": change, "Symbol": symbol}
+
+    # Render overall watchlist performance comparison chart
+    valid_wl_data = []
+    for ticker, info in price_cache.items():
+        if info["Price"] is not None:
+            valid_wl_data.append({"Ticker": ticker, "Price": info["Price"], "Change (%)": info["Change (%)"]})
+
+    if valid_wl_data:
+        df_wl = pd.DataFrame(valid_wl_data)
+        colors = ['#10B981' if c >= 0 else '#EF4444' for c in df_wl["Change (%)"]]
+        
+        fig_wl = go.Figure()
+        fig_wl.add_trace(go.Bar(
+            x=df_wl["Ticker"],
+            y=df_wl["Change (%)"],
+            marker_color=colors,
+            text=df_wl["Change (%)"].round(2).astype(str) + '%',
+            textposition='auto',
+            opacity=0.85
+        ))
+        
+        fig_wl.update_layout(
+            title=f"<b>{tr('watchlist_performance')}</b>",
+            yaxis_title=tr("percentage"),
+            xaxis=dict(type='category'),
+            margin=dict(t=50, b=20, l=40, r=40),
+            height=320
+        )
+        st.plotly_chart(fig_wl, use_container_width=True)
+        st.markdown("---")
+
+    # Render sections and tickers
+    if st.session_state.watchlist:
+        for idx, section in enumerate(st.session_state.watchlist):
+            col_sec_title, col_sec_del = st.columns([5, 1])
+            col_sec_title.markdown(f"#### 📁 {section['title']}")
+            
+            # Allow deleting section
+            if col_sec_del.button("🗑️ " + tr("delete_section"), key=f"del_sec_{section['title']}_{idx}", use_container_width=True):
+                st.session_state.watchlist.remove(section)
+                save_watchlists(st.session_state.watchlists)
+                st.success(tr("section_deleted"))
                 st.rerun()
+
+            if section["tickers"]:
+                for ticker in section["tickers"]:
+                    cache = price_cache.get(ticker, {"Price": None, "Change (%)": None, "Symbol": "$"})
+                    price = cache["Price"]
+                    change = cache["Change (%)"]
+                    symbol = cache.get("Symbol", "$")
+
+                    if price is not None:
+                        company_name = get_company_name(ticker)
+                        change_color = "#089981" if change >= 0 else "#f23645"
+                        change_sign = "+" if change >= 0 else ""
+
+                        align_text = "right" if st.session_state.language == "he" else "left"
+                        align_price = "left" if st.session_state.language == "he" else "right"
+                        flex_dir = "row-reverse" if st.session_state.language == "he" else "row"
+
+                        col_card, col_btn, col_remove = st.columns([6, 2, 1])
+
+                        card_html = f"""
+                        <div style="
+                            background-color: #1c2030;
+                            border: 1px solid #2a2e39;
+                            border-radius: 8px;
+                            padding: 10px 15px;
+                            display: flex;
+                            flex-direction: {flex_dir};
+                            justify-content: space-between;
+                            align-items: center;
+                            font-family: 'Outfit', 'Rubik', sans-serif;
+                            height: 50px;
+                        ">
+                            <div style="display: flex; flex-direction: column; text-align: {align_text};">
+                                <span style="font-size: 15px; font-weight: bold; color: #ffffff;">{ticker}</span>
+                                <span style="font-size: 10px; color: #848e9c; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px;">{company_name}</span>
+                            </div>
+                            <div style="display: flex; flex-direction: {flex_dir}; align-items: center; gap: 15px; text-align: {align_price};">
+                                <span style="font-size: 14px; font-weight: bold; color: #ffffff;">{symbol}{price:.2f}</span>
+                                <span style="
+                                    background-color: {change_color}20;
+                                    color: {change_color};
+                                    border: 1px solid {change_color}40;
+                                    padding: 3px 8px;
+                                    border-radius: 5px;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    min-width: 60px;
+                                    text-align: center;
+                                    display: inline-block;
+                                ">
+                                    {change_sign}{change:.2f}%
+                                </span>
+                            </div>
+                        </div>
+                        """
+                        col_card.markdown(card_html, unsafe_allow_html=True)
+
+                        col_btn.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+                        col_btn.button(
+                            tr("analyze_ticker").format(ticker=ticker),
+                            key=f"btn_{ticker}_{section['title']}_{idx}",
+                            on_click=navigate_to_dashboard,
+                            args=(ticker,),
+                            use_container_width=True
+                        )
+
+                        col_remove.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+                        if col_remove.button("🗑️", key=f"remove_{ticker}_{section['title']}_{idx}", help=tr("remove_from_watchlist"), use_container_width=True):
+                            section["tickers"].remove(ticker)
+                            save_watchlists(st.session_state.watchlists)
+                            st.rerun()
+
+                        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                    else:
+                        st.error(tr("could_not_load_live_data").format(ticker=ticker))
             else:
-                st.warning(tr("ticker_already_watchlist"))
-
-    st.markdown("### " + tr("live_market_status"))
-
-    for ticker in st.session_state.watchlist:
-        price, change = get_live_price_info(ticker)
-
-        if price is not None:
-            col_tick, col_price, col_change, col_btn = st.columns([2, 2, 2, 2])
-
-            col_tick.markdown(f"#### {ticker}")
-            col_price.markdown(f"**${price:.2f}**")
-
-            if change >= 0:
-                col_change.markdown(f"<span style='color:green;'>+{change:.2f}%</span>", unsafe_allow_html=True)
-            else:
-                col_change.markdown(f"<span style='color:red;'>{change:.2f}%</span>", unsafe_allow_html=True)
-
-            col_btn.button(
-                tr("analyze_ticker").format(ticker=ticker),
-                key=f"btn_{ticker}",
-                on_click=navigate_to_dashboard,
-                args=(ticker,)
-            )
-
+                st.info("This section is currently empty. Add tickers to it above!")
             st.markdown("---")
-        else:
-            st.error(tr("could_not_load_live_data").format(ticker=ticker))
+    else:
+        st.info("Watchlist is currently empty. Add a section above first!")
 
 # --- Execution Wrapper ---
 if __name__ == "__main__":
