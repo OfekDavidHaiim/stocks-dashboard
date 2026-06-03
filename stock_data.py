@@ -106,8 +106,8 @@ def save_portfolio(portfolio_data):
     try:
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(portfolio_data, f, ensure_ascii=False, indent=4)
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Error saving portfolio: {e}")
 
 def calculate_stock_metrics(stock):
     total_buy_qty = 0.0
@@ -284,6 +284,17 @@ def get_portfolio_live_price(ticker_symbol: str, currency: str):
     except Exception:
         pass
     return None
+
+def get_usd_ils_rate():
+    try:
+        stock = yf.Ticker("USDILS=X")
+        hist = stock.history(period="2d")
+        if not hist.empty:
+            price = hist['Close'].iloc[-1]
+            return float(price)
+    except Exception:
+        pass
+    return 3.70
 
 # --- Internationalization ---
 from translations import TRANSLATIONS
@@ -3646,7 +3657,13 @@ elif st.session_state.page_selector == "Portfolio":
         st.session_state.display_currency = "USD"
         
     if "usd_rate" not in st.session_state:
-        st.session_state.usd_rate = 3.70
+        with st.spinner("Fetching live exchange rate..."):
+            st.session_state.usd_rate = get_usd_ils_rate()
+
+    # Display dynamic toast notifications if set
+    if "portfolio_toast" in st.session_state and st.session_state.portfolio_toast:
+        st.toast(st.session_state.portfolio_toast, icon="✅")
+        st.session_state.portfolio_toast = None
 
     # Header controls: Rate and Display Currency
     col_rate, col_curr = st.columns([1, 1])
@@ -3683,7 +3700,7 @@ elif st.session_state.page_selector == "Portfolio":
             import random
             st.session_state.portfolio_data.append({
                 "id": f"{pd.Timestamp.now().timestamp()}_{random.random()}",
-                "symbol": "",
+                "symbol": "TICKER",
                 "currency": "USD",
                 "buys": [{"p": 0.0, "q": 0.0}],
                 "sells": [],
@@ -3691,6 +3708,7 @@ elif st.session_state.page_selector == "Portfolio":
                 "locked": False
             })
             save_portfolio(st.session_state.portfolio_data)
+            st.session_state.portfolio_toast = "Position added successfully!"
             st.rerun()
 
     with col_btn2:
@@ -3705,7 +3723,7 @@ elif st.session_state.page_selector == "Portfolio":
                             updated_count += 1
             if updated_count > 0:
                 save_portfolio(st.session_state.portfolio_data)
-                st.success(f"Updated {updated_count} prices!")
+                st.session_state.portfolio_toast = f"Updated {updated_count} stock prices successfully!"
                 st.rerun()
 
     with col_btn3:
@@ -3717,7 +3735,7 @@ elif st.session_state.page_selector == "Portfolio":
                 if imported_stocks:
                     st.session_state.portfolio_data = imported_stocks
                     save_portfolio(st.session_state.portfolio_data)
-                    st.success("CSV Imported successfully!")
+                    st.session_state.portfolio_toast = "CSV imported successfully!"
                     st.rerun()
                 else:
                     st.error("No valid positions found in CSV.")
@@ -3925,6 +3943,7 @@ elif st.session_state.page_selector == "Portfolio":
                     if st.button("🗑️", key=f"del_pos_btn_{index}_{s['id']}", help=tr("portfolio_delete_position"), use_container_width=True):
                         st.session_state.portfolio_data.pop(index)
                         save_portfolio(st.session_state.portfolio_data)
+                        st.session_state.portfolio_toast = "Position deleted!"
                         st.rerun()
 
                 col_buys, col_sells = st.columns(2)
