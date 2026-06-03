@@ -3664,6 +3664,15 @@ elif st.session_state.page_selector == "Portfolio":
     if "portfolio_data" not in st.session_state:
         st.session_state.portfolio_data = load_portfolio()
     
+    # Sort: open positions first (remaining_qty > 0), then by largest current total value
+    def get_portfolio_sort_key(item_stock):
+        metrics = calculate_stock_metrics(item_stock)
+        is_open = 1 if metrics["remaining_qty"] > 0 else 0
+        total_val = metrics["current_total_value"]
+        return (is_open, total_val)
+        
+    st.session_state.portfolio_data.sort(key=get_portfolio_sort_key, reverse=True)
+    
     if "display_currency" not in st.session_state:
         st.session_state.display_currency = "USD"
         
