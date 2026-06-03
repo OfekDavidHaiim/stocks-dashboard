@@ -545,7 +545,8 @@ if st.session_state.language == "he":
 
 
 # --- TradingView Plotly Custom Styling & Monkeypatch ---
-_orig_plotly_chart = st.plotly_chart
+if not hasattr(st, "_orig_plotly_chart"):
+    st._orig_plotly_chart = st.plotly_chart
 
 def apply_tradingview_plotly_style(fig):
     if fig is None:
@@ -613,7 +614,7 @@ def apply_tradingview_plotly_style(fig):
 
 def plotly_chart_styled(fig, use_container_width=True, **kwargs):
     styled_fig = apply_tradingview_plotly_style(fig)
-    return _orig_plotly_chart(styled_fig, use_container_width=use_container_width, **kwargs)
+    return st._orig_plotly_chart(styled_fig, use_container_width=use_container_width, **kwargs)
 
 st.plotly_chart = plotly_chart_styled
 
