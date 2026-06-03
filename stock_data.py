@@ -3785,24 +3785,22 @@ elif st.session_state.page_selector == "Portfolio":
         align_text = "right" if st.session_state.language == "he" else "left"
         lang_dir = "rtl" if st.session_state.language == "he" else "ltr"
         
-        table_html = f"""
-        <div style="overflow-x: auto; font-family: 'Outfit', 'Rubik', sans-serif;" dir="{lang_dir}">
-            <table style="width: 100%; border-collapse: collapse; text-align: {align_text}; color: #ffffff; background-color: #1c2030; border: 1px solid #2a2e39; border-radius: 8px;">
-                <thead>
-                    <tr style="border-bottom: 2px solid #2a2e39; background-color: #131722;">
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_actions')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_currency')} / {tr('ticker_input_placeholder').split()[0]}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_average_buy')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_initial_capital')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_remaining_cost')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_value')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_price')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_realized_pl')}</th>
-                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_unrealized_pl')}</th>
-                    </tr>
-                </thead>
-                <tbody>
-        """
+        table_html = f"""<div style="overflow-x: auto; font-family: 'Outfit', 'Rubik', sans-serif;" dir="{lang_dir}">
+<table style="width: 100%; border-collapse: collapse; text-align: {align_text}; color: #ffffff; background-color: #1c2030; border: 1px solid #2a2e39; border-radius: 8px;">
+<thead>
+<tr style="border-bottom: 2px solid #2a2e39; background-color: #131722;">
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_actions')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_currency')} / {tr('ticker_input_placeholder').split()[0]}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_average_buy')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_initial_capital')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_remaining_cost')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_value')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_price')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_realized_pl')}</th>
+<th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_unrealized_pl')}</th>
+</tr>
+</thead>
+<tbody>"""
         
         for s in st.session_state.portfolio_data:
             m = calculate_stock_metrics(s)
@@ -3830,25 +3828,21 @@ elif st.session_state.page_selector == "Portfolio":
             else:
                 mkt_price_display = f"{curr_mkt_p:.2f}"
 
-            table_html += f"""
-                    <tr style="border-bottom: 1px solid #2a2e39; hover: background-color: #242936;">
-                        <td style="padding: 10px;">{lock_icon}</td>
-                        <td style="padding: 10px; font-weight: bold; color: #2962ff;">{s.get('symbol', 'N/A')} <span style="font-size: 10px; color: #848e9c;">({s.get('currency')})</span></td>
-                        <td style="padding: 10px;">{avg_price_display}</td>
-                        <td style="padding: 10px;">{initial_cap_str}</td>
-                        <td style="padding: 10px;">{remaining_cost_str}</td>
-                        <td style="padding: 10px; font-weight: bold;">{curr_val_str}</td>
-                        <td style="padding: 10px;">{mkt_price_display}</td>
-                        <td style="padding: 10px; color: {realized_color}; font-weight: bold;">{realized_str}</td>
-                        <td style="padding: 10px; color: {unrealized_color}; font-weight: bold;">{unrealized_str}</td>
-                    </tr>
-            """
+            table_html += f"""<tr style="border-bottom: 1px solid #2a2e39; hover: background-color: #242936;">
+<td style="padding: 10px;">{lock_icon}</td>
+<td style="padding: 10px; font-weight: bold; color: #2962ff;">{s.get('symbol', 'N/A')} <span style="font-size: 10px; color: #848e9c;">({s.get('currency')})</span></td>
+<td style="padding: 10px;">{avg_price_display}</td>
+<td style="padding: 10px;">{initial_cap_str}</td>
+<td style="padding: 10px;">{remaining_cost_str}</td>
+<td style="padding: 10px; font-weight: bold;">{curr_val_str}</td>
+<td style="padding: 10px;">{mkt_price_display}</td>
+<td style="padding: 10px; color: {realized_color}; font-weight: bold;">{realized_str}</td>
+<td style="padding: 10px; color: {unrealized_color}; font-weight: bold;">{unrealized_str}</td>
+</tr>"""
             
-        table_html += """
-                </tbody>
-            </table>
-        </div>
-        """
+        table_html += """</tbody>
+</table>
+</div>"""
         st.markdown(table_html, unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         
