@@ -95,8 +95,14 @@ def load_portfolio():
                     item["sells"] = []
                 if "currentPrice" not in item:
                     item["currentPrice"] = 0.0
+                elif isinstance(item["currentPrice"], (list, tuple)):
+                    item["currentPrice"] = float(item["currentPrice"][0]) if len(item["currentPrice"]) > 0 else 0.0
+                
                 if "prevClosePrice" not in item:
                     item["prevClosePrice"] = item.get("currentPrice", 0.0)
+                elif isinstance(item["prevClosePrice"], (list, tuple)):
+                    item["prevClosePrice"] = float(item["prevClosePrice"][0]) if len(item["prevClosePrice"]) > 0 else 0.0
+                    
                 if "locked" not in item:
                     item["locked"] = False
             return data
@@ -3723,9 +3729,10 @@ elif st.session_state.page_selector == "Portfolio":
             with st.spinner(tr("pulling_data").format(ticker="all")):
                 for s in st.session_state.portfolio_data:
                     if s.get("symbol") and not s.get("locked"):
-                        live_price = get_portfolio_live_price(s["symbol"], s["currency"])
+                        live_price, prev_close = get_portfolio_live_price(s["symbol"], s["currency"])
                         if live_price is not None:
                             s["currentPrice"] = live_price
+                            s["prevClosePrice"] = prev_close
                             updated_count += 1
             if updated_count > 0:
                 save_portfolio(st.session_state.portfolio_data)
