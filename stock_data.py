@@ -95,6 +95,8 @@ def load_portfolio():
                     item["sells"] = []
                 if "currentPrice" not in item:
                     item["currentPrice"] = 0.0
+                if "prevClosePrice" not in item:
+                    item["prevClosePrice"] = item.get("currentPrice", 0.0)
                 if "locked" not in item:
                     item["locked"] = False
             return data
@@ -226,6 +228,7 @@ def import_portfolio_csv(file_contents):
                     "buys": [],
                     "sells": [],
                     "currentPrice": mkt_p,
+                    "prevClosePrice": mkt_p,
                     "locked": is_locked,
                     "currency": curr
                 }
@@ -237,6 +240,7 @@ def import_portfolio_csv(file_contents):
                 
             if mkt_p > 0:
                 imported_data[sym]["currentPrice"] = mkt_p
+                imported_data[sym]["prevClosePrice"] = mkt_p
         except Exception:
             continue
             
@@ -279,11 +283,12 @@ def get_portfolio_live_price(ticker_symbol: str, currency: str):
         stock = yf.Ticker(ticker_symbol)
         hist = stock.history(period="2d")
         if not hist.empty:
-            price = hist['Close'].iloc[-1]
-            return float(price)
+            price = float(hist['Close'].iloc[-1])
+            prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else price
+            return price, prev_close
     except Exception:
         pass
-    return None
+    return None, None
 
 def get_usd_ils_rate():
     try:
@@ -3705,6 +3710,7 @@ elif st.session_state.page_selector == "Portfolio":
                 "buys": [{"p": 0.0, "q": 0.0}],
                 "sells": [],
                 "currentPrice": 0.0,
+                "prevClosePrice": 0.0,
                 "locked": False
             })
             save_portfolio(st.session_state.portfolio_data)
@@ -3762,6 +3768,8 @@ elif st.session_state.page_selector == "Portfolio":
     total_market_value_usd = 0.0
     total_realized_usd = 0.0
     total_unrealized_usd = 0.0
+    total_daily_change_usd = 0.0
+    total_prev_market_value_usd = 0.0
 
     for s in st.session_state.portfolio_data:
         m = calculate_stock_metrics(s)
@@ -3770,16 +3778,30 @@ elif st.session_state.page_selector == "Portfolio":
         total_market_value_usd += m["current_total_value"] * factor
         total_realized_usd += m["realized_pl"] * factor
         total_unrealized_usd += m["unrealized_pl"] * factor
+        
+        # Calculate daily change
+        remaining_qty = m["remaining_qty"]
+        curr_price = float(s.get("currentPrice", 0.0))
+        prev_close = float(s.get("prevClosePrice", curr_price))
+        cost_factor = 100.0 if s.get("currency") == "ILS" else 1.0
+        
+        daily_change_val = (curr_price - prev_close) * remaining_qty / cost_factor
+        daily_change_usd = daily_change_val * factor
+        total_daily_change_usd += daily_change_usd
+        
+        prev_val_usd = (prev_close * remaining_qty / cost_factor) * factor
+        total_prev_market_value_usd += prev_val_usd
 
     total_profit_usd = total_realized_usd + total_unrealized_usd
     total_profit_pct = (total_profit_usd / (total_remaining_cost_usd + abs(total_realized_usd))) * 100.0 if (total_remaining_cost_usd + abs(total_realized_usd)) > 0 else 0.0
     open_return_pct = (total_unrealized_usd / total_remaining_cost_usd) * 100.0 if total_remaining_cost_usd > 0 else 0.0
+    daily_change_pct = (total_daily_change_usd / total_prev_market_value_usd * 100.0) if total_prev_market_value_usd > 0 else 0.0
 
     display_factor = usd_rate if st.session_state.display_currency == "ILS" else 1.0
     sym = "₪" if st.session_state.display_currency == "ILS" else "$"
 
-    # Cards layout
-    col_card1, col_card2, col_card3, col_card4, col_card5, col_card6 = st.columns(6)
+    # Cards layout - Row 1 (4 columns)
+    col_card1, col_card2, col_card3, col_card4 = st.columns(4)
     with col_card1:
         st.markdown(render_portfolio_card(tr("portfolio_cost_basis"), f"{sym}{(total_remaining_cost_usd * display_factor):,.2f}", "neutral"), unsafe_allow_html=True)
     with col_card2:
@@ -3788,10 +3810,16 @@ elif st.session_state.page_selector == "Portfolio":
         st.markdown(render_portfolio_card(tr("portfolio_realized_pl"), f"{sym}{(total_realized_usd * display_factor):,.2f}", "good" if total_realized_usd >= 0 else "critical"), unsafe_allow_html=True)
     with col_card4:
         st.markdown(render_portfolio_card(tr("portfolio_unrealized_pl"), f"{sym}{(total_unrealized_usd * display_factor):,.2f}", "good" if total_unrealized_usd >= 0 else "critical"), unsafe_allow_html=True)
+
+    # Cards layout - Row 2 (3 columns)
+    col_card5, col_card6, col_card7 = st.columns(3)
     with col_card5:
         st.markdown(render_portfolio_card(tr("portfolio_total_return"), f"{total_profit_pct:+.2f}%", "good" if total_profit_usd >= 0 else "critical"), unsafe_allow_html=True)
     with col_card6:
         st.markdown(render_portfolio_card(tr("portfolio_open_return"), f"{open_return_pct:+.2f}%", "good" if total_unrealized_usd >= 0 else "critical"), unsafe_allow_html=True)
+    with col_card7:
+        daily_change_str = f"{sym}{(total_daily_change_usd * display_factor):+,.2f} ({daily_change_pct:+.2f}%)"
+        st.markdown(render_portfolio_card(tr("portfolio_today_change"), daily_change_str, "good" if total_daily_change_usd >= 0 else "critical"), unsafe_allow_html=True)
 
     # Detailed Table
     st.markdown("---")
@@ -3827,10 +3855,17 @@ elif st.session_state.page_selector == "Portfolio":
             
             raw_buy_p = m["avg_buy_price"]
             curr_mkt_p = s.get("currentPrice", 0.0)
+            prev_close_p = s.get("prevClosePrice", curr_mkt_p)
+            
             profit_pct = ((curr_mkt_p - raw_buy_p) / raw_buy_p * 100.0) if raw_buy_p > 0 else 0.0
+            
+            pos_daily_change_val = curr_mkt_p - prev_close_p
+            pos_daily_change_pct = ((curr_mkt_p - prev_close_p) / prev_close_p * 100.0) if prev_close_p > 0 else 0.0
             
             realized_color = "#089981" if m["realized_pl"] >= 0 else "#f23645"
             unrealized_color = "#089981" if m["unrealized_pl"] >= 0 else "#f23645"
+            pos_daily_change_color = "#089981" if pos_daily_change_val >= 0 else "#f23645"
+            pos_daily_change_sign = "+" if pos_daily_change_val >= 0 else ""
             
             initial_cap_str = f"{s_curr_sym}{m['total_initial_capital']:,.2f}"
             remaining_cost_str = f"{s_curr_sym}{m['remaining_cost_basis']:,.2f}"
@@ -3843,8 +3878,10 @@ elif st.session_state.page_selector == "Portfolio":
             if s.get("currency") == "ILS":
                 avg_price_display += " (אג')"
                 mkt_price_display = f"{curr_mkt_p:.2f} (אג')"
+                pos_daily_change_val_str = f"{pos_daily_change_sign}{pos_daily_change_val:.2f} (אג')"
             else:
                 mkt_price_display = f"{curr_mkt_p:.2f}"
+                pos_daily_change_val_str = f"{s_curr_sym}{pos_daily_change_sign}{pos_daily_change_val:.2f}"
 
             table_html += f"""<tr style="border-bottom: 1px solid #2a2e39; hover: background-color: #242936;">
 <td style="padding: 10px;">{lock_icon}</td>
@@ -3853,7 +3890,12 @@ elif st.session_state.page_selector == "Portfolio":
 <td style="padding: 10px;">{initial_cap_str}</td>
 <td style="padding: 10px;">{remaining_cost_str}</td>
 <td style="padding: 10px; font-weight: bold;">{curr_val_str}</td>
-<td style="padding: 10px;">{mkt_price_display}</td>
+<td style="padding: 10px;">
+    <div>{mkt_price_display}</div>
+    <div style="font-size: 10px; color: {pos_daily_change_color}; font-weight: bold;">
+        {pos_daily_change_val_str} ({pos_daily_change_pct:+.2f}%)
+    </div>
+</td>
 <td style="padding: 10px; color: {realized_color}; font-weight: bold;">{realized_str}</td>
 <td style="padding: 10px; color: {unrealized_color}; font-weight: bold;">{unrealized_str}</td>
 </tr>"""
