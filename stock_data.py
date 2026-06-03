@@ -59,6 +59,232 @@ def save_watchlists(watchlists_dict):
     except Exception:
         pass
 
+
+# --- Portfolio Management Helpers ---
+PORTFOLIO_FILE = "portfolio.json"
+
+def load_portfolio():
+    default_portfolio = [
+        {
+            "id": "1",
+            "symbol": "NVDA",
+            "currency": "USD",
+            "buys": [{"p": 102.98, "q": 52.0}],
+            "sells": [],
+            "currentPrice": 120.0,
+            "locked": False
+        }
+    ]
+    if not os.path.exists(PORTFOLIO_FILE):
+        return default_portfolio
+    try:
+        import random
+        with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for item in data:
+                if "id" not in item:
+                    item["id"] = f"{pd.Timestamp.now().timestamp()}_{random.random()}"
+                if "symbol" not in item:
+                    item["symbol"] = ""
+                if "currency" not in item:
+                    item["currency"] = "USD"
+                if "buys" not in item:
+                    item["buys"] = []
+                if "sells" not in item:
+                    item["sells"] = []
+                if "currentPrice" not in item:
+                    item["currentPrice"] = 0.0
+                if "locked" not in item:
+                    item["locked"] = False
+            return data
+        return default_portfolio
+    except Exception:
+        return default_portfolio
+
+def save_portfolio(portfolio_data):
+    try:
+        with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+            json.dump(portfolio_data, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass
+
+def calculate_stock_metrics(stock):
+    total_buy_qty = 0.0
+    total_buy_cost_raw = 0.0
+    for b in stock.get("buys", []):
+        qty = float(b.get("q", 0.0))
+        price = float(b.get("p", 0.0))
+        total_buy_qty += qty
+        total_buy_cost_raw += price * qty
+        
+    cost_factor = 100.0 if stock.get("currency") == "ILS" else 1.0
+    
+    total_initial_capital = total_buy_cost_raw / cost_factor
+    avg_buy_price_raw = (total_buy_cost_raw / total_buy_qty) if total_buy_qty > 0 else 0.0
+    
+    total_sell_qty = 0.0
+    total_sell_revenue_raw = 0.0
+    for s in stock.get("sells", []):
+        qty = float(s.get("q", 0.0))
+        price = float(s.get("p", 0.0))
+        total_sell_qty += qty
+        total_sell_revenue_raw += price * qty
+        
+    total_sell_revenue = total_sell_revenue_raw / cost_factor
+    remaining_qty = max(0.0, total_buy_qty - total_sell_qty)
+    
+    realized_pl = total_sell_revenue - ((avg_buy_price_raw / cost_factor) * total_sell_qty)
+    curr_price = float(stock.get("currentPrice", 0.0))
+    unrealized_pl = ((curr_price - avg_buy_price_raw) / cost_factor) * remaining_qty
+    
+    current_total_value = (remaining_qty * curr_price) / cost_factor
+    remaining_cost_basis = remaining_qty * (avg_buy_price_raw / cost_factor)
+    
+    return {
+        "avg_buy_price": avg_buy_price_raw,
+        "realized_pl": realized_pl,
+        "unrealized_pl": unrealized_pl,
+        "current_total_value": current_total_value,
+        "remaining_qty": remaining_qty,
+        "remaining_cost_basis": remaining_cost_basis,
+        "total_initial_capital": total_initial_capital
+    }
+
+def import_portfolio_csv(file_contents):
+    import io
+    import csv
+    import random
+    
+    text_data = file_contents.decode("utf-8-sig")
+    f = io.StringIO(text_data)
+    
+    first_line = next(f, None)
+    if not first_line:
+        return []
+    delimiter = ";" if ";" in first_line else ","
+    f.seek(0)
+    
+    reader = csv.reader(f, delimiter=delimiter)
+    headers = [h.strip().replace('"', '') for h in next(reader, [])]
+    
+    col_map = {
+        "symbol": -1,
+        "price": -1,
+        "qty": -1,
+        "type": -1,
+        "marketPrice": -1,
+        "locked": -1,
+        "currency": -1
+    }
+    
+    for idx, h in enumerate(headers):
+        h_lower = h.lower()
+        if "מנייה" in h_lower or "symbol" in h_lower:
+            col_map["symbol"] = idx
+        elif "מחיר" in h_lower and "שוק" not in h_lower:
+            col_map["price"] = idx
+        elif "כמות" in h_lower or "quantity" in h_lower or "qty" in h_lower:
+            col_map["qty"] = idx
+        elif "סוג" in h_lower or "type" in h_lower:
+            col_map["type"] = idx
+        elif "מחיר שוק" in h_lower or "market" in h_lower or "current" in h_lower:
+            col_map["marketPrice"] = idx
+        elif "נעול" in h_lower or "locked" in h_lower:
+            col_map["locked"] = idx
+        elif "מטבע" in h_lower or "currency" in h_lower:
+            col_map["currency"] = idx
+            
+    if col_map["symbol"] == -1: col_map["symbol"] = 0
+    if col_map["price"] == -1: col_map["price"] = 1
+    if col_map["qty"] == -1: col_map["qty"] = 2
+    if col_map["type"] == -1: col_map["type"] = 3
+    if col_map["marketPrice"] == -1: col_map["marketPrice"] = 4
+    if col_map["locked"] == -1: col_map["locked"] = 5
+    if col_map["currency"] == -1: col_map["currency"] = 6
+    
+    imported_data = {}
+    for idx, row in enumerate(reader):
+        if not row or len(row) < 3:
+            continue
+        try:
+            sym = row[col_map["symbol"]].upper().strip()
+            if not sym:
+                continue
+            
+            p = float(row[col_map["price"]]) if col_map["price"] < len(row) else 0.0
+            q = float(row[col_map["qty"]]) if col_map["qty"] < len(row) else 0.0
+            t_type = row[col_map["type"]].upper().strip() if col_map["type"] < len(row) else "BUY"
+            mkt_p = float(row[col_map["marketPrice"]]) if col_map["marketPrice"] < len(row) else 0.0
+            is_locked = row[col_map["locked"]].upper().strip() == "YES" if col_map["locked"] < len(row) else False
+            curr = row[col_map["currency"]].upper().strip() if col_map["currency"] < len(row) else "USD"
+            
+            if sym not in imported_data:
+                imported_data[sym] = {
+                    "id": f"{idx}_{pd.Timestamp.now().timestamp()}_{random.random()}",
+                    "symbol": sym,
+                    "buys": [],
+                    "sells": [],
+                    "currentPrice": mkt_p,
+                    "locked": is_locked,
+                    "currency": curr
+                }
+            
+            if t_type == "SELL":
+                imported_data[sym]["sells"].append({"p": p, "q": q})
+            else:
+                imported_data[sym]["buys"].append({"p": p, "q": q})
+                
+            if mkt_p > 0:
+                imported_data[sym]["currentPrice"] = mkt_p
+        except Exception:
+            continue
+            
+    stocks_list = list(imported_data.values())
+    for s in stocks_list:
+        metrics = calculate_stock_metrics(s)
+        s["_sort_qty"] = metrics["remaining_qty"]
+        
+    stocks_list.sort(key=lambda x: x["_sort_qty"] > 0, reverse=True)
+    for s in stocks_list:
+        if "_sort_qty" in s:
+            del s["_sort_qty"]
+            
+    return stocks_list
+
+def export_portfolio_csv(portfolio_data):
+    import io
+    import csv
+    
+    output = io.StringIO()
+    output.write('\uFEFF')
+    writer = csv.writer(output, delimiter=',')
+    
+    writer.writerow(["מנייה", "מחיר", "כמות", "סוג", "מחיר שוק", "נעול", "מטבע"])
+    for s in portfolio_data:
+        sym = s.get("symbol", "")
+        mkt_p = s.get("currentPrice", 0.0)
+        locked_str = "YES" if s.get("locked") else "NO"
+        curr = s.get("currency", "USD")
+        
+        for b in s.get("buys", []):
+            writer.writerow([sym, b.get("p", 0.0), b.get("q", 0.0), "BUY", mkt_p, locked_str, curr])
+        for sl in s.get("sells", []):
+            writer.writerow([sym, sl.get("p", 0.0), sl.get("q", 0.0), "SELL", mkt_p, locked_str, curr])
+            
+    return output.getvalue().encode("utf-8")
+
+def get_portfolio_live_price(ticker_symbol: str, currency: str):
+    try:
+        stock = yf.Ticker(ticker_symbol)
+        hist = stock.history(period="2d")
+        if not hist.empty:
+            price = hist['Close'].iloc[-1]
+            return float(price)
+    except Exception:
+        pass
+    return None
+
 # --- Internationalization ---
 from translations import TRANSLATIONS
 
@@ -1549,12 +1775,38 @@ def render_ratio_card(label, value_str, status, description):
     return card_html
 
 
+def render_portfolio_card(label, value_str, status, description=""):
+    colors = {
+        'good': {'bg': '#1c2030', 'border': '#089981', 'text': '#089981'},
+        'warning': {'bg': '#1c2030', 'border': '#ff7f0e', 'text': '#ff7f0e'},
+        'critical': {'bg': '#1c2030', 'border': '#f23645', 'text': '#f23645'},
+        'neutral': {'bg': '#1c2030', 'border': '#848e9c', 'text': '#ffffff'}
+    }
+    c = colors.get(status, colors['neutral'])
+    lang = st.session_state.get("language", "en")
+    border_style = f"border-right: 5px solid {c['border']};" if lang == "he" else f"border-left: 5px solid {c['border']};"
+    align_text = 'right' if lang == 'he' else 'left'
+    
+    desc_html = ""
+    if description:
+        desc_html = f'<p style="margin: 0; color: #d1d4dc !important; font-size: 10px; line-height: 1.4; font-family: \'Outfit\', \'Rubik\', sans-serif; text-align: {align_text} !important;">{description}</p>'
+        
+    card_html = f"""
+    <div style="background-color: {c['bg']} !important; border: 1px solid #2a2e39 !important; {border_style} padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.15); box-sizing: border-box; min-height: 120px;">
+        <h4 style="margin: 0; color: #848e9c !important; font-size: 11px; font-weight: 600; text-transform: uppercase; font-family: 'Outfit', 'Rubik', sans-serif; text-align: {align_text} !important;">{label}</h4>
+        <h2 style="margin: 5px 0; color: {c['text']} !important; font-size: 18px; font-weight: 700; font-family: 'Outfit', 'Rubik', sans-serif; text-align: {align_text} !important;">{value_str}</h2>
+        {desc_html}
+    </div>
+    """
+    return card_html
+
+
 st.set_page_config(page_title="Comprehensive Stock Dashboard", layout="wide")
 
 # --- Sidebar Navigation ---
 st.sidebar.title(tr("navigation"))
-pages = ["Dashboard", "Compare", "Watchlist"]
-page_format_func = lambda x: tr("dashboard") if x == "Dashboard" else (tr("compare_stocks") if x == "Compare" else tr("watchlist"))
+pages = ["Dashboard", "Compare", "Watchlist", "Portfolio"]
+page_format_func = lambda x: tr("dashboard") if x == "Dashboard" else (tr("compare_stocks") if x == "Compare" else (tr("watchlist") if x == "Watchlist" else tr("portfolio")))
 try:
     page_index = pages.index(st.session_state.page_selector)
 except ValueError:
@@ -3379,6 +3631,402 @@ elif st.session_state.page_selector == "Watchlist":
             st.markdown("---")
     else:
         st.info("Watchlist is currently empty. Add a section above first!")
+
+
+# ==========================================
+# PAGE 3: PORTFOLIO
+# ==========================================
+elif st.session_state.page_selector == "Portfolio":
+    st.title(tr("portfolio"))
+
+    if "portfolio_data" not in st.session_state:
+        st.session_state.portfolio_data = load_portfolio()
+    
+    if "display_currency" not in st.session_state:
+        st.session_state.display_currency = "USD"
+        
+    if "usd_rate" not in st.session_state:
+        st.session_state.usd_rate = 3.70
+
+    # Header controls: Rate and Display Currency
+    col_rate, col_curr = st.columns([1, 1])
+    
+    with col_rate:
+        usd_rate_val = st.number_input(
+            tr("portfolio_exchange_rate"),
+            value=st.session_state.usd_rate,
+            step=0.01,
+            format="%.4f"
+        )
+        if usd_rate_val != st.session_state.usd_rate:
+            st.session_state.usd_rate = usd_rate_val
+            st.rerun()
+
+    with col_curr:
+        display_curr_options = ["USD", "ILS"]
+        selected_display_curr = st.radio(
+            tr("select_view"),
+            display_curr_options,
+            index=display_curr_options.index(st.session_state.display_currency),
+            horizontal=True
+        )
+        if selected_display_curr != st.session_state.display_currency:
+            st.session_state.display_currency = selected_display_curr
+            st.rerun()
+
+    # Toolbar buttons
+    st.markdown("### " + tr("portfolio_actions"))
+    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+    
+    with col_btn1:
+        if st.button("➕ " + tr("portfolio_add_position"), key="add_stock_pos", use_container_width=True):
+            import random
+            st.session_state.portfolio_data.append({
+                "id": f"{pd.Timestamp.now().timestamp()}_{random.random()}",
+                "symbol": "",
+                "currency": "USD",
+                "buys": [{"p": 0.0, "q": 0.0}],
+                "sells": [],
+                "currentPrice": 0.0,
+                "locked": False
+            })
+            save_portfolio(st.session_state.portfolio_data)
+            st.rerun()
+
+    with col_btn2:
+        if st.button("🔄 " + tr("portfolio_update_prices"), key="update_stock_prices", use_container_width=True):
+            updated_count = 0
+            with st.spinner(tr("pulling_data").format(ticker="all")):
+                for s in st.session_state.portfolio_data:
+                    if s.get("symbol") and not s.get("locked"):
+                        live_price = get_portfolio_live_price(s["symbol"], s["currency"])
+                        if live_price is not None:
+                            s["currentPrice"] = live_price
+                            updated_count += 1
+            if updated_count > 0:
+                save_portfolio(st.session_state.portfolio_data)
+                st.success(f"Updated {updated_count} prices!")
+                st.rerun()
+
+    with col_btn3:
+        # Import CSV
+        csv_file = st.file_uploader(tr("portfolio_import_csv"), type=["csv"], label_visibility="collapsed")
+        if csv_file is not None:
+            try:
+                imported_stocks = import_portfolio_csv(csv_file.read())
+                if imported_stocks:
+                    st.session_state.portfolio_data = imported_stocks
+                    save_portfolio(st.session_state.portfolio_data)
+                    st.success("CSV Imported successfully!")
+                    st.rerun()
+                else:
+                    st.error("No valid positions found in CSV.")
+            except Exception as ex:
+                st.error(f"Error: {ex}")
+
+    with col_btn4:
+        # Export CSV
+        try:
+            csv_bytes = export_portfolio_csv(st.session_state.portfolio_data)
+            st.download_button(
+                label="📥 " + tr("portfolio_export_csv"),
+                data=csv_bytes,
+                file_name="portfolio_backup.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        except Exception as ex:
+            st.error(f"Error: {ex}")
+
+    # Calculations
+    usd_rate = st.session_state.usd_rate if st.session_state.usd_rate > 0 else 1.0
+    total_remaining_cost_usd = 0.0
+    total_market_value_usd = 0.0
+    total_realized_usd = 0.0
+    total_unrealized_usd = 0.0
+
+    for s in st.session_state.portfolio_data:
+        m = calculate_stock_metrics(s)
+        factor = 1.0 / usd_rate if s.get("currency") == "ILS" else 1.0
+        total_remaining_cost_usd += m["remaining_cost_basis"] * factor
+        total_market_value_usd += m["current_total_value"] * factor
+        total_realized_usd += m["realized_pl"] * factor
+        total_unrealized_usd += m["unrealized_pl"] * factor
+
+    total_profit_usd = total_realized_usd + total_unrealized_usd
+    total_profit_pct = (total_profit_usd / (total_remaining_cost_usd + abs(total_realized_usd))) * 100.0 if (total_remaining_cost_usd + abs(total_realized_usd)) > 0 else 0.0
+    open_return_pct = (total_unrealized_usd / total_remaining_cost_usd) * 100.0 if total_remaining_cost_usd > 0 else 0.0
+
+    display_factor = usd_rate if st.session_state.display_currency == "ILS" else 1.0
+    sym = "₪" if st.session_state.display_currency == "ILS" else "$"
+
+    # Cards layout
+    col_card1, col_card2, col_card3, col_card4, col_card5, col_card6 = st.columns(6)
+    with col_card1:
+        st.markdown(render_portfolio_card(tr("portfolio_cost_basis"), f"{sym}{(total_remaining_cost_usd * display_factor):,.2f}", "neutral"), unsafe_allow_html=True)
+    with col_card2:
+        st.markdown(render_portfolio_card(tr("portfolio_market_value"), f"{sym}{(total_market_value_usd * display_factor):,.2f}", "warning" if total_market_value_usd >= total_remaining_cost_usd else "critical"), unsafe_allow_html=True)
+    with col_card3:
+        st.markdown(render_portfolio_card(tr("portfolio_realized_pl"), f"{sym}{(total_realized_usd * display_factor):,.2f}", "good" if total_realized_usd >= 0 else "critical"), unsafe_allow_html=True)
+    with col_card4:
+        st.markdown(render_portfolio_card(tr("portfolio_unrealized_pl"), f"{sym}{(total_unrealized_usd * display_factor):,.2f}", "good" if total_unrealized_usd >= 0 else "critical"), unsafe_allow_html=True)
+    with col_card5:
+        st.markdown(render_portfolio_card(tr("portfolio_total_return"), f"{total_profit_pct:+.2f}%", "good" if total_profit_usd >= 0 else "critical"), unsafe_allow_html=True)
+    with col_card6:
+        st.markdown(render_portfolio_card(tr("portfolio_open_return"), f"{open_return_pct:+.2f}%", "good" if total_unrealized_usd >= 0 else "critical"), unsafe_allow_html=True)
+
+    # Detailed Table
+    st.markdown("---")
+    st.markdown("### " + tr("portfolio"))
+
+    if not st.session_state.portfolio_data:
+        st.info(tr("portfolio_empty"))
+    else:
+        align_text = "right" if st.session_state.language == "he" else "left"
+        lang_dir = "rtl" if st.session_state.language == "he" else "ltr"
+        
+        table_html = f"""
+        <div style="overflow-x: auto; font-family: 'Outfit', 'Rubik', sans-serif;" dir="{lang_dir}">
+            <table style="width: 100%; border-collapse: collapse; text-align: {align_text}; color: #ffffff; background-color: #1c2030; border: 1px solid #2a2e39; border-radius: 8px;">
+                <thead>
+                    <tr style="border-bottom: 2px solid #2a2e39; background-color: #131722;">
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_actions')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_currency')} / {tr('ticker_input_placeholder').split()[0]}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_average_buy')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_initial_capital')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_remaining_cost')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_value')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_market_price')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_realized_pl')}</th>
+                        <th style="padding: 12px; border-bottom: 1px solid #2a2e39;">{tr('portfolio_unrealized_pl')}</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+        
+        for s in st.session_state.portfolio_data:
+            m = calculate_stock_metrics(s)
+            s_curr_sym = "₪" if s.get("currency") == "ILS" else "$"
+            lock_icon = "🔒" if s.get("locked") else "🔓"
+            
+            raw_buy_p = m["avg_buy_price"]
+            curr_mkt_p = s.get("currentPrice", 0.0)
+            profit_pct = ((curr_mkt_p - raw_buy_p) / raw_buy_p * 100.0) if raw_buy_p > 0 else 0.0
+            
+            realized_color = "#089981" if m["realized_pl"] >= 0 else "#f23645"
+            unrealized_color = "#089981" if m["unrealized_pl"] >= 0 else "#f23645"
+            
+            initial_cap_str = f"{s_curr_sym}{m['total_initial_capital']:,.2f}"
+            remaining_cost_str = f"{s_curr_sym}{m['remaining_cost_basis']:,.2f}"
+            curr_val_str = f"{s_curr_sym}{m['current_total_value']:,.2f}"
+            
+            realized_str = f"{s_curr_sym}{m['realized_pl']:,.2f}"
+            unrealized_str = f"{s_curr_sym}{m['unrealized_pl']:,.2f} ({profit_pct:+.2f}%)"
+            
+            avg_price_display = f"{m['avg_buy_price']:.2f}"
+            if s.get("currency") == "ILS":
+                avg_price_display += " (אג')"
+                mkt_price_display = f"{curr_mkt_p:.2f} (אג')"
+            else:
+                mkt_price_display = f"{curr_mkt_p:.2f}"
+
+            table_html += f"""
+                    <tr style="border-bottom: 1px solid #2a2e39; hover: background-color: #242936;">
+                        <td style="padding: 10px;">{lock_icon}</td>
+                        <td style="padding: 10px; font-weight: bold; color: #2962ff;">{s.get('symbol', 'N/A')} <span style="font-size: 10px; color: #848e9c;">({s.get('currency')})</span></td>
+                        <td style="padding: 10px;">{avg_price_display}</td>
+                        <td style="padding: 10px;">{initial_cap_str}</td>
+                        <td style="padding: 10px;">{remaining_cost_str}</td>
+                        <td style="padding: 10px; font-weight: bold;">{curr_val_str}</td>
+                        <td style="padding: 10px;">{mkt_price_display}</td>
+                        <td style="padding: 10px; color: {realized_color}; font-weight: bold;">{realized_str}</td>
+                        <td style="padding: 10px; color: {unrealized_color}; font-weight: bold;">{unrealized_str}</td>
+                    </tr>
+            """
+            
+        table_html += """
+                </tbody>
+            </table>
+        </div>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Position Management Section
+        mgmt_title = "ניהול פוזיציות ופרטי קניות/מכירות" if st.session_state.language == "he" else "Manage Positions & Buy/Sell Details"
+        st.markdown("### " + mgmt_title)
+        
+        # Helper tip for Israeli stocks suffix and units
+        if st.session_state.language == "he":
+            st.info("💡 עבור מניות בישראל, יש להשתמש בסיומת .TA (למשל ICL.TA). מחירים עבור מניות אלו מוזנים ומוצגים באגורות, והחישובים הסופיים מוצגים בשקלים (₪).")
+        else:
+            st.info("💡 For Israeli stocks, use the .TA suffix (e.g. ICL.TA). Prices for these stocks are entered and shown in Agorot, while final calculations are converted to ILS (₪).")
+
+        for index, s in enumerate(st.session_state.portfolio_data):
+            symbol_label = s.get("symbol") if s.get("symbol") else f"Position #{index+1}"
+            exp_title = f"{symbol_label} ({s.get('currency')})"
+            if s.get("locked"):
+                exp_title += " 🔒 " + tr("portfolio_locked")
+            
+            with st.expander(exp_title, expanded=False):
+                col_sym, col_cur, col_pr, col_lk, col_del_btn = st.columns([2, 2, 2, 1, 1])
+                is_disabled = s.get("locked", False)
+                
+                with col_sym:
+                    new_sym = st.text_input(
+                        tr("ticker_input_placeholder").split()[0],
+                        value=s.get("symbol", ""),
+                        key=f"sym_input_{index}_{s['id']}",
+                        disabled=is_disabled
+                    ).upper().strip()
+                    if new_sym != s.get("symbol"):
+                        s["symbol"] = new_sym
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                
+                with col_cur:
+                    cur_opts = ["USD", "ILS"]
+                    new_cur = st.selectbox(
+                        tr("portfolio_currency"),
+                        cur_opts,
+                        index=cur_opts.index(s.get("currency", "USD")),
+                        key=f"cur_select_{index}_{s['id']}",
+                        disabled=is_disabled
+                    )
+                    if new_cur != s.get("currency"):
+                        s["currency"] = new_cur
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                        
+                with col_pr:
+                    lbl = tr("portfolio_market_price")
+                    if s.get("currency") == "ILS":
+                        lbl += " (אגורות)"
+                    new_price = st.number_input(
+                        lbl,
+                        value=float(s.get("currentPrice", 0.0)),
+                        step=0.01,
+                        key=f"price_input_{index}_{s['id']}",
+                        disabled=is_disabled
+                    )
+                    if new_price != s.get("currentPrice"):
+                        s["currentPrice"] = new_price
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                        
+                with col_lk:
+                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                    new_locked = st.checkbox(
+                        "🔒",
+                        value=s.get("locked", False),
+                        key=f"lock_checkbox_{index}_{s['id']}"
+                    )
+                    if new_locked != s.get("locked"):
+                        s["locked"] = new_locked
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                        
+                with col_del_btn:
+                    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                    if st.button("🗑️", key=f"del_pos_btn_{index}_{s['id']}", help=tr("portfolio_delete_position"), use_container_width=True):
+                        st.session_state.portfolio_data.pop(index)
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+
+                col_buys, col_sells = st.columns(2)
+                
+                with col_buys:
+                    st.markdown(f"##### 📥 {tr('portfolio_buys')}")
+                    buys_to_remove = []
+                    for b_idx, buy in enumerate(s.get("buys", [])):
+                        col_bp, col_bq, col_bd = st.columns([3, 3, 1])
+                        with col_bp:
+                            buy_p = col_bp.number_input(
+                                f"Price {b_idx+1}",
+                                value=float(buy.get("p", 0.0)),
+                                step=0.01,
+                                key=f"buy_p_{index}_{b_idx}_{s['id']}",
+                                disabled=is_disabled,
+                                label_visibility="collapsed"
+                            )
+                            if buy_p != buy.get("p"):
+                                buy["p"] = buy_p
+                                save_portfolio(st.session_state.portfolio_data)
+                        with col_bq:
+                            buy_q = col_bq.number_input(
+                                f"Qty {b_idx+1}",
+                                value=float(buy.get("q", 0.0)),
+                                step=0.01,
+                                key=f"buy_q_{index}_{b_idx}_{s['id']}",
+                                disabled=is_disabled,
+                                label_visibility="collapsed"
+                            )
+                            if buy_q != buy.get("q"):
+                                buy["q"] = buy_q
+                                save_portfolio(st.session_state.portfolio_data)
+                        with col_bd:
+                            if not is_disabled:
+                                if col_bd.button("❌", key=f"del_buy_{index}_{b_idx}_{s['id']}", use_container_width=True):
+                                    buys_to_remove.append(b_idx)
+                                    
+                    if buys_to_remove:
+                        for b_idx in sorted(buys_to_remove, reverse=True):
+                            s["buys"].pop(b_idx)
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                        
+                    if not is_disabled:
+                        if st.button("➕ " + tr("portfolio_add_buy"), key=f"add_buy_btn_{index}_{s['id']}", use_container_width=True):
+                            s["buys"].append({"p": 0.0, "q": 0.0})
+                            save_portfolio(st.session_state.portfolio_data)
+                            st.rerun()
+                            
+                with col_sells:
+                    st.markdown(f"##### 📤 {tr('portfolio_sells')}")
+                    sells_to_remove = []
+                    for s_idx, sell in enumerate(s.get("sells", [])):
+                        col_sp, col_sq, col_sd = st.columns([3, 3, 1])
+                        with col_sp:
+                            sell_p = col_sp.number_input(
+                                f"Price {s_idx+1}",
+                                value=float(sell.get("p", 0.0)),
+                                step=0.01,
+                                key=f"sell_p_{index}_{s_idx}_{s['id']}",
+                                disabled=is_disabled,
+                                label_visibility="collapsed"
+                            )
+                            if sell_p != sell.get("p"):
+                                sell["p"] = sell_p
+                                save_portfolio(st.session_state.portfolio_data)
+                        with col_sq:
+                            sell_q = col_sq.number_input(
+                                f"Qty {s_idx+1}",
+                                value=float(sell.get("q", 0.0)),
+                                step=0.01,
+                                key=f"sell_q_{index}_{s_idx}_{s['id']}",
+                                disabled=is_disabled,
+                                label_visibility="collapsed"
+                            )
+                            if sell_q != sell.get("q"):
+                                sell["q"] = sell_q
+                                save_portfolio(st.session_state.portfolio_data)
+                        with col_sd:
+                            if not is_disabled:
+                                if col_sd.button("❌", key=f"del_sell_{index}_{s_idx}_{s['id']}", use_container_width=True):
+                                    sells_to_remove.append(s_idx)
+                                    
+                    if sells_to_remove:
+                        for s_idx in sorted(sells_to_remove, reverse=True):
+                            s["sells"].pop(s_idx)
+                        save_portfolio(st.session_state.portfolio_data)
+                        st.rerun()
+                        
+                    if not is_disabled:
+                        if st.button("➕ " + tr("portfolio_add_sell"), key=f"add_sell_btn_{index}_{s['id']}", use_container_width=True):
+                            s["sells"].append({"p": 0.0, "q": 0.0})
+                            save_portfolio(st.session_state.portfolio_data)
+                            st.rerun()
+
 
 # --- Execution Wrapper ---
 if __name__ == "__main__":
