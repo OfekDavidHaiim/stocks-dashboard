@@ -320,7 +320,11 @@ TRANSLATIONS = {
         "portfolio_delete_btn": "Delete Portfolio",
         "portfolio_deleted": "Portfolio deleted successfully.",
         "portfolio_exists": "A portfolio with this name already exists.",
-        "cannot_delete_last_portfolio": "Cannot delete the last remaining portfolio."
+        "cannot_delete_last_portfolio": "Cannot delete the last remaining portfolio.",
+        "portfolio_visual_analysis": "Portfolio Visual Analysis",
+        "portfolio_asset_allocation": "Asset Allocation (by Market Value)",
+        "portfolio_currency_exposure": "Currency Exposure",
+        "portfolio_pl_breakdown": "P&L Breakdown by Ticker"
     },
     "he": {
         "navigation": "ניווט",
@@ -643,6 +647,10 @@ TRANSLATIONS = {
         "portfolio_delete_btn": "מחק תיק",
         "portfolio_deleted": "תיק ההשקעות נמחק בהצלחה.",
         "portfolio_exists": "תיק השקעות בשם זה כבר קיים.",
-        "cannot_delete_last_portfolio": "לא ניתן למחוק את תיק ההשקעות האחרון."
+        "cannot_delete_last_portfolio": "לא ניתן למחוק את תיק ההשקעות האחרון.",
+        "portfolio_visual_analysis": "ניתוח הרכב וביצועי התיק",
+        "portfolio_asset_allocation": "פילוג נכסים (לפי שווי שוק)",
+        "portfolio_currency_exposure": "חשיפת מטבעות",
+        "portfolio_pl_breakdown": "רווח והפסד (P&L) לפי מניה"
     }
 }

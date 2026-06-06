@@ -1919,6 +1919,68 @@ if st.session_state.page_selector == "Dashboard":
                 </div>
                 """, unsafe_allow_html=True)
 
+                # --- Quick Actions Expander ---
+                quick_actions_title = "⚡ פעולות מהירות (הוספה למעקב / תיק השקעות)" if st.session_state.language == "he" else "⚡ Quick Actions (Add to Watchlist / Portfolio)"
+                with st.expander(quick_actions_title, expanded=False):
+                    col_qa_wl, col_qa_port = st.columns(2)
+                    
+                    with col_qa_wl:
+                        if "watchlists" in st.session_state and st.session_state.watchlists:
+                            wl_options = []
+                            for wl_name, wl_sections in st.session_state.watchlists.items():
+                                for section in wl_sections:
+                                    wl_options.append((wl_name, section["title"]))
+                            if wl_options:
+                                select_wl_lbl = "הוסף לרשימת מעקב:" if st.session_state.language == "he" else "Add to Watchlist:"
+                                selected_wl_opt = st.selectbox(
+                                    select_wl_lbl,
+                                    options=wl_options,
+                                    format_func=lambda x: f"{x[0]} ➡️ {x[1]}",
+                                    key="quick_add_watchlist_selector"
+                                )
+                                if st.button("➕ " + ("הוסף למעקב" if st.session_state.language == "he" else "Add to Watchlist"), key="quick_add_wl_btn", use_container_width=True):
+                                    target_wl, target_sec = selected_wl_opt
+                                    for section in st.session_state.watchlists[target_wl]:
+                                        if section["title"] == target_sec:
+                                            ticker_exists = any(ticker_input in s["tickers"] for s in st.session_state.watchlists[target_wl])
+                                            if not ticker_exists:
+                                                section["tickers"].append(ticker_input)
+                                                save_watchlists(st.session_state.watchlists)
+                                                st.success(f"{ticker_input} added to {target_wl} ({target_sec})!")
+                                                st.rerun()
+                                            else:
+                                                st.warning(f"{ticker_input} is already in {target_wl}!")
+                                                
+                    with col_qa_port:
+                        if "portfolio_dict" in st.session_state and st.session_state.portfolio_dict:
+                            port_options = list(st.session_state.portfolio_dict.keys())
+                            if port_options:
+                                select_port_lbl = "הוסף לתיק השקעות:" if st.session_state.language == "he" else "Add to Portfolio:"
+                                selected_port_opt = st.selectbox(
+                                    select_port_lbl,
+                                    options=port_options,
+                                    key="quick_add_portfolio_selector"
+                                )
+                                if st.button("💼 " + ("הוסף לתיק" if st.session_state.language == "he" else "Add to Portfolio"), key="quick_add_port_btn", use_container_width=True):
+                                    import random
+                                    exists_in_port = any(pos.get("symbol") == ticker_input for pos in st.session_state.portfolio_dict[selected_port_opt])
+                                    if not exists_in_port:
+                                        st.session_state.portfolio_dict[selected_port_opt].append({
+                                            "id": f"{pd.Timestamp.now().timestamp()}_{random.random()}",
+                                            "symbol": ticker_input,
+                                            "currency": "USD" if not ticker_input.endswith(".TA") else "ILS",
+                                            "buys": [{"p": 0.0, "q": 0.0}],
+                                            "sells": [],
+                                            "currentPrice": 0.0,
+                                            "prevClosePrice": 0.0,
+                                            "locked": False
+                                        })
+                                        save_portfolio(st.session_state.portfolio_dict)
+                                        st.success(f"{ticker_input} added to Portfolio '{selected_port_opt}'!")
+                                        st.rerun()
+                                    else:
+                                        st.warning(f"{ticker_input} is already in Portfolio '{selected_port_opt}'!")
+
                 with st.expander(tr("company_description")):
                     st.write(summary)
                 # --- 2. Create Tabs ---
@@ -3905,6 +3967,108 @@ elif st.session_state.page_selector == "Portfolio":
     with col_card7:
         daily_change_str = f"{sym}{(total_daily_change_usd * display_factor):+,.2f} ({daily_change_pct:+.2f}%)"
         st.markdown(render_portfolio_card(tr("portfolio_today_change"), daily_change_str, "good" if total_daily_change_usd >= 0 else "critical"), unsafe_allow_html=True)
+
+    # Visualizations section
+    if portfolio_data:
+        asset_labels = []
+        asset_values = []
+        for s in portfolio_data:
+            m = calculate_stock_metrics(s)
+            val_usd = m["current_total_value"] * (1.0 / usd_rate if s.get("currency") == "ILS" else 1.0)
+            if val_usd > 0:
+                asset_labels.append(s.get("symbol", "N/A"))
+                asset_values.append(val_usd * display_factor)
+                
+        curr_labels = ["USD", "ILS"]
+        usd_val = sum(calculate_stock_metrics(s)["current_total_value"] for s in portfolio_data if s.get("currency") == "USD")
+        ils_val_in_usd = sum(calculate_stock_metrics(s)["current_total_value"] * (1.0 / usd_rate) for s in portfolio_data if s.get("currency") == "ILS")
+        curr_values = [usd_val * display_factor, ils_val_in_usd * display_factor]
+        
+        pl_labels = []
+        pl_values = []
+        for s in portfolio_data:
+            m = calculate_stock_metrics(s)
+            pl_usd = (m["realized_pl"] + m["unrealized_pl"]) * (1.0 / usd_rate if s.get("currency") == "ILS" else 1.0)
+            pl_labels.append(s.get("symbol", "N/A"))
+            pl_values.append(pl_usd * display_factor)
+
+        # Only show visuals if there is either positive market value or non-zero P&L
+        has_assets = any(v > 0 for v in asset_values)
+        has_pl = any(v != 0 for v in pl_values)
+        
+        if has_assets or has_pl:
+            st.markdown("---")
+            st.markdown(f"### 📊 {tr('portfolio_visual_analysis')}")
+            
+            if has_assets:
+                col_vis1, col_vis2 = st.columns(2)
+                import plotly.graph_objects as go
+                
+                with col_vis1:
+                    fig_asset = go.Figure(data=[go.Pie(
+                        labels=asset_labels,
+                        values=asset_values,
+                        hole=0.4,
+                        hoverinfo="label+percent+value",
+                        textinfo="label+percent",
+                        marker=dict(line=dict(color="#1c2030", width=2))
+                    )])
+                    fig_asset.update_layout(
+                        title=dict(text=f"<b>{tr('portfolio_asset_allocation')}</b>", x=0.5, font=dict(size=14, color="#ffffff")),
+                        margin=dict(t=40, b=10, l=10, r=10),
+                        showlegend=True,
+                        height=300
+                    )
+                    st.plotly_chart(fig_asset, use_container_width=True)
+                    
+                with col_vis2:
+                    filtered_curr_labels = []
+                    filtered_curr_values = []
+                    for lbl, val in zip(curr_labels, curr_values):
+                        if val > 0:
+                            filtered_curr_labels.append(lbl)
+                            filtered_curr_values.append(val)
+                            
+                    fig_curr = go.Figure(data=[go.Pie(
+                        labels=filtered_curr_labels,
+                        values=filtered_curr_values,
+                        hole=0.4,
+                        hoverinfo="label+percent+value",
+                        textinfo="label+percent",
+                        marker=dict(colors=["#2962ff", "#089981"], line=dict(color="#1c2030", width=2))
+                    )])
+                    fig_curr.update_layout(
+                        title=dict(text=f"<b>{tr('portfolio_currency_exposure')}</b>", x=0.5, font=dict(size=14, color="#ffffff")),
+                        margin=dict(t=40, b=10, l=10, r=10),
+                        showlegend=True,
+                        height=300
+                    )
+                    st.plotly_chart(fig_curr, use_container_width=True)
+            
+            if has_pl:
+                import plotly.graph_objects as go
+                sorted_pl = sorted(zip(pl_labels, pl_values), key=lambda x: x[1])
+                s_labels = [x[0] for x in sorted_pl]
+                s_values = [x[1] for x in sorted_pl]
+                
+                bar_colors = ['#089981' if val >= 0 else '#f23645' for val in s_values]
+                
+                fig_pl = go.Figure(data=[go.Bar(
+                    y=s_labels,
+                    x=s_values,
+                    orientation='h',
+                    marker_color=bar_colors,
+                    hoverinfo="y+x",
+                    text=[f"{sym}{val:+,.2f}" for val in s_values],
+                    textposition='auto'
+                )])
+                fig_pl.update_layout(
+                    title=dict(text=f"<b>{tr('portfolio_pl_breakdown')} ({sym})</b>", x=0.5, font=dict(size=14, color="#ffffff")),
+                    margin=dict(t=40, b=20, l=20, r=20),
+                    xaxis=dict(gridcolor="#2a2e39"),
+                    height=max(180, 120 + len(pl_labels) * 35)
+                )
+                st.plotly_chart(fig_pl, use_container_width=True)
 
     # Detailed Table
     st.markdown("---")
