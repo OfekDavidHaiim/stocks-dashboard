@@ -64,17 +64,20 @@ def save_watchlists(watchlists_dict):
 PORTFOLIO_FILE = "portfolio.json"
 
 def load_portfolio():
-    default_portfolio = [
-        {
-            "id": "1",
-            "symbol": "NVDA",
-            "currency": "USD",
-            "buys": [{"p": 102.98, "q": 52.0}],
-            "sells": [],
-            "currentPrice": 120.0,
-            "locked": False
-        }
-    ]
+    default_portfolio = {
+        "Discount": [
+            {
+                "id": "1",
+                "symbol": "NVDA",
+                "currency": "USD",
+                "buys": [{"p": 102.98, "q": 52.0}],
+                "sells": [],
+                "currentPrice": 120.0,
+                "prevClosePrice": 120.0,
+                "locked": False
+            }
+        ]
+    }
     if not os.path.exists(PORTFOLIO_FILE):
         return default_portfolio
     try:
@@ -82,29 +85,37 @@ def load_portfolio():
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            for item in data:
-                if "id" not in item:
-                    item["id"] = f"{pd.Timestamp.now().timestamp()}_{random.random()}"
-                if "symbol" not in item:
-                    item["symbol"] = ""
-                if "currency" not in item:
-                    item["currency"] = "USD"
-                if "buys" not in item:
-                    item["buys"] = []
-                if "sells" not in item:
-                    item["sells"] = []
-                if "currentPrice" not in item:
-                    item["currentPrice"] = 0.0
-                elif isinstance(item["currentPrice"], (list, tuple)):
-                    item["currentPrice"] = float(item["currentPrice"][0]) if len(item["currentPrice"]) > 0 else 0.0
-                
-                if "prevClosePrice" not in item:
-                    item["prevClosePrice"] = item.get("currentPrice", 0.0)
-                elif isinstance(item["prevClosePrice"], (list, tuple)):
-                    item["prevClosePrice"] = float(item["prevClosePrice"][0]) if len(item["prevClosePrice"]) > 0 else 0.0
+            data = {"Discount": data}
+        if isinstance(data, dict):
+            if not data:
+                return default_portfolio
+            for port_name, port_list in data.items():
+                if not isinstance(port_list, list):
+                    data[port_name] = []
+                    continue
+                for item in port_list:
+                    if "id" not in item:
+                        item["id"] = f"{pd.Timestamp.now().timestamp()}_{random.random()}"
+                    if "symbol" not in item:
+                        item["symbol"] = ""
+                    if "currency" not in item:
+                        item["currency"] = "USD"
+                    if "buys" not in item:
+                        item["buys"] = []
+                    if "sells" not in item:
+                        item["sells"] = []
+                    if "currentPrice" not in item:
+                        item["currentPrice"] = 0.0
+                    elif isinstance(item["currentPrice"], (list, tuple)):
+                        item["currentPrice"] = float(item["currentPrice"][0]) if len(item["currentPrice"]) > 0 else 0.0
                     
-                if "locked" not in item:
-                    item["locked"] = False
+                    if "prevClosePrice" not in item:
+                        item["prevClosePrice"] = item.get("currentPrice", 0.0)
+                    elif isinstance(item["prevClosePrice"], (list, tuple)):
+                        item["prevClosePrice"] = float(item["prevClosePrice"][0]) if len(item["prevClosePrice"]) > 0 else 0.0
+                        
+                    if "locked" not in item:
+                        item["locked"] = False
             return data
         return default_portfolio
     except Exception:
@@ -3662,8 +3673,17 @@ elif st.session_state.page_selector == "Watchlist":
 elif st.session_state.page_selector == "Portfolio":
     st.title(tr("portfolio"))
 
-    if "portfolio_data" not in st.session_state:
-        st.session_state.portfolio_data = load_portfolio()
+    if "portfolio_dict" not in st.session_state:
+        st.session_state.portfolio_dict = load_portfolio()
+        
+    portfolio_options = list(st.session_state.portfolio_dict.keys())
+    if "active_portfolio" not in st.session_state or st.session_state.active_portfolio not in portfolio_options:
+        st.session_state.active_portfolio = portfolio_options[0] if portfolio_options else "Discount"
+        
+    if st.session_state.active_portfolio not in st.session_state.portfolio_dict:
+        st.session_state.portfolio_dict[st.session_state.active_portfolio] = []
+        
+    portfolio_data = st.session_state.portfolio_dict[st.session_state.active_portfolio]
     
     # Sort: open positions first (remaining_qty > 0), then by largest current total value
     def get_portfolio_sort_key(item_stock):
@@ -3672,7 +3692,7 @@ elif st.session_state.page_selector == "Portfolio":
         total_val = metrics["current_total_value"]
         return (is_open, total_val)
         
-    st.session_state.portfolio_data.sort(key=get_portfolio_sort_key, reverse=True)
+    portfolio_data.sort(key=get_portfolio_sort_key, reverse=True)
     
     if "display_currency" not in st.session_state:
         st.session_state.display_currency = "USD"
@@ -3685,6 +3705,54 @@ elif st.session_state.page_selector == "Portfolio":
     if "portfolio_toast" in st.session_state and st.session_state.portfolio_toast:
         st.toast(st.session_state.portfolio_toast, icon="✅")
         st.session_state.portfolio_toast = None
+
+    # Portfolio Selection & Creation UI
+    col_sel, col_del = st.columns([3, 2])
+    selected_port = col_sel.selectbox(
+        tr("portfolio_select"),
+        portfolio_options,
+        index=portfolio_options.index(st.session_state.active_portfolio) if st.session_state.active_portfolio in portfolio_options else 0,
+        key="active_portfolio_selector"
+    )
+    if selected_port != st.session_state.active_portfolio:
+        st.session_state.active_portfolio = selected_port
+        st.rerun()
+        
+    col_del.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    if col_del.button("🗑️ " + tr("portfolio_delete_btn"), key="btn_del_port", use_container_width=True):
+        if len(portfolio_options) > 1:
+            del st.session_state.portfolio_dict[st.session_state.active_portfolio]
+            save_portfolio(st.session_state.portfolio_dict)
+            st.session_state.active_portfolio = list(st.session_state.portfolio_dict.keys())[0]
+            st.session_state.portfolio_toast = tr("portfolio_deleted")
+            st.rerun()
+        else:
+            st.error(tr("cannot_delete_last_portfolio"))
+
+    with st.expander("📁 " + tr("portfolio_create")):
+        with st.form(key="create_portfolio_form", clear_on_submit=True):
+            new_port_name = st.text_input(tr("portfolio_enter_name")).strip()
+            submit_port = st.form_submit_button(label=tr("portfolio_create_btn"))
+            if submit_port and new_port_name:
+                if new_port_name not in st.session_state.portfolio_dict:
+                    st.session_state.portfolio_dict[new_port_name] = [
+                        {
+                            "id": f"{pd.Timestamp.now().timestamp()}_init",
+                            "symbol": "TICKER",
+                            "currency": "USD",
+                            "buys": [{"p": 0.0, "q": 0.0}],
+                            "sells": [],
+                            "currentPrice": 0.0,
+                            "prevClosePrice": 0.0,
+                            "locked": False
+                        }
+                    ]
+                    save_portfolio(st.session_state.portfolio_dict)
+                    st.session_state.active_portfolio = new_port_name
+                    st.session_state.portfolio_toast = f"Portfolio '{new_port_name}' created!"
+                    st.rerun()
+                else:
+                    st.warning(tr("portfolio_exists"))
 
     # Header controls: Rate and Display Currency
     col_rate, col_curr = st.columns([1, 1])
@@ -3719,7 +3787,7 @@ elif st.session_state.page_selector == "Portfolio":
     with col_btn1:
         if st.button("➕ " + tr("portfolio_add_position"), key="add_stock_pos", use_container_width=True):
             import random
-            st.session_state.portfolio_data.append({
+            portfolio_data.append({
                 "id": f"{pd.Timestamp.now().timestamp()}_{random.random()}",
                 "symbol": "TICKER",
                 "currency": "USD",
@@ -3729,7 +3797,7 @@ elif st.session_state.page_selector == "Portfolio":
                 "prevClosePrice": 0.0,
                 "locked": False
             })
-            save_portfolio(st.session_state.portfolio_data)
+            save_portfolio(st.session_state.portfolio_dict)
             st.session_state.portfolio_toast = "Position added successfully!"
             st.rerun()
 
@@ -3737,7 +3805,7 @@ elif st.session_state.page_selector == "Portfolio":
         if st.button("🔄 " + tr("portfolio_update_prices"), key="update_stock_prices", use_container_width=True):
             updated_count = 0
             with st.spinner(tr("pulling_data").format(ticker="all")):
-                for s in st.session_state.portfolio_data:
+                for s in portfolio_data:
                     if s.get("symbol") and not s.get("locked"):
                         live_price, prev_close = get_portfolio_live_price(s["symbol"], s["currency"])
                         if live_price is not None:
@@ -3745,7 +3813,7 @@ elif st.session_state.page_selector == "Portfolio":
                             s["prevClosePrice"] = prev_close
                             updated_count += 1
             if updated_count > 0:
-                save_portfolio(st.session_state.portfolio_data)
+                save_portfolio(st.session_state.portfolio_dict)
                 st.session_state.portfolio_toast = f"Updated {updated_count} stock prices successfully!"
                 st.rerun()
 
@@ -3756,8 +3824,8 @@ elif st.session_state.page_selector == "Portfolio":
             try:
                 imported_stocks = import_portfolio_csv(csv_file.read())
                 if imported_stocks:
-                    st.session_state.portfolio_data = imported_stocks
-                    save_portfolio(st.session_state.portfolio_data)
+                    st.session_state.portfolio_dict[st.session_state.active_portfolio] = imported_stocks
+                    save_portfolio(st.session_state.portfolio_dict)
                     st.session_state.portfolio_toast = "CSV imported successfully!"
                     st.rerun()
                 else:
@@ -3768,7 +3836,7 @@ elif st.session_state.page_selector == "Portfolio":
     with col_btn4:
         # Export CSV
         try:
-            csv_bytes = export_portfolio_csv(st.session_state.portfolio_data)
+            csv_bytes = export_portfolio_csv(portfolio_data)
             st.download_button(
                 label="📥 " + tr("portfolio_export_csv"),
                 data=csv_bytes,
@@ -3788,7 +3856,7 @@ elif st.session_state.page_selector == "Portfolio":
     total_daily_change_usd = 0.0
     total_prev_market_value_usd = 0.0
 
-    for s in st.session_state.portfolio_data:
+    for s in portfolio_data:
         m = calculate_stock_metrics(s)
         factor = 1.0 / usd_rate if s.get("currency") == "ILS" else 1.0
         total_remaining_cost_usd += m["remaining_cost_basis"] * factor
@@ -3842,7 +3910,7 @@ elif st.session_state.page_selector == "Portfolio":
     st.markdown("---")
     st.markdown("### " + tr("portfolio"))
 
-    if not st.session_state.portfolio_data:
+    if not portfolio_data:
         st.info(tr("portfolio_empty"))
     else:
         align_text = "right" if st.session_state.language == "he" else "left"
@@ -3865,7 +3933,7 @@ elif st.session_state.page_selector == "Portfolio":
 </thead>
 <tbody>"""
         
-        for s in st.session_state.portfolio_data:
+        for s in portfolio_data:
             m = calculate_stock_metrics(s)
             s_curr_sym = "₪" if s.get("currency") == "ILS" else "$"
             lock_icon = "🔒" if s.get("locked") else "🔓"
@@ -3933,7 +4001,7 @@ elif st.session_state.page_selector == "Portfolio":
         else:
             st.info("💡 For Israeli stocks, use the .TA suffix (e.g. ICL.TA). Prices for these stocks are entered and shown in Agorot, while final calculations are converted to ILS (₪).")
 
-        for index, s in enumerate(st.session_state.portfolio_data):
+        for index, s in enumerate(portfolio_data):
             symbol_label = s.get("symbol") if s.get("symbol") else f"Position #{index+1}"
             exp_title = f"{symbol_label} ({s.get('currency')})"
             if s.get("locked"):
@@ -3952,7 +4020,7 @@ elif st.session_state.page_selector == "Portfolio":
                     ).upper().strip()
                     if new_sym != s.get("symbol"):
                         s["symbol"] = new_sym
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                 
                 with col_cur:
@@ -3966,7 +4034,7 @@ elif st.session_state.page_selector == "Portfolio":
                     )
                     if new_cur != s.get("currency"):
                         s["currency"] = new_cur
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                         
                 with col_pr:
@@ -3982,7 +4050,7 @@ elif st.session_state.page_selector == "Portfolio":
                     )
                     if new_price != s.get("currentPrice"):
                         s["currentPrice"] = new_price
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                         
                 with col_lk:
@@ -3994,14 +4062,14 @@ elif st.session_state.page_selector == "Portfolio":
                     )
                     if new_locked != s.get("locked"):
                         s["locked"] = new_locked
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                         
                 with col_del_btn:
                     st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                     if st.button("🗑️", key=f"del_pos_btn_{index}_{s['id']}", help=tr("portfolio_delete_position"), use_container_width=True):
-                        st.session_state.portfolio_data.pop(index)
-                        save_portfolio(st.session_state.portfolio_data)
+                        portfolio_data.pop(index)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.session_state.portfolio_toast = "Position deleted!"
                         st.rerun()
 
@@ -4023,7 +4091,7 @@ elif st.session_state.page_selector == "Portfolio":
                             )
                             if buy_p != buy.get("p"):
                                 buy["p"] = buy_p
-                                save_portfolio(st.session_state.portfolio_data)
+                                save_portfolio(st.session_state.portfolio_dict)
                         with col_bq:
                             buy_q = col_bq.number_input(
                                 f"Qty {b_idx+1}",
@@ -4035,7 +4103,7 @@ elif st.session_state.page_selector == "Portfolio":
                             )
                             if buy_q != buy.get("q"):
                                 buy["q"] = buy_q
-                                save_portfolio(st.session_state.portfolio_data)
+                                save_portfolio(st.session_state.portfolio_dict)
                         with col_bd:
                             if not is_disabled:
                                 if col_bd.button("❌", key=f"del_buy_{index}_{b_idx}_{s['id']}", use_container_width=True):
@@ -4044,13 +4112,13 @@ elif st.session_state.page_selector == "Portfolio":
                     if buys_to_remove:
                         for b_idx in sorted(buys_to_remove, reverse=True):
                             s["buys"].pop(b_idx)
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                         
                     if not is_disabled:
                         if st.button("➕ " + tr("portfolio_add_buy"), key=f"add_buy_btn_{index}_{s['id']}", use_container_width=True):
                             s["buys"].append({"p": 0.0, "q": 0.0})
-                            save_portfolio(st.session_state.portfolio_data)
+                            save_portfolio(st.session_state.portfolio_dict)
                             st.rerun()
                             
                 with col_sells:
@@ -4069,7 +4137,7 @@ elif st.session_state.page_selector == "Portfolio":
                             )
                             if sell_p != sell.get("p"):
                                 sell["p"] = sell_p
-                                save_portfolio(st.session_state.portfolio_data)
+                                save_portfolio(st.session_state.portfolio_dict)
                         with col_sq:
                             sell_q = col_sq.number_input(
                                 f"Qty {s_idx+1}",
@@ -4081,7 +4149,7 @@ elif st.session_state.page_selector == "Portfolio":
                             )
                             if sell_q != sell.get("q"):
                                 sell["q"] = sell_q
-                                save_portfolio(st.session_state.portfolio_data)
+                                save_portfolio(st.session_state.portfolio_dict)
                         with col_sd:
                             if not is_disabled:
                                 if col_sd.button("❌", key=f"del_sell_{index}_{s_idx}_{s['id']}", use_container_width=True):
@@ -4090,13 +4158,13 @@ elif st.session_state.page_selector == "Portfolio":
                     if sells_to_remove:
                         for s_idx in sorted(sells_to_remove, reverse=True):
                             s["sells"].pop(s_idx)
-                        save_portfolio(st.session_state.portfolio_data)
+                        save_portfolio(st.session_state.portfolio_dict)
                         st.rerun()
                         
                     if not is_disabled:
                         if st.button("➕ " + tr("portfolio_add_sell"), key=f"add_sell_btn_{index}_{s['id']}", use_container_width=True):
                             s["sells"].append({"p": 0.0, "q": 0.0})
-                            save_portfolio(st.session_state.portfolio_data)
+                            save_portfolio(st.session_state.portfolio_dict)
                             st.rerun()
 
 

@@ -312,7 +312,15 @@ TRANSLATIONS = {
         "portfolio_delete_position": "Delete Position",
         "portfolio_lock_position": "Lock Position",
         "portfolio_empty": "The portfolio is empty. Add positions to get started.",
-        "portfolio_fetch_price": "Fetch Price"
+        "portfolio_fetch_price": "Fetch Price",
+        "portfolio_select": "Select Portfolio:",
+        "portfolio_create": "Create Portfolio",
+        "portfolio_enter_name": "Enter Portfolio Name (e.g., TradeStation):",
+        "portfolio_create_btn": "Create",
+        "portfolio_delete_btn": "Delete Portfolio",
+        "portfolio_deleted": "Portfolio deleted successfully.",
+        "portfolio_exists": "A portfolio with this name already exists.",
+        "cannot_delete_last_portfolio": "Cannot delete the last remaining portfolio."
     },
     "he": {
         "navigation": "ניווט",
@@ -627,6 +635,14 @@ TRANSLATIONS = {
         "portfolio_delete_position": "מחק מנייה",
         "portfolio_lock_position": "נעל פוזיציה",
         "portfolio_empty": "התיק ריק. התחל על ידי הוספת מנייה.",
-        "portfolio_fetch_price": "עדכן מחיר"
+        "portfolio_fetch_price": "עדכן מחיר",
+        "portfolio_select": "בחר תיק השקעות:",
+        "portfolio_create": "צור תיק השקעות חדש",
+        "portfolio_enter_name": "הכנס שם לתיק ההשקעות (למשל TradeStation):",
+        "portfolio_create_btn": "צור",
+        "portfolio_delete_btn": "מחק תיק",
+        "portfolio_deleted": "תיק ההשקעות נמחק בהצלחה.",
+        "portfolio_exists": "תיק השקעות בשם זה כבר קיים.",
+        "cannot_delete_last_portfolio": "לא ניתן למחוק את תיק ההשקעות האחרון."
     }
 }
