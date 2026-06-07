@@ -1242,7 +1242,124 @@ def create_line_chart(series: pd.Series, title: str, y_label: str):
 
 
 
-def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, years=5):
+def _get_risk_free_rate():
+    """Attempt to fetch the current 10-Year US Treasury yield from yfinance; fall back to 4.5%."""
+    try:
+        import yfinance as _yf
+        tnx = _yf.Ticker("^TNX")
+        hist = tnx.history(period="5d")
+        if hist is not None and not hist.empty:
+            rate = hist['Close'].iloc[-1]
+            if rate and rate > 0:
+                return round(rate, 2)
+    except Exception:
+        pass
+    return 4.5  # current approximate 10Y US yield
+
+
+def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discount=10.0):
+    """
+    Compute WACC using CAPM for cost of equity and after-tax cost of debt.
+    Returns (wacc_pct, beta_used, cost_of_equity_pct, notes).
+    """
+    beta = info.get('beta')
+    if beta is None or pd.isna(beta) or beta <= 0:
+        beta = 1.1  # market average
+
+    cost_of_equity = risk_free_rate + beta * market_premium
+
+    total_debt = info.get('totalDebt', 0) or 0
+    total_cash = info.get('totalCash', 0) or 0
+    market_cap = info.get('marketCap', 0) or 0
+    net_debt = max(total_debt - total_cash, 0)
+    total_capital = market_cap + net_debt
+
+    if total_capital <= 0 or net_debt <= 0:
+        # All equity — WACC equals cost of equity
+        wacc = cost_of_equity
+    else:
+        equity_weight = market_cap / total_capital
+        debt_weight = net_debt / total_capital
+        tax_rate = 0.21  # US corporate tax rate
+        interest_expense = info.get('interestExpense', 0) or 0
+        if interest_expense < 0:
+            interest_expense = abs(interest_expense)
+        cost_of_debt_pretax = (interest_expense / net_debt * 100) if net_debt > 0 else risk_free_rate + 1.5
+        cost_of_debt_pretax = min(max(cost_of_debt_pretax, risk_free_rate), 15.0)
+        cost_of_debt_aftertax = cost_of_debt_pretax * (1 - tax_rate)
+        wacc = equity_weight * cost_of_equity + debt_weight * cost_of_debt_aftertax
+
+    wacc = min(max(wacc, 6.0), 18.0)
+    return round(wacc, 2), round(beta, 2), round(cost_of_equity, 2)
+
+
+def _derive_growth_rates(info, df_fin, base_growth):
+    """
+    Derive separate growth rates for EPS, Revenue, and FCF from available data.
+    Returns dict: {eps_g, rev_g, fcf_g} each as a percentage (e.g. 12.5 for 12.5%).
+    """
+    def clamp(v, lo=-20.0, hi=50.0):
+        return min(max(v, lo), hi)
+
+    # --- EPS growth ---
+    eps_g = base_growth
+    earn_growth = info.get('earningsGrowth')
+    if earn_growth is not None and not pd.isna(earn_growth) and earn_growth > -0.5:
+        eps_g = clamp(earn_growth * 100)
+    elif df_fin is not None and not df_fin.empty:
+        eps_col = 'Diluted EPS' if 'Diluted EPS' in df_fin.columns else (
+            'Basic EPS' if 'Basic EPS' in df_fin.columns else None)
+        if eps_col:
+            eps_series = df_fin[eps_col].dropna()
+            eps_series = eps_series[eps_series > 0]
+            if len(eps_series) >= 2:
+                start_eps = eps_series.iloc[0]
+                end_eps = eps_series.iloc[-1]
+                n = len(eps_series) - 1
+                if start_eps > 0:
+                    cagr = ((end_eps / start_eps) ** (1 / n) - 1) * 100
+                    eps_g = clamp(cagr)
+
+    # --- Revenue growth ---
+    rev_g = base_growth
+    rev_growth = info.get('revenueGrowth')
+    if rev_growth is not None and not pd.isna(rev_growth) and rev_growth > -0.5:
+        rev_g = clamp(rev_growth * 100)
+    elif df_fin is not None and not df_fin.empty:
+        rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
+            'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
+        if rev_col:
+            rev_series = df_fin[rev_col].dropna()
+            rev_series = rev_series[rev_series > 0]
+            if len(rev_series) >= 2:
+                start_rev = rev_series.iloc[0]
+                end_rev = rev_series.iloc[-1]
+                n = len(rev_series) - 1
+                if start_rev > 0:
+                    cagr = ((end_rev / start_rev) ** (1 / n) - 1) * 100
+                    rev_g = clamp(cagr)
+
+    # --- FCF growth ---
+    fcf_g = eps_g  # default to earnings growth as proxy
+    # Try to estimate from operating CF trend if available
+    if df_fin is not None and not df_fin.empty:
+        ocf_col = 'Operating Cash Flow' if 'Operating Cash Flow' in df_fin.columns else None
+        if ocf_col:
+            ocf_series = df_fin[ocf_col].dropna()
+            ocf_series = ocf_series[ocf_series > 0]
+            if len(ocf_series) >= 2:
+                n = len(ocf_series) - 1
+                start_ocf = ocf_series.iloc[0]
+                end_ocf = ocf_series.iloc[-1]
+                if start_ocf > 0:
+                    cagr = ((end_ocf / start_ocf) ** (1 / n) - 1) * 100
+                    fcf_g = clamp(cagr)
+
+    return {'eps_g': eps_g, 'rev_g': rev_g, 'fcf_g': fcf_g}
+
+
+def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, years=5,
+                         terminal_growth=2.5, use_wacc=True):
     valuations = {}
     shares_out = info.get('sharesOutstanding', 1)
     if not shares_out or pd.isna(shares_out) or shares_out <= 0:
@@ -1259,134 +1376,210 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     currency = info.get("currency", "USD") if info else "USD"
     sym = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
 
-    # Clamped baseline growth rates for safety
-    growth_rate_val = growth_rate if (growth_rate is not None and not pd.isna(growth_rate)) else 10.0
-    pe_g = min(max(growth_rate_val, -10.0), 30.0)
-    
-    rev_growth = info.get('revenueGrowth')
-    rev_g = (rev_growth * 100) if (rev_growth is not None and not pd.isna(rev_growth)) else growth_rate_val
-    rev_g = min(max(rev_g, -10.0), 30.0)
+    # --- WACC: Auto compute or use provided discount_rate ---
+    rf_rate = 4.5  # will be overridden by session cache if available
+    if use_wacc and info:
+        try:
+            wacc_val, beta_val, coe_val = _compute_wacc(info, risk_free_rate=rf_rate)
+            discount_rate_used = wacc_val
+        except Exception:
+            discount_rate_used = discount_rate
+            beta_val = info.get('beta', 1.1) or 1.1
+            coe_val = rf_rate + beta_val * 5.5
+    else:
+        discount_rate_used = discount_rate
+        beta_val = info.get('beta', 1.1) or 1.1
+        coe_val = discount_rate
 
-    fcf_growth = info.get('earningsGrowth')
-    fcf_g = (fcf_growth * 100) if (fcf_growth is not None and not pd.isna(fcf_growth)) else growth_rate_val
-    fcf_g = min(max(fcf_g, -10.0), 30.0)
+    dr = discount_rate_used  # short alias
 
-    # 1. P/E Earnings Projection Model
-    is_eps_normalized = False
-    eps = trailing_eps
-    if eps is None or pd.isna(eps) or eps <= 0:
-        eps = current_price / 15.0
-        is_eps_normalized = True
+    # --- Differentiated per-model growth rates ---
+    base_growth_val = growth_rate if (growth_rate is not None and not pd.isna(growth_rate)) else 10.0
+    derived = _derive_growth_rates(info, df_fin, base_growth_val)
+    eps_g = derived['eps_g']
+    rev_g = derived['rev_g']
+    fcf_g_raw = derived['fcf_g']
 
-    conservative_pe = min(max(avg_pe, 10.0), 25.0) if (avg_pe and not pd.isna(avg_pe)) else 15.0
-    future_eps = eps * ((1 + (pe_g / 100)) ** years)
-    future_price_pe = future_eps * conservative_pe
-    intrinsic_value_pe = future_price_pe / ((1 + (discount_rate / 100)) ** years)
+    # Safety clamps per model type
+    def clamp_g(v, lo=-20.0, hi=50.0):
+        return min(max(v, lo), hi)
 
-    eps_desc = f"Projects trailing EPS ({sym}{eps:.2f}) [Normalized]" if is_eps_normalized else f"Projects trailing EPS ({sym}{eps:.2f})"
-    valuations['P/E Earnings Projection'] = {
-        'intrinsic_value': intrinsic_value_pe,
-        'future_price_5y': future_price_pe,
-        'future_price': future_price_pe,
-        'description': f"{eps_desc} {years} years using growth rate {pe_g:.2f}% and applies P/E multiple of {conservative_pe:.1f}x."
-    }
+    pe_g  = clamp_g(eps_g, -10.0, 40.0)
+    rev_g = clamp_g(rev_g, -10.0, 40.0)
+    fcf_g = clamp_g(fcf_g_raw, -10.0, 40.0)
+    tg    = clamp_g(terminal_growth, 0.0, 5.0)
 
-    # 2. P/S Revenue Projection Model
+    # --- Shared base data ---
     total_revenue = info.get('totalRevenue')
     if (total_revenue is None or pd.isna(total_revenue)) and df_fin is not None and not df_fin.empty:
         rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
             'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
         if rev_col:
             total_revenue = df_fin[rev_col].iloc[-1]
-
-    is_rev_normalized = False
     if total_revenue is None or pd.isna(total_revenue) or total_revenue <= 0:
         total_revenue = (current_price * shares_out) / 3.0
-        is_rev_normalized = True
 
+    # EPS with smart fallback
+    is_eps_normalized = False
+    eps = trailing_eps
+    if eps is None or pd.isna(eps) or eps <= 0:
+        # Try Net Income / shares
+        net_income = info.get('netIncomeToCommon') or info.get('netIncome')
+        if net_income and net_income > 0:
+            eps = net_income / shares_out
+        else:
+            eps = current_price / 15.0
+            is_eps_normalized = True
+
+    # FCF with improved fallback chain
+    is_fcf_normalized = False
+    fcf = info.get('freeCashflow')
+    if fcf is None or pd.isna(fcf) or fcf <= 0:
+        # Try: Operating CF - CapEx from df_fin
+        ocf = info.get('operatingCashflow')
+        capex = info.get('capitalExpenditures')
+        if ocf and ocf > 0:
+            capex_val = abs(capex) if capex else 0
+            fcf = ocf - capex_val
+            if fcf <= 0:
+                fcf = None
+        if not fcf or fcf <= 0:
+            # Fall back to Net Income × 0.70 (much better than Revenue × 0.10)
+            net_income = info.get('netIncomeToCommon') or info.get('netIncome')
+            if net_income and net_income > 0:
+                fcf = net_income * 0.70
+                is_fcf_normalized = True
+            else:
+                fcf = total_revenue * 0.08
+                is_fcf_normalized = True
+
+    fcf_per_share = fcf / shares_out
+
+    # Net Debt
+    total_debt = info.get('totalDebt', 0) or 0
+    total_cash = info.get('totalCash', 0) or 0
+    if pd.isna(total_debt): total_debt = 0
+    if pd.isna(total_cash): total_cash = 0
+    net_debt = max(total_debt - total_cash, 0)
+    net_debt_per_share = (total_debt - total_cash) / shares_out
+
+    # Dynamic Graham bond yield (use session-cached or derive)
+    graham_bond_yield = rf_rate + 0.5  # approx corp bond = rf + 0.5%
+    graham_bond_yield = min(max(graham_bond_yield, 3.5), 8.0)
+
+    conservative_pe = min(max(avg_pe, 10.0), 30.0) if (avg_pe and not pd.isna(avg_pe)) else 15.0
+
+    # =========================================================
+    # MODEL 1: P/E Earnings Projection
+    # =========================================================
+    eps_desc = f"Projects trailing EPS ({sym}{eps:.2f}) [Normalized]" if is_eps_normalized else f"Projects trailing EPS ({sym}{eps:.2f})"
+    future_eps_pe = eps * ((1 + pe_g / 100) ** years)
+    future_price_pe = future_eps_pe * conservative_pe
+    intrinsic_pe = future_price_pe / ((1 + dr / 100) ** years)
+
+    valuations['P/E Earnings Projection'] = {
+        'intrinsic_value': intrinsic_pe,
+        'future_price_5y': future_price_pe,
+        'future_price': future_price_pe,
+        'growth_used': pe_g,
+        'discount_used': dr,
+        'weight': 0.15,
+        'description': f"{eps_desc} → {years}yr at EPS growth {pe_g:.1f}%, exit P/E {conservative_pe:.1f}x, WACC {dr:.1f}%."
+    }
+
+    # =========================================================
+    # MODEL 2: P/S Revenue Projection
+    # =========================================================
     current_rev_per_share = total_revenue / shares_out
-    future_rev_per_share = current_rev_per_share * ((1 + (rev_g / 100)) ** years)
+    is_rev_normalized = (total_revenue == (current_price * shares_out) / 3.0)
+    future_rev_per_share = current_rev_per_share * ((1 + rev_g / 100) ** years)
 
     target_ps = info.get('priceToSalesTrailing12Months')
     if target_ps is None or pd.isna(target_ps) or target_ps <= 0:
         target_ps = current_price / current_rev_per_share if current_rev_per_share > 0 else 3.0
-    target_ps = min(max(target_ps, 0.5), 10.0)
+    target_ps = min(max(target_ps, 0.3), 12.0)
 
     future_price_ps = future_rev_per_share * target_ps
-    intrinsic_value_ps = future_price_ps / ((1 + (discount_rate / 100)) ** years)
+    intrinsic_ps = future_price_ps / ((1 + dr / 100) ** years)
 
     rev_desc = f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f}) [Normalized]" if is_rev_normalized else f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f})"
     valuations['P/S Revenue Projection'] = {
-        'intrinsic_value': intrinsic_value_ps,
+        'intrinsic_value': intrinsic_ps,
         'future_price_5y': future_price_ps,
         'future_price': future_price_ps,
-        'description': f"{rev_desc} at growth rate {rev_g:.2f}% and applies target P/S multiple of {target_ps:.1f}x."
+        'growth_used': rev_g,
+        'discount_used': dr,
+        'weight': 0.10,
+        'description': f"{rev_desc} → {years}yr at revenue growth {rev_g:.1f}%, exit P/S {target_ps:.1f}x, WACC {dr:.1f}%."
     }
 
-    # 3. FCF (Free Cash Flow) Projection Model
-    fcf = info.get('freeCashflow')
-    is_fcf_normalized = False
+    # =========================================================
+    # MODEL 3: FCF Projection
+    # =========================================================
+    future_fcf_per_share = fcf_per_share * ((1 + fcf_g / 100) ** years)
 
-    if fcf is None or pd.isna(fcf) or fcf <= 0:
-        if total_revenue and total_revenue > 0:
-            fcf = total_revenue * 0.10
-        else:
-            fcf = current_price * shares_out * 0.05
-        is_fcf_normalized = True
-
-    fcf_per_share = fcf / shares_out
-    future_fcf_per_share = fcf_per_share * ((1 + (fcf_g / 100)) ** years)
-    
     target_fcf_multiple = info.get('priceToFreeCashflow')
     if target_fcf_multiple is None or pd.isna(target_fcf_multiple) or target_fcf_multiple <= 0:
-        target_fcf_multiple = avg_pe if (avg_pe and not pd.isna(avg_pe)) else 18.0
-    target_fcf_multiple = min(max(target_fcf_multiple, 12.0), 25.0)
+        target_fcf_multiple = conservative_pe * 1.1  # FCF multiples tend to track PE
+    target_fcf_multiple = min(max(target_fcf_multiple, 10.0), 35.0)
 
     future_price_fcf = future_fcf_per_share * target_fcf_multiple
-    intrinsic_value_fcf = future_price_fcf / ((1 + (discount_rate / 100)) ** years)
+    intrinsic_fcf = future_price_fcf / ((1 + dr / 100) ** years)
 
     fcf_desc = f"Projects FCF Per Share ({sym}{fcf_per_share:.2f}) [Normalized]" if is_fcf_normalized else f"Projects FCF Per Share ({sym}{fcf_per_share:.2f})"
     valuations['FCF Projection'] = {
-        'intrinsic_value': intrinsic_value_fcf,
+        'intrinsic_value': intrinsic_fcf,
         'future_price_5y': future_price_fcf,
         'future_price': future_price_fcf,
-        'description': f"{fcf_desc} {years} years at growth rate {fcf_g:.2f}% and applies target multiple of {target_fcf_multiple:.1f}x."
+        'growth_used': fcf_g,
+        'discount_used': dr,
+        'weight': 0.20,
+        'description': f"{fcf_desc} → {years}yr at FCF growth {fcf_g:.1f}%, exit P/FCF {target_fcf_multiple:.1f}x, WACC {dr:.1f}%."
     }
 
-    # 4. EV/EBITDA Projection Model
+    # =========================================================
+    # MODEL 4: EV/EBITDA Projection
+    # =========================================================
     ebitda = info.get('ebitda')
     is_ebitda_normalized = False
     if ebitda is None or pd.isna(ebitda) or ebitda <= 0:
-        ebitda = total_revenue * 0.15
+        # Use operating income as proxy before margin estimate
+        op_income = info.get('operatingIncome')
+        if op_income and op_income > 0:
+            ebitda = op_income * 1.15  # rough D&A add-back
+        else:
+            ebitda = total_revenue * 0.15
         is_ebitda_normalized = True
 
     ebitda_per_share = ebitda / shares_out
-    future_ebitda_per_share = ebitda_per_share * ((1 + (fcf_g / 100)) ** years)
-    
+    # Use FCF growth rate for EBITDA projection (operating metric)
+    future_ebitda_per_share = ebitda_per_share * ((1 + fcf_g / 100) ** years)
+
     target_ev_ebitda = info.get('enterpriseToEbitda')
     if target_ev_ebitda is None or pd.isna(target_ev_ebitda) or target_ev_ebitda <= 0:
-        target_ev_ebitda = 10.0
-    target_ev_ebitda = min(max(target_ev_ebitda, 6.0), 18.0)
-
-    total_debt = info.get('totalDebt', 0)
-    if total_debt is None or pd.isna(total_debt): total_debt = 0
-    total_cash = info.get('totalCash', 0)
-    if total_cash is None or pd.isna(total_cash): total_cash = 0
-    net_debt_per_share = (total_debt - total_cash) / shares_out
+        target_ev_ebitda = 12.0
+    # Wider range — many growth companies trade 20-40x
+    target_ev_ebitda = min(max(target_ev_ebitda, 5.0), 30.0)
 
     future_ev_per_share = future_ebitda_per_share * target_ev_ebitda
-    future_price_ev = max(future_ev_per_share - net_debt_per_share, current_price * 0.2)
-    intrinsic_value_ev = future_price_ev / ((1 + (discount_rate / 100)) ** years)
+    # Net debt adjustment: subtract net debt per share from EV to get equity value
+    future_price_ev = max(future_ev_per_share - net_debt_per_share, current_price * 0.1)
+    intrinsic_ev = future_price_ev / ((1 + dr / 100) ** years)
 
-    ebitda_desc = f"Projects EBITDA Per Share ({sym}{ebitda_per_share:.2f}) [Normalized]" if is_ebitda_normalized else f"Projects EBITDA Per Share ({sym}{ebitda_per_share:.2f})"
+    ebitda_desc = f"Projects EBITDA/Share ({sym}{ebitda_per_share:.2f}) [Normalized]" if is_ebitda_normalized else f"Projects EBITDA/Share ({sym}{ebitda_per_share:.2f})"
     valuations['EV/EBITDA Projection'] = {
-        'intrinsic_value': intrinsic_value_ev,
+        'intrinsic_value': intrinsic_ev,
         'future_price_5y': future_price_ev,
         'future_price': future_price_ev,
-        'description': f"{ebitda_desc} {years} years at growth rate {fcf_g:.2f}%, applies exit multiple {target_ev_ebitda:.1f}x and adjusts for net debt."
+        'growth_used': fcf_g,
+        'discount_used': dr,
+        'weight': 0.15,
+        'description': f"{ebitda_desc} → {years}yr at {fcf_g:.1f}% growth, exit EV/EBITDA {target_ev_ebitda:.1f}x, net-debt adj, WACC {dr:.1f}%."
     }
 
-    # 5. P/B Book Value Projection Model
+    # =========================================================
+    # MODEL 5: P/B Book Value Projection
+    # =========================================================
     bv = book_value if (book_value and not pd.isna(book_value) and book_value > 0) else info.get('bookValue')
     is_bv_normalized = False
     if bv is None or pd.isna(bv) or bv <= 0:
@@ -1394,97 +1587,174 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         is_bv_normalized = True
 
     roe = info.get('returnOnEquity')
-    book_g = roe * 100 if (roe and not pd.isna(roe) and roe > 0) else 12.0
-    book_g = min(max(book_g, 4.0), 15.0)
+    book_g = roe * 100 if (roe and not pd.isna(roe) and roe > 0) else 10.0
+    book_g = min(max(book_g, 3.0), 20.0)
 
-    future_bv = bv * ((1 + (book_g / 100)) ** years)
+    future_bv = bv * ((1 + book_g / 100) ** years)
     target_pb = info.get('priceToBook')
     if target_pb is None or pd.isna(target_pb) or target_pb <= 0:
         target_pb = 2.0
-    target_pb = min(max(target_pb, 1.0), 6.0)
+    target_pb = min(max(target_pb, 0.8), 8.0)
 
     future_price_pb = future_bv * target_pb
-    intrinsic_value_pb = future_price_pb / ((1 + (discount_rate / 100)) ** years)
+    intrinsic_pb = future_price_pb / ((1 + dr / 100) ** years)
 
-    bv_desc = f"Projects Book Value per share ({sym}{bv:.2f}) [Normalized]" if is_bv_normalized else f"Projects Book Value per share ({sym}{bv:.2f})"
+    bv_desc = f"Projects BV/Share ({sym}{bv:.2f}) [Normalized]" if is_bv_normalized else f"Projects BV/Share ({sym}{bv:.2f})"
     valuations['P/B Book Value Projection'] = {
-        'intrinsic_value': intrinsic_value_pb,
+        'intrinsic_value': intrinsic_pb,
         'future_price_5y': future_price_pb,
         'future_price': future_price_pb,
-        'description': f"{bv_desc} {years} years at ROE-based growth rate {book_g:.2f}% and applies exit P/B multiple of {target_pb:.1f}x."
+        'growth_used': book_g,
+        'discount_used': dr,
+        'weight': 0.10,
+        'description': f"{bv_desc} → {years}yr at ROE-based growth {book_g:.1f}%, exit P/B {target_pb:.1f}x, WACC {dr:.1f}%."
     }
 
-    # 6. 2-Stage Discounted Cash Flow (DCF) Model
-    terminal_growth_rate = 2.5
+    # =========================================================
+    # MODEL 6: 2-Stage DCF (Standard)
+    # =========================================================
     pv_stage1 = 0.0
     for i in range(1, years + 1):
-        fcf_i = fcf_per_share * ((1 + (fcf_g / 100)) ** i)
-        pv_stage1 += fcf_i / ((1 + (discount_rate / 100)) ** i)
-    
-    future_fcf_N = fcf_per_share * ((1 + (fcf_g / 100)) ** years)
-    terminal_value = future_fcf_N * (1 + (terminal_growth_rate / 100)) / ((discount_rate - terminal_growth_rate) / 100)
-    pv_terminal = terminal_value / ((1 + (discount_rate / 100)) ** years)
-    
-    intrinsic_value_dcf = pv_stage1 + pv_terminal
-    future_price_dcf = intrinsic_value_dcf * ((1 + (discount_rate / 100)) ** years)
+        fcf_i = fcf_per_share * ((1 + fcf_g / 100) ** i)
+        pv_stage1 += fcf_i / ((1 + dr / 100) ** i)
 
-    valuations['2-Stage Discounted Cash Flow (DCF)'] = {
-        'intrinsic_value': intrinsic_value_dcf,
+    future_fcf_N = fcf_per_share * ((1 + fcf_g / 100) ** years)
+    if dr > tg:
+        terminal_value = future_fcf_N * (1 + tg / 100) / ((dr - tg) / 100)
+    else:
+        terminal_value = future_fcf_N * (1 + tg / 100) / ((max(dr, tg + 0.5)) / 100)
+    pv_terminal = terminal_value / ((1 + dr / 100) ** years)
+
+    intrinsic_dcf = pv_stage1 + pv_terminal
+    future_price_dcf = intrinsic_dcf * ((1 + dr / 100) ** years)
+
+    valuations['2-Stage DCF'] = {
+        'intrinsic_value': intrinsic_dcf,
         'future_price_5y': future_price_dcf,
         'future_price': future_price_dcf,
-        'description': f"Projects FCF over {years} years at growth rate {fcf_g:.2f}%, applies perpetuity growth rate of {terminal_growth_rate:.1f}% to compute Terminal Value, and discounts all flows."
+        'growth_used': fcf_g,
+        'discount_used': dr,
+        'weight': 0.20,
+        'description': f"Discounts FCF {years}yr at {fcf_g:.1f}% growth, terminal at {tg:.1f}%, WACC {dr:.1f}%."
     }
 
-    # 7. Earnings Power Value (EPV) Model
-    adjusted_eps = eps * 0.90
-    intrinsic_value_epv = adjusted_eps / (discount_rate / 100.0)
-    future_price_epv = intrinsic_value_epv * (1.02 ** years)
+    # =========================================================
+    # MODEL 7: 3-Stage DCF (High Growth → Fade → Terminal)
+    # =========================================================
+    stage1_yrs = min(years, 3)
+    stage2_yrs = max(years - stage1_yrs, 2)
+    stage2_g = max(fcf_g * 0.5, tg + 1.0)  # fade to half
+    pv_3s1 = 0.0
+    last_fcf = fcf_per_share
+    for i in range(1, stage1_yrs + 1):
+        cf = last_fcf * (1 + fcf_g / 100)
+        pv_3s1 += cf / ((1 + dr / 100) ** i)
+        last_fcf = cf
+
+    pv_3s2 = 0.0
+    for j in range(1, stage2_yrs + 1):
+        cf = last_fcf * (1 + stage2_g / 100)
+        pv_3s2 += cf / ((1 + dr / 100) ** (stage1_yrs + j))
+        last_fcf = cf
+
+    if dr > tg:
+        tv_3s = last_fcf * (1 + tg / 100) / ((dr - tg) / 100)
+    else:
+        tv_3s = last_fcf * (1 + tg / 100) / (max(dr, tg + 0.5) / 100)
+    pv_tv_3s = tv_3s / ((1 + dr / 100) ** (stage1_yrs + stage2_yrs))
+
+    intrinsic_3stage = pv_3s1 + pv_3s2 + pv_tv_3s
+    future_price_3stage = intrinsic_3stage * ((1 + dr / 100) ** years)
+
+    valuations['3-Stage DCF'] = {
+        'intrinsic_value': intrinsic_3stage,
+        'future_price_5y': future_price_3stage,
+        'future_price': future_price_3stage,
+        'growth_used': fcf_g,
+        'discount_used': dr,
+        'weight': 0.15,
+        'description': f"3-Stage: {stage1_yrs}yr at {fcf_g:.1f}%, {stage2_yrs}yr fade to {stage2_g:.1f}%, terminal {tg:.1f}%, WACC {dr:.1f}%."
+    }
+
+    # =========================================================
+    # MODEL 8: Earnings Power Value (EPV) — Damodaran-style
+    # =========================================================
+    # EPV = Normalized EBIT(1-t) / cost_of_capital  (no-growth perpetuity)
+    ebit = info.get('ebit') or (ebitda * 0.85 if ebitda > 0 else eps * shares_out)
+    if ebit <= 0:
+        ebit = ebitda * 0.80 if ebitda > 0 else total_revenue * 0.10
+    tax_rate_epv = 0.21
+    nopat = ebit * (1 - tax_rate_epv) / shares_out  # NOPAT per share
+    if nopat <= 0:
+        nopat = eps * 0.85
+    # EPV uses cost of equity (CAPM) not WACC for equity value
+    cost_eq = max(coe_val, 6.0)
+    intrinsic_epv = nopat / (cost_eq / 100)
+    # EPV grows only at inflation (no structural growth assumed)
+    inflation_rate = 2.5
+    future_price_epv = intrinsic_epv * ((1 + inflation_rate / 100) ** years)
 
     valuations['Earnings Power Value (EPV)'] = {
-        'intrinsic_value': intrinsic_value_epv,
+        'intrinsic_value': intrinsic_epv,
         'future_price_5y': future_price_epv,
         'future_price': future_price_epv,
-        'description': f"Calculates no-growth value based on adjusted EPS ({sym}{adjusted_eps:.2f}) capitalized at the discount rate ({discount_rate:.1f}%)."
+        'growth_used': inflation_rate,
+        'discount_used': cost_eq,
+        'weight': 0.05,
+        'description': f"No-growth perpetuity: NOPAT/Share ({sym}{nopat:.2f}) ÷ cost of equity {cost_eq:.1f}%, inflated at {inflation_rate:.1f}%/yr."
     }
 
-    # 8. Revised Benjamin Graham Formula
-    intrinsic_value_graham = eps * (8.5 + 2 * min(pe_g, 15.0)) * 4.4 / 4.5
-    future_price_graham = intrinsic_value_graham * ((1 + (pe_g / 100)) ** years)
+    # =========================================================
+    # MODEL 9: Revised Benjamin Graham Formula
+    # =========================================================
+    g_capped = min(pe_g, 15.0)
+    intrinsic_graham = eps * (8.5 + 2 * g_capped) * 4.4 / graham_bond_yield
+    future_price_graham = intrinsic_graham * ((1 + g_capped / 100) ** years)
 
-    valuations['Revised Benjamin Graham Formula'] = {
-        'intrinsic_value': intrinsic_value_graham,
+    valuations['Revised Benjamin Graham'] = {
+        'intrinsic_value': intrinsic_graham,
         'future_price_5y': future_price_graham,
         'future_price': future_price_graham,
-        'description': f"Applies Graham formula: EPS * (8.5 + 2g) * 4.4 / Y (using growth rate {min(pe_g, 15.0):.2f}% and corporate bond yield of 4.5%)."
+        'growth_used': g_capped,
+        'discount_used': graham_bond_yield,
+        'weight': 0.05,
+        'description': f"Graham: EPS({sym}{eps:.2f}) × (8.5 + 2×{g_capped:.1f}%) × 4.4 ÷ {graham_bond_yield:.1f}% (corp bond yield)."
     }
 
-    # 9. PEG Ratio Valuation Model
-    target_peg_multiple = 1.2
-    implied_pe = target_peg_multiple * max(pe_g, 5.0)
-    implied_pe = min(max(implied_pe, 10.0), 30.0)
-    future_eps_peg = eps * ((1 + (pe_g / 100)) ** years)
-    future_price_peg = future_eps_peg * implied_pe
-    intrinsic_value_peg = future_price_peg / ((1 + (discount_rate / 100)) ** years)
-
-    valuations['PEG Ratio Valuation Model'] = {
-        'intrinsic_value': intrinsic_value_peg,
-        'future_price_5y': future_price_peg,
-        'future_price': future_price_peg,
-        'description': f"Calculates exit multiple based on target PEG of {target_peg_multiple:.1f}x and growth rate of {pe_g:.2f}% (implied exit PE of {implied_pe:.1f}x)."
-    }
-
-    # 10. Buffett Owner Earnings Model
+    # =========================================================
+    # MODEL 10: Buffett Owner Earnings Model
+    # =========================================================
+    # Owner Earnings = Net Income + D&A - Maintenance CapEx
+    # Proxy: FCF is already a reasonable owner earnings proxy
     oe_per_share = fcf_per_share
-    future_oe_ps = oe_per_share * ((1 + (fcf_g / 100)) ** years)
-    target_oe_multiple = min(max(avg_pe if (avg_pe and not pd.isna(avg_pe)) else 15.0, 12.0), 22.0)
+    future_oe_ps = oe_per_share * ((1 + fcf_g / 100) ** years)
+    # Buffett uses ~15x earnings as baseline; adjust slightly for growth
+    target_oe_multiple = min(max(conservative_pe * 1.05, 13.0), 28.0)
     future_price_oe = future_oe_ps * target_oe_multiple
-    intrinsic_value_oe = future_price_oe / ((1 + (discount_rate / 100)) ** years)
+    intrinsic_oe = future_price_oe / ((1 + dr / 100) ** years)
 
-    valuations['Buffett Owner Earnings Model'] = {
-        'intrinsic_value': intrinsic_value_oe,
+    valuations['Buffett Owner Earnings'] = {
+        'intrinsic_value': intrinsic_oe,
         'future_price_5y': future_price_oe,
         'future_price': future_price_oe,
-        'description': f"Buffett owner earnings projection ({sym}{oe_per_share:.2f}/share) growing at {fcf_g:.2f}% and applying multiple of {target_oe_multiple:.1f}x."
+        'growth_used': fcf_g,
+        'discount_used': dr,
+        'weight': 0.15,
+        'description': f"Owner earnings ({sym}{oe_per_share:.2f}/share) → {years}yr at {fcf_g:.1f}% growth, exit {target_oe_multiple:.1f}x, WACC {dr:.1f}%."
+    }
+
+    # Store metadata for UI use
+    valuations['_meta'] = {
+        'wacc': dr,
+        'beta': beta_val,
+        'cost_of_equity': coe_val,
+        'rf_rate': rf_rate,
+        'terminal_growth': tg,
+        'eps_growth': pe_g,
+        'rev_growth': rev_g,
+        'fcf_growth': fcf_g,
+        'years': years,
+        'graham_bond_yield': graham_bond_yield,
     }
 
     return valuations
@@ -1494,13 +1764,35 @@ def create_valuation_chart(valuations, current_price, years=5):
     if not valuations:
         return None
 
-    names = list(valuations.keys())
-    intrinsic_values = [v['intrinsic_value'] for v in valuations.values()]
-    future_prices = [v.get('future_price', v['future_price_5y']) for v in valuations.values()]
+    meta = valuations.get('_meta', {})
+    models = {k: v for k, v in valuations.items() if k != '_meta'}
+    if not models:
+        return None
 
-    avg_intrinsic = sum(intrinsic_values) / len(intrinsic_values)
-    avg_future = sum(future_prices) / len(future_prices)
+    names = list(models.keys())
+    intrinsic_values = [v['intrinsic_value'] for v in models.values()]
+    future_prices = [v.get('future_price', v['future_price_5y']) for v in models.values()]
+    weights = [v.get('weight', 1.0 / len(models)) for v in models.values()]
+
+    total_weight = sum(weights)
+    avg_intrinsic = sum(iv * w for iv, w in zip(intrinsic_values, weights)) / total_weight if total_weight > 0 else sum(intrinsic_values) / len(intrinsic_values)
+    avg_future = sum(fp * w for fp, w in zip(future_prices, weights)) / total_weight if total_weight > 0 else sum(future_prices) / len(future_prices)
     sym = cs()
+
+    # Color-code each bar: green if intrinsic > current price (undervalued), red if overvalued
+    bar_colors_iv = ['#10B981' if iv >= current_price else '#F87171' for iv in intrinsic_values]
+    bar_colors_fp = ['#3B82F6' if fp >= current_price else '#F59E0B' for fp in future_prices]
+
+    # Margin of safety text per bar
+    mos_texts = []
+    for iv in intrinsic_values:
+        if iv > 0 and current_price > 0:
+            mos = ((iv - current_price) / current_price) * 100
+            mos_texts.append(f"{sym}{iv:.1f}<br>{'▲' if mos >= 0 else '▼'}{abs(mos):.0f}%")
+        else:
+            mos_texts.append(f"{sym}{iv:.1f}")
+
+    fp_texts = [f"{sym}{fp:.1f}" for fp in future_prices]
 
     fig = go.Figure()
 
@@ -1508,64 +1800,71 @@ def create_valuation_chart(valuations, current_price, years=5):
         x=names,
         y=intrinsic_values,
         name=tr("intrinsic_value_pv_column"),
-        marker_color='#48BB78',
-        text=[f"{sym}{v:.2f}" for v in intrinsic_values],
-        textposition='auto',
-        opacity=0.8
+        marker_color=bar_colors_iv,
+        text=mos_texts,
+        textposition='outside',
+        textfont=dict(size=9),
+        opacity=0.9,
+        hovertemplate='<b>%{x}</b><br>Intrinsic Value: ' + sym + '%{y:.2f}<extra></extra>'
     ))
 
     fig.add_trace(go.Bar(
         x=names,
         y=future_prices,
         name=tr("target_price_fv_column").replace("{years}", str(years)),
-        marker_color='#4299E1',
-        text=[f"{sym}{v:.2f}" for v in future_prices],
-        textposition='auto',
-        opacity=0.8
+        marker_color=bar_colors_fp,
+        text=fp_texts,
+        textposition='outside',
+        textfont=dict(size=9),
+        opacity=0.7,
+        hovertemplate='<b>%{x}</b><br>Target Price: ' + sym + '%{y:.2f}<extra></extra>'
     ))
 
     fig.add_hline(
         y=current_price,
-        line_dash="dash",
-        line_color="#4A5568",
-        line_width=2,
-        annotation_text=f"{tr('current_price')}: {sym}{current_price:.2f}",
+        line_dash="solid",
+        line_color="#E2E8F0",
+        line_width=2.5,
+        annotation_text=f"  {tr('current_price')}: {sym}{current_price:.2f}",
         annotation_position="bottom right",
-        annotation_font=dict(color="#4A5568", size=11, family="Arial")
+        annotation_font=dict(color="#E2E8F0", size=12, family="Arial")
     )
 
     fig.add_hline(
         y=avg_intrinsic,
         line_dash="dash",
-        line_color="#E53E3E",
-        line_width=2.5,
-        annotation_text=f"{tr('consensus_intrinsic_value')}: {sym}{avg_intrinsic:.2f}",
+        line_color="#10B981",
+        line_width=2,
+        annotation_text=f"  Weighted IV: {sym}{avg_intrinsic:.2f}",
         annotation_position="top left",
-        annotation_font=dict(color="#E53E3E", size=12, family="Arial")
+        annotation_font=dict(color="#10B981", size=11, family="Arial")
     )
 
     fig.add_hline(
         y=avg_future,
-        line_dash="dash",
-        line_color="#1A365D",
-        line_width=2.5,
-        annotation_text=f"{tr('projected_target_price')}: {sym}{avg_future:.2f}",
+        line_dash="dot",
+        line_color="#60A5FA",
+        line_width=2,
+        annotation_text=f"  Weighted Target: {sym}{avg_future:.2f}",
         annotation_position="top right",
-        annotation_font=dict(color="#1A365D", size=12, family="Arial")
+        annotation_font=dict(color="#60A5FA", size=11, family="Arial")
     )
 
     years_str = tr("price_period_1y") if years == 1 else (tr("price_period_2y") if years == 2 else f"{years} {tr('price_period_5y')}")
+    wacc_str = f" | WACC: {meta.get('wacc', 10):.1f}%" if meta else ""
     fig.update_layout(
-        title=f"<b>{tr('multi_model_consensus')} ({years_str})</b>",
+        title=f"<b>{tr('multi_model_consensus')} ({years_str}){wacc_str}</b>",
         yaxis_title=tr("usd_sign"),
         barmode='group',
         hovermode="x unified",
-        margin=dict(t=60, b=40, l=40, r=40),
+        margin=dict(t=70, b=60, l=40, r=40),
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5)
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+        xaxis=dict(tickangle=-35)
     )
 
     return fig
+
 
 def create_stock_price_chart(df: pd.DataFrame, ticker_symbol: str, show_bollinger: bool = False):
     if df.empty:
@@ -1893,7 +2192,12 @@ if st.session_state.page_selector == "Dashboard":
                 discount_rate = 10.0
 
                 # Valuations are typically calculated using Annual TTM data
-                valuations = calculate_valuations(info, df_fin_a, avg_pe, growth_rate, discount_rate)
+                # WACC is auto-computed inside calculate_valuations using CAPM
+                valuations = calculate_valuations(
+                    info, df_fin_a, avg_pe, growth_rate, discount_rate,
+                    terminal_growth=2.5, use_wacc=True
+                )
+
 
                 # --- 1. Company Profile Card ---
                 long_name = info.get('longName', ticker_input)
@@ -2607,48 +2911,133 @@ if st.session_state.page_selector == "Dashboard":
                     st.markdown("---")
                     st.subheader(tr("multi_model_consensus"))
 
-                    if current_price and current_price > 0 and len(valuations) >= 3:
-                        avg_intrinsic = sum(v['intrinsic_value'] for v in valuations.values()) / len(valuations)
-                        margin_of_safety = ((avg_intrinsic - current_price) / avg_intrinsic) * 100
+                    # Extract _meta and build model-only dict
+                    val_meta = valuations.get('_meta', {})
+                    val_models = {k: v for k, v in valuations.items() if k != '_meta'}
 
-                        st.markdown(
-                            tr("multi_model_description").format(years=5, growth_rate=growth_rate, discount_rate=discount_rate, num_models=len(valuations))
-                        )
+                    if current_price and current_price > 0 and len(val_models) >= 3:
+                        # --- Weighted & Simple Consensus ---
+                        weights = [v.get('weight', 1.0 / len(val_models)) for v in val_models.values()]
+                        total_w = sum(weights)
+                        iv_list = [v['intrinsic_value'] for v in val_models.values()]
+                        fp_list = [v.get('future_price_5y', v.get('future_price', 0)) for v in val_models.values()]
 
-                        val_res_col1, val_res_col2, val_res_col3, val_res_col4 = st.columns(4)
-                        val_res_col1.metric(tr("consensus_intrinsic_value"), f"{cs()}{avg_intrinsic:.2f}")
-                        if avg_intrinsic > current_price:
-                            val_res_col2.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", tr("undervalued"))
+                        weighted_iv = sum(iv * w for iv, w in zip(iv_list, weights)) / total_w
+                        simple_iv   = sum(iv_list) / len(iv_list)
+                        weighted_fp = sum(fp * w for fp, w in zip(fp_list, weights)) / total_w
+                        simple_fp   = sum(fp_list) / len(fp_list)
+                        margin_of_safety = ((weighted_iv - current_price) / weighted_iv) * 100
+                        val_years = val_meta.get('years', 5)
+                        consensus_cagr = (((weighted_fp / current_price) ** (1 / val_years) - 1) * 100) if (current_price > 0 and weighted_fp > 0) else 0.0
+
+                        # WACC / model assumptions info box
+                        if val_meta:
+                            wacc_val = val_meta.get('wacc', discount_rate)
+                            beta_val = val_meta.get('beta', 1.1)
+                            coe_val  = val_meta.get('cost_of_equity', wacc_val)
+                            eps_g_val = val_meta.get('eps_growth', growth_rate)
+                            rev_g_val = val_meta.get('rev_growth', growth_rate)
+                            fcf_g_val = val_meta.get('fcf_growth', growth_rate)
+                            tg_val    = val_meta.get('terminal_growth', 2.5)
+
+                            st.info(
+                                f"📐 **Model Assumptions** | "
+                                f"WACC: **{wacc_val:.1f}%** (β={beta_val:.2f}, CoE={coe_val:.1f}%) | "
+                                f"EPS Growth: **{eps_g_val:.1f}%** | "
+                                f"Rev Growth: **{rev_g_val:.1f}%** | "
+                                f"FCF Growth: **{fcf_g_val:.1f}%** | "
+                                f"Terminal Growth: **{tg_val:.1f}%** | "
+                                f"Horizon: **{val_years} years**"
+                            )
+
+                        # Main consensus metrics
+                        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                        mc1.metric("⚖️ Weighted Intrinsic Value", f"{cs()}{weighted_iv:.2f}")
+                        mc2.metric("📊 Simple Average IV", f"{cs()}{simple_iv:.2f}")
+                        if weighted_iv > current_price:
+                            mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▲ " + tr("undervalued"))
                         else:
-                            val_res_col2.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", tr("overvalued_sign"))
-
-                        val_res_col3.metric(tr("current_market_price"), f"{cs()}{current_price:.2f}")
-
-                        avg_future = sum(v.get('future_price_5y', v.get('future_price', 0)) for v in valuations.values()) / len(valuations)
-                        consensus_cagr = (((avg_future / current_price) ** (1 / 5) - 1) * 100) if (current_price > 0 and avg_future > 0) else 0.0
-                        val_res_col4.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
+                            mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▼ " + tr("overvalued_sign"), delta_color="inverse")
+                        mc4.metric(tr("current_market_price"), f"{cs()}{current_price:.2f}")
+                        mc5.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
 
                         st.markdown("---")
                         chart_col, details_col = st.columns([3, 2])
                         with chart_col:
-                            fig_val = create_valuation_chart(valuations, current_price)
+                            fig_val = create_valuation_chart(valuations, current_price, years=val_years)
                             if fig_val:
                                 st.plotly_chart(fig_val, use_container_width=True)
+
+                            # --- DCF Sensitivity Table ---
+                            with st.expander("🔢 DCF Sensitivity Analysis (Intrinsic Value)"):
+                                growth_scenarios = [-5, 0, +5]
+                                wacc_scenarios   = [-2, 0, +2]
+                                base_fcf = val_meta.get('fcf_growth', growth_rate) if val_meta else growth_rate
+                                base_wacc = val_meta.get('wacc', discount_rate) if val_meta else discount_rate
+                                base_tg   = val_meta.get('terminal_growth', 2.5) if val_meta else 2.5
+                                base_fcf_ps = [v['intrinsic_value'] for k, v in val_models.items() if '2-Stage DCF' in k]
+                                base_fcf_ps = base_fcf_ps[0] if base_fcf_ps else weighted_iv
+
+                                # Recompute DCF for each scenario
+                                fcf_real = info.get('freeCashflow') or 0
+                                s_out = info.get('sharesOutstanding', 1) or 1
+                                fcf_ps_base = fcf_real / s_out if fcf_real > 0 else (simple_iv * 0.05)
+
+                                sens_rows = []
+                                for dg in growth_scenarios:
+                                    row = {'Growth Rate': f"{base_fcf + dg:.1f}%"}
+                                    for dw in wacc_scenarios:
+                                        g = (base_fcf + dg) / 100
+                                        w = (base_wacc + dw) / 100
+                                        tg_s = base_tg / 100
+                                        if w <= tg_s: w = tg_s + 0.01
+                                        pv = sum(fcf_ps_base * ((1 + g) ** i) / ((1 + w) ** i) for i in range(1, val_years + 1))
+                                        fcf_n = fcf_ps_base * ((1 + g) ** val_years)
+                                        tv = fcf_n * (1 + tg_s) / (w - tg_s)
+                                        iv_s = pv + tv / ((1 + w) ** val_years)
+                                        row[f"WACC {base_wacc + dw:.1f}%"] = f"{cs()}{iv_s:.1f}"
+                                    sens_rows.append(row)
+
+                                sens_df = pd.DataFrame(sens_rows).set_index('Growth Rate')
+                                st.caption(f"📌 Base: FCF Growth {base_fcf:.1f}%, WACC {base_wacc:.1f}%, Terminal {base_tg:.1f}%")
+                                st.dataframe(sens_df, use_container_width=True)
+
                         with details_col:
-                            st.subheader(tr("individual_model_targets").format(years=5))
-                            for idx, (name, val_data) in enumerate(valuations.items(), 1):
-                                st.markdown("#### " + tr("valuation_number").format(idx=idx, name=name))
-                                desc_translated = translate_text(val_data['description']) if st.session_state.get("language", "en") == "he" else val_data['description']
-                                st.markdown(tr("calculation_method").format(desc=desc_translated))
-                                st.markdown(tr("target_price_fv").format(years=5, val=val_data['future_price_5y']))
-                                future_val = val_data.get('future_price_5y', val_data.get('future_price', 0))
-                                model_cagr = (((future_val / current_price) ** (1 / 5) - 1) * 100) if (current_price > 0 and future_val > 0) else 0.0
-                                st.markdown(tr("projected_cagr").format(cagr=model_cagr))
-                                st.markdown(tr("intrinsic_value_pv").format(val=val_data['intrinsic_value']))
-                                st.markdown("---")
+                            st.subheader(tr("individual_model_targets").format(years=val_years))
+                            # Full sortable model table
+                            model_rows = []
+                            for name, val_data in val_models.items():
+                                fv = val_data.get('future_price_5y', val_data.get('future_price', 0))
+                                iv = val_data['intrinsic_value']
+                                upside_iv = ((iv - current_price) / current_price * 100) if current_price > 0 else 0
+                                upside_fv = ((fv - current_price) / current_price * 100) if current_price > 0 else 0
+                                verdict = "✅" if iv >= current_price else "❌"
+                                model_rows.append({
+                                    "Model": name,
+                                    "Intrinsic Value": f"{cs()}{iv:.2f}",
+                                    "Upside IV": f"{'▲' if upside_iv >= 0 else '▼'}{abs(upside_iv):.1f}%",
+                                    f"{val_years}Y Target": f"{cs()}{fv:.2f}",
+                                    "Verdict": verdict,
+                                })
+                            st.dataframe(pd.DataFrame(model_rows).set_index("Model"), use_container_width=True)
+
+                            st.markdown("---")
+                            # Individual detail expandable per model
+                            for idx, (name, val_data) in enumerate(val_models.items(), 1):
+                                with st.expander(f"{idx}. {name}"):
+                                    desc_translated = translate_text(val_data['description']) if st.session_state.get("language", "en") == "he" else val_data['description']
+                                    fv = val_data.get('future_price_5y', val_data.get('future_price', 0))
+                                    iv = val_data['intrinsic_value']
+                                    upside = ((iv - current_price) / current_price * 100) if current_price > 0 else 0
+                                    model_cagr = (((fv / current_price) ** (1 / val_years) - 1) * 100) if (current_price > 0 and fv > 0) else 0.0
+                                    st.markdown(f"**Method:** {desc_translated}")
+                                    st.markdown(f"**{val_years}-Year Target:** `{cs()}{fv:.2f}`")
+                                    st.markdown(f"**CAGR:** `{model_cagr:.1f}%`")
+                                    st.markdown(f"**Intrinsic Value (PV):** `{cs()}{iv:.2f}` ({'▲ Undervalued' if upside >= 0 else '▼ Overvalued'} {abs(upside):.1f}%)")
+
                     elif current_price and current_price > 0:
-                        st.warning(tr("minimum_models_warning").format(num_models=len(valuations)))
-                        for idx, (name, val_data) in enumerate(valuations.items(), 1):
+                        st.warning(tr("minimum_models_warning").format(num_models=len(val_models)))
+                        for idx, (name, val_data) in enumerate(val_models.items(), 1):
                             st.markdown("### " + tr("valuation_number").format(idx=idx, name=name))
                             desc_translated = translate_text(val_data['description']) if st.session_state.get("language", "en") == "he" else val_data['description']
                             st.markdown(desc_translated)
@@ -2659,6 +3048,7 @@ if st.session_state.page_selector == "Dashboard":
                             st.markdown(tr("intrinsic_value_pv").format(val=val_data['intrinsic_value']))
                     else:
                         st.warning(tr("valuation_requirements_warning"))
+
 
                 # ==========================================
                 # TAB 5: TIME MACHINE (BACKTESTING)
@@ -2870,62 +3260,34 @@ if st.session_state.page_selector == "Dashboard":
                                     hist_valuations = calculate_valuations(hist_info, hist_fin_df, avg_pe=user_exit_pe,
                                                                            growth_rate=user_earn_growth,
                                                                            discount_rate=discount_rate,
-                                                                           years=projection_years)
+                                                                           years=projection_years,
+                                                                           use_wacc=False)
 
-                                    if hist_valuations and len(hist_valuations) >= 2:
-                                        avg_intrinsic = sum(
-                                            v['intrinsic_value'] for v in hist_valuations.values()) / len(
-                                            hist_valuations)
-                                        avg_target = sum(v['future_price'] for v in hist_valuations.values()) / len(
-                                            hist_valuations)
+                                    hist_models = {k: v for k, v in hist_valuations.items() if k != '_meta'}
+
+                                    if hist_models and len(hist_models) >= 2:
+                                        h_weights = [v.get('weight', 1.0 / len(hist_models)) for v in hist_models.values()]
+                                        h_total_w = sum(h_weights)
+                                        h_ivs = [v['intrinsic_value'] for v in hist_models.values()]
+                                        h_fps = [v['future_price'] for v in hist_models.values()]
+
+                                        avg_intrinsic = sum(iv * w for iv, w in zip(h_ivs, h_weights)) / h_total_w
+                                        avg_target = sum(fp * w for fp, w in zip(h_fps, h_weights)) / h_total_w
 
                                         st.markdown("---")
                                         st.subheader(tr("backtest_results_header").format(years=projection_years))
 
-                                        res_col1, res_col2, res_col3 = st.columns(3)
-                                        keys = list(hist_valuations.keys())
-                                        if len(keys) > 0:
-                                            k = keys[0]
-                                            name_trans = translate_text(k) if st.session_state.language == "he" else k
-                                            res_col1.markdown("#### " + tr("valuation_number").format(idx=1, name=name_trans))
-                                            res_col1.write(
-                                                f"**{tr('target_price_fv_column').format(years=projection_years)}:** `${hist_valuations[k]['future_price']:.2f}`")
-                                            res_col1.write(
-                                                f"**{tr('intrinsic_value_pv_column')}:** `${hist_valuations[k]['intrinsic_value']:.2f}`")
-                                        if len(keys) > 1:
-                                            k = keys[1]
-                                            name_trans = translate_text(k) if st.session_state.language == "he" else k
-                                            res_col2.markdown("#### " + tr("valuation_number").format(idx=2, name=name_trans))
-                                            res_col2.write(
-                                                f"**{tr('target_price_fv_column').format(years=projection_years)}:** `${hist_valuations[k]['future_price']:.2f}`")
-                                            res_col2.write(
-                                                f"**{tr('intrinsic_value_pv_column')}:** `${hist_valuations[k]['intrinsic_value']:.2f}`")
-                                        if len(keys) > 2:
-                                            k = keys[2]
-                                            name_trans = translate_text(k) if st.session_state.language == "he" else k
-                                            res_col3.markdown("#### " + tr("valuation_number").format(idx=3, name=name_trans))
-                                            res_col3.write(
-                                                f"**{tr('target_price_fv_column').format(years=projection_years)}:** `${hist_valuations[k]['future_price']:.2f}`")
-                                            res_col3.write(
-                                                f"**{tr('intrinsic_value_pv_column')}:** `${hist_valuations[k]['intrinsic_value']:.2f}`")
+                                        # --- Summary metrics ---
+                                        bm1, bm2, bm3, bm4 = st.columns(4)
+                                        bm1.metric("📍 Starting Price", f"{cs()}{hist_price:.2f}", f"{selected_year}")
+                                        bm2.metric("⚖️ Weighted Intrinsic Value", f"{cs()}{avg_intrinsic:.2f}")
+                                        bm3.metric(f"🎯 Weighted {projection_years}Y Target", f"{cs()}{avg_target:.2f}")
+                                        proj_cagr = ((avg_target / hist_price) ** (1 / projection_years) - 1) * 100 if hist_price > 0 and projection_years > 0 else 0
+                                        bm4.metric("📈 Projected CAGR", f"{proj_cagr:.1f}%")
 
-                                        st.markdown("---")
                                         st.markdown(
                                             tr("backtest_target_intrinsic").format(years=projection_years, avg_target=avg_target, avg_intrinsic=avg_intrinsic)
                                         )
-
-                                        with st.expander(tr("show_detailed_table")):
-                                            breakdown_data = []
-                                            for name, val_data in hist_valuations.items():
-                                                name_trans = translate_text(name) if st.session_state.language == "he" else name
-                                                desc_trans = translate_text(val_data['description']) if st.session_state.language == "he" else val_data['description']
-                                                breakdown_data.append({
-                                                    tr("valuation_model_column"): name_trans,
-                                                    tr("intrinsic_value_pv_column"): f"${val_data['intrinsic_value']:.2f}",
-                                                    tr("target_price_fv_column").format(years=projection_years): f"${val_data['future_price']:.2f}",
-                                                    tr("description_column"): desc_trans
-                                                })
-                                            st.table(pd.DataFrame(breakdown_data))
 
                                         # Compare historic starting price to calculated intrinsic value
                                         diff_starting = ((hist_price - avg_intrinsic) / avg_intrinsic) * 100
@@ -2934,7 +3296,7 @@ if st.session_state.page_selector == "Dashboard":
                                         else:
                                             st.info(tr("historic_price_overvalued_info").format(year=selected_year, price=hist_price, intrinsic=avg_intrinsic, pct=abs(diff_starting)))
 
-                                        # Find actual price at the end of the target year
+                                        # --- Find actual price at target year ---
                                         target_price_slice = history[history.index.year == target_year]
                                         actual_target_price = None
                                         actual_target_date = None
@@ -2942,33 +3304,155 @@ if st.session_state.page_selector == "Dashboard":
                                             actual_target_price = target_price_slice['Close'].iloc[-1]
                                             actual_target_date = target_price_slice.index[-1].strftime('%Y-%m-%d')
 
+                                        # --- Full model results table ---
+                                        st.markdown("---")
+                                        st.markdown(f"### 📊 All Models — {projection_years}-Year Results")
+                                        result_rows = []
+                                        model_errors = {}  # for accuracy chart
+                                        for mname, mdata in hist_models.items():
+                                            fp = mdata['future_price']
+                                            iv = mdata['intrinsic_value']
+                                            proj_ret = ((fp / hist_price) - 1) * 100 if hist_price > 0 else 0
+                                            row = {
+                                                "Model": mname,
+                                                "Projected Target": f"{cs()}{fp:.2f}",
+                                                "Proj Return": f"{'▲' if proj_ret >= 0 else '▼'}{abs(proj_ret):.1f}%",
+                                                "Intrinsic Value": f"{cs()}{iv:.2f}",
+                                            }
+                                            if actual_target_price is not None:
+                                                err_pct = abs(fp - actual_target_price) / actual_target_price * 100
+                                                accuracy = max(0, 100 - err_pct)
+                                                verdict = "✅" if fp >= actual_target_price * 0.9 else "❌"
+                                                row["Actual Price"] = f"{cs()}{actual_target_price:.2f}"
+                                                row["Error %"] = f"{err_pct:.1f}%"
+                                                row["Accuracy"] = f"{accuracy:.0f}%"
+                                                row["Verdict"] = verdict
+                                                model_errors[mname] = err_pct
+                                            result_rows.append(row)
+
+                                        result_df = pd.DataFrame(result_rows).set_index("Model")
+                                        st.dataframe(result_df, use_container_width=True)
+
+                                        # --- Accuracy chart (if actual price available) ---
                                         if actual_target_price is not None:
+                                            st.markdown("---")
                                             st.subheader(tr("performance_at_target_year").format(year=target_year, date=actual_target_date))
-                                            col_perf1, col_perf2 = st.columns(2)
-                                            col_perf1.metric(tr("actual_closing_price_in_year").format(year=target_year), f"${actual_target_price:.2f}")
-                                            col_perf2.metric(tr("projected_target_price"), f"${avg_target:.2f}")
 
-                                            # Calculate actual return CAGR vs projected CAGR
-                                            years_passed = projection_years
-                                            cagr_actual = ((actual_target_price / hist_price) ** (1 / years_passed) - 1) * 100
-                                            cagr_projected = ((avg_target / hist_price) ** (1 / years_passed) - 1) * 100
-
-                                            total_actual_pct = ((actual_target_price - hist_price)/hist_price)*100
-                                            total_proj_pct = ((avg_target - hist_price)/hist_price)*100
-                                            st.write(tr("actual_return_from_to").format(start=selected_year, end=target_year, cagr=cagr_actual, total=total_actual_pct))
-                                            st.write(tr("projected_return_cagr").format(cagr=cagr_projected, total=total_proj_pct))
+                                            # Comparison metrics
+                                            ap1, ap2, ap3 = st.columns(3)
+                                            ap1.metric(tr("actual_closing_price_in_year").format(year=target_year), f"{cs()}{actual_target_price:.2f}")
+                                            ap2.metric(tr("projected_target_price"), f"{cs()}{avg_target:.2f}")
+                                            actual_cagr = ((actual_target_price / hist_price) ** (1 / projection_years) - 1) * 100 if hist_price > 0 and projection_years > 0 else 0
+                                            ap3.metric("Actual CAGR", f"{actual_cagr:.1f}%")
 
                                             diff_pct = ((actual_target_price - avg_target) / avg_target) * 100
                                             if actual_target_price >= avg_target:
                                                 st.success(tr("success_beat_target").format(years=projection_years, pct=diff_pct))
                                             else:
                                                 st.warning(tr("warning_miss_target").format(year=target_year, pct=abs(diff_pct)))
+
+                                            # --- Accuracy bar chart ---
+                                            model_names_chart = list(model_errors.keys())
+                                            projected_prices_chart = [hist_models[m]['future_price'] for m in model_names_chart]
+                                            errors_chart = [model_errors[m] for m in model_names_chart]
+
+                                            fig_accuracy = go.Figure()
+                                            bar_colors_chart = ['#10B981' if p >= actual_target_price * 0.9 else '#F87171' for p in projected_prices_chart]
+                                            fig_accuracy.add_trace(go.Bar(
+                                                x=model_names_chart,
+                                                y=projected_prices_chart,
+                                                name=f"Projected {projection_years}Y Price",
+                                                marker_color=bar_colors_chart,
+                                                text=[f"{cs()}{p:.1f}" for p in projected_prices_chart],
+                                                textposition='outside',
+                                                opacity=0.85,
+                                            ))
+                                            fig_accuracy.add_hline(
+                                                y=actual_target_price,
+                                                line_dash="solid",
+                                                line_color="#F59E0B",
+                                                line_width=3,
+                                                annotation_text=f"  Actual ({actual_target_date}): {cs()}{actual_target_price:.2f}",
+                                                annotation_position="top right",
+                                                annotation_font=dict(color="#F59E0B", size=12)
+                                            )
+                                            fig_accuracy.add_hline(
+                                                y=hist_price,
+                                                line_dash="dash",
+                                                line_color="#94A3B8",
+                                                line_width=2,
+                                                annotation_text=f"  Starting Price ({selected_year}): {cs()}{hist_price:.2f}",
+                                                annotation_position="bottom right",
+                                                annotation_font=dict(color="#94A3B8", size=11)
+                                            )
+                                            fig_accuracy.update_layout(
+                                                title=f"<b>Model Accuracy: Projected vs Actual Price ({selected_year}→{target_year})</b>",
+                                                yaxis_title="Price",
+                                                barmode='group',
+                                                margin=dict(t=60, b=80, l=40, r=40),
+                                                xaxis=dict(tickangle=-30),
+                                            )
+                                            st.plotly_chart(fig_accuracy, use_container_width=True)
+
+                                            # --- Model accuracy ranking ---
+                                            st.markdown("#### 🏆 Model Accuracy Ranking")
+                                            sorted_models = sorted(model_errors.items(), key=lambda x: x[1])
+                                            rank_rows = []
+                                            for rank, (mname, err) in enumerate(sorted_models, 1):
+                                                fp = hist_models[mname]['future_price']
+                                                accuracy = max(0, 100 - err)
+                                                medal = "🥇" if rank == 1 else ("🥈" if rank == 2 else ("🥉" if rank == 3 else f"#{rank}"))
+                                                rank_rows.append({
+                                                    "Rank": medal,
+                                                    "Model": mname,
+                                                    "Projected": f"{cs()}{fp:.2f}",
+                                                    "Error %": f"{err:.1f}%",
+                                                    "Accuracy Score": f"{accuracy:.0f}/100",
+                                                })
+                                            st.dataframe(pd.DataFrame(rank_rows).set_index("Rank"), use_container_width=True)
+
+                                            # --- Visual timeline ---
+                                            with st.expander("📈 Visual Timeline: Price Path + Model Targets"):
+                                                hist_range = history[(history.index.year >= selected_year - 1) & (history.index.year <= target_year + 1)]
+                                                if not hist_range.empty:
+                                                    fig_timeline = go.Figure()
+                                                    fig_timeline.add_trace(go.Scatter(
+                                                        x=hist_range.index,
+                                                        y=hist_range['Close'],
+                                                        mode='lines',
+                                                        name='Actual Price',
+                                                        line=dict(color='#F59E0B', width=2.5),
+                                                        fill='tozeroy',
+                                                        fillcolor='rgba(245, 158, 11, 0.05)'
+                                                    ))
+                                                    colors_cycle = ['#10B981', '#3B82F6', '#8B5CF6', '#F87171', '#60A5FA', '#34D399', '#FBBF24', '#A78BFA', '#F472B6', '#2DD4BF']
+                                                    for i, (mname, mdata) in enumerate(hist_models.items()):
+                                                        fp = mdata['future_price']
+                                                        col = colors_cycle[i % len(colors_cycle)]
+                                                        fig_timeline.add_hline(
+                                                            y=fp,
+                                                            line_dash="dot",
+                                                            line_color=col,
+                                                            line_width=1.2,
+                                                            annotation_text=f" {mname[:15]}: {cs()}{fp:.0f}",
+                                                            annotation_position="right",
+                                                            annotation_font=dict(color=col, size=8)
+                                                        )
+                                                    fig_timeline.update_layout(
+                                                        title=f"<b>Price Path: {selected_year} → {target_year}</b>",
+                                                        xaxis_title="Date",
+                                                        yaxis_title="Price",
+                                                        margin=dict(t=50, b=20, l=40, r=200),
+                                                        height=400
+                                                    )
+                                                    st.plotly_chart(fig_timeline, use_container_width=True)
+
                                         else:
                                             # Target year is in the future relative to historical series
                                             st.subheader(tr("performance_status_future").format(year=target_year))
                                             col_perf1, col_perf2 = st.columns(2)
-                                            col_perf1.metric(tr("actual_price_today"), f"${current_price:.2f}")
-                                            col_perf2.metric(tr("projected_target_price_for_year").format(year=target_year), f"${avg_target:.2f}")
+                                            col_perf1.metric(tr("actual_price_today"), f"{cs()}{current_price:.2f}")
+                                            col_perf2.metric(tr("projected_target_price_for_year").format(year=target_year), f"{cs()}{avg_target:.2f}")
 
                                             years_passed = current_year - selected_year
                                             if years_passed > 0:
@@ -2981,6 +3465,21 @@ if st.session_state.page_selector == "Dashboard":
                                                     st.info(tr("info_below_projected_target").format(years=projection_years, pct=abs(diff_pct)))
                                             else:
                                                 st.write(tr("selected_year_is_current").format(year=selected_year, years=projection_years))
+
+                                        # --- Detailed table expander ---
+                                        with st.expander(tr("show_detailed_table")):
+                                            breakdown_data = []
+                                            for name, val_data in hist_models.items():
+                                                name_trans = translate_text(name) if st.session_state.language == "he" else name
+                                                desc_trans = translate_text(val_data['description']) if st.session_state.language == "he" else val_data['description']
+                                                breakdown_data.append({
+                                                    tr("valuation_model_column"): name_trans,
+                                                    tr("intrinsic_value_pv_column"): f"{cs()}{val_data['intrinsic_value']:.2f}",
+                                                    tr("target_price_fv_column").format(years=projection_years): f"{cs()}{val_data['future_price']:.2f}",
+                                                    tr("description_column"): desc_trans
+                                                })
+                                            st.table(pd.DataFrame(breakdown_data))
+
                                     else:
                                         st.error(tr("error_not_enough_historical_valuation"))
                                 else:
@@ -2989,6 +3488,7 @@ if st.session_state.page_selector == "Dashboard":
                             st.warning(tr("warning_not_enough_historical_data"))
                     else:
                         st.warning(tr("warning_historical_financials_unavailable"))
+
 
                 # ==========================================
                 # TAB 6: NEWS & MARKET SENTIMENT
