@@ -998,18 +998,281 @@ def render_financial_forecasting_tab(df_fin_a):
             rev_growths_table.append(f"{r_change:+.1f}%{label_suffix}")
             ni_growths_table.append(f"{n_change:+.1f}%{label_suffix}")
             
-    df_table["Revenue Growth"] = rev_growths_table
-    df_table["Net Income Growth"] = ni_growths_table
-    
+    df_table[st.session_state.get("language","en") == "he" and "Revenue Growth" or "Revenue Growth"] = rev_growths_table
+    df_table[st.session_state.get("language","en") == "he" and "Net Income Growth" or "Net Income Growth"] = ni_growths_table
+
     df_table["Revenue"] = df_table["Revenue"].apply(lambda x: f"{sym}{x/divisor:.2f} {unit_label}")
     df_table["Net Income"] = df_table["Net Income"].apply(lambda x: f"{sym}{x/divisor:.2f} {unit_label}")
-    
+
     if st.session_state.language == 'he':
         df_table.columns = ["תקופה", "סוג", "הכנסות", "רווח נקי", "צמיחת הכנסות", "צמיחת רווח"]
     else:
         df_table.columns = ["Period", "Type", "Revenue", "Net Income", "Revenue Growth", "Net Income Growth"]
-        
+
     st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+
+def render_manual_valuation_calculator(info, df_fin_a):
+    """
+    Manual Valuation Calculator — Bull / Base / Bear scenarios.
+    Auto-populates from live ticker data; user can override any field.
+    """
+    is_he = st.session_state.get("language", "en") == "he"
+
+    # ─── Labels ───────────────────────────────────────────────────────────────
+    def lbl(en, he): return he if is_he else en
+
+    st.markdown("---")
+    st.markdown(f"## 🧮 {lbl('Manual Valuation Calculator', 'מחשבון הערכת שווי ידנית')}")
+    st.info(lbl(
+        "Enter the company's financial assumptions below. Fields pre-filled from live data — override anything you like.",
+        "הזן נתונים פיננסיים להערכת שווי. השדות ממולאים אוטומטית מהנתונים החיים — ניתן לשנות כל ערך."
+    ))
+
+    sym_cur = cs()
+    shares_out = info.get('sharesOutstanding', 1) or 1
+    current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0.0
+    market_cap = info.get('marketCap') or (current_price * shares_out)
+    trailing_pe = info.get('trailingPE') or 20.0
+    forward_pe  = info.get('forwardPE')  or trailing_pe
+
+    # Derive base revenue from financial statements
+    base_rev = 0.0
+    if df_fin_a is not None and not df_fin_a.empty:
+        rev_col_f = 'Total Revenue' if 'Total Revenue' in df_fin_a.columns else (
+            'Operating Revenue' if 'Operating Revenue' in df_fin_a.columns else None)
+        if rev_col_f:
+            vals = df_fin_a[rev_col_f].dropna()
+            if not vals.empty:
+                base_rev = float(vals.iloc[-1])
+    if base_rev == 0:
+        base_rev = info.get('totalRevenue') or 0.0
+
+    base_rev_b = base_rev / 1e9  # convert to billions for display
+
+    # Derive base margin
+    net_income = 0.0
+    if df_fin_a is not None and not df_fin_a.empty and 'Net Income' in df_fin_a.columns:
+        ni_vals = df_fin_a['Net Income'].dropna()
+        if not ni_vals.empty:
+            net_income = float(ni_vals.iloc[-1])
+    if net_income == 0:
+        net_income = info.get('netIncomeToCommon') or 0.0
+    base_margin = (net_income / base_rev * 100) if base_rev > 0 else (info.get('profitMargins', 0.15) * 100)
+    base_margin = max(min(base_margin, 60.0), -30.0)
+
+    # Auto-derive revenue growth
+    auto_rev_growth = 15.0
+    earn_g = info.get('earningsGrowth')
+    rev_g  = info.get('revenueGrowth')
+    if rev_g and not pd.isna(rev_g):
+        auto_rev_growth = round(rev_g * 100, 1)
+    elif earn_g and not pd.isna(earn_g):
+        auto_rev_growth = round(earn_g * 100, 1)
+    auto_rev_growth = max(min(auto_rev_growth, 100.0), -30.0)
+
+    mc_b = market_cap / 1e9 if market_cap else 0.0
+
+    # ─── Input Section ────────────────────────────────────────────────────────
+    st.markdown(f"### {lbl('📥 Inputs', '📥 קלטים')}")
+
+    ci1, ci2 = st.columns(2)
+    with ci1:
+        inp_base_rev = st.number_input(
+            lbl("Base Revenue ($ Billion)", "הכנסות בסיס (מיליארד $)"),
+            min_value=0.0, value=round(base_rev_b, 2), step=0.5, format="%.2f",
+            key="mval_base_rev"
+        )
+        inp_rev_growth = st.number_input(
+            lbl("Revenue Growth Rate (%)", "קצב צמיחת הכנסות (%)"),
+            min_value=-50.0, max_value=200.0, value=float(round(auto_rev_growth, 1)), step=0.5,
+            key="mval_rev_growth"
+        )
+        inp_margin = st.number_input(
+            lbl("Target Net Profit Margin (%)", "מרווח רווח נקי יעד (%)"),
+            min_value=-30.0, max_value=80.0, value=round(float(base_margin), 2), step=0.1,
+            key="mval_margin"
+        )
+        inp_forecast_years = st.number_input(
+            lbl("Forecast Years", "מספר שנות תחזית"),
+            min_value=1, max_value=10, value=5, step=1,
+            key="mval_years"
+        )
+
+    with ci2:
+        inp_price = st.number_input(
+            lbl(f"Current Share Price ({sym_cur})", f"מחיר מניה נוכחי ({sym_cur})"),
+            min_value=0.0, value=float(round(current_price, 2)), step=0.5, format="%.2f",
+            key="mval_price"
+        )
+        inp_mc = st.number_input(
+            lbl("Current Market Cap ($ Billion)", "שווי שוק נוכחי (מיליארד $)"),
+            min_value=0.0, value=round(float(mc_b), 2), step=1.0, format="%.2f",
+            key="mval_mc"
+        )
+        inp_base_year = st.number_input(
+            lbl("Starting Year", "שנת בסיס"),
+            min_value=2000, max_value=2040,
+            value=int(pd.Timestamp.now().year),
+            step=1, key="mval_start_year"
+        )
+        inp_shares_b = st.number_input(
+            lbl("Shares Outstanding (Billion)", "מניות במחזור (מיליארד)"),
+            min_value=0.001, value=round(shares_out / 1e9, 3), step=0.01, format="%.3f",
+            key="mval_shares"
+        )
+
+    # ─── P/E Multiples ────────────────────────────────────────────────────────
+    st.markdown(f"### {lbl('📊 Valuation Multiples (P/E)', '📊 מכפילי הערכה (P/E)')}")
+    low_default  = max(int(round(trailing_pe * 0.75)), 8)
+    base_default = max(int(round(trailing_pe)), 12)
+    high_default = max(int(round(trailing_pe * 1.35)), 15)
+
+    pm1, pm2, pm3 = st.columns(3)
+    with pm1:
+        st.markdown(f"<p style='color:#F87171;font-weight:bold'>🐻 {lbl('Low (Bear)', 'נמוך / פסימי')}</p>", unsafe_allow_html=True)
+        inp_pe_low = st.number_input("", min_value=1, value=low_default, step=1, key="mval_pe_low", label_visibility="collapsed")
+    with pm2:
+        st.markdown(f"<p style='color:#60A5FA;font-weight:bold'>📊 {lbl('Base (Neutral)', 'בסיס / ניטרלי')}</p>", unsafe_allow_html=True)
+        inp_pe_base = st.number_input("", min_value=1, value=base_default, step=1, key="mval_pe_base", label_visibility="collapsed")
+    with pm3:
+        st.markdown(f"<p style='color:#34D399;font-weight:bold'>🐂 {lbl('High (Bull)', 'גבוה / אופטימי')}</p>", unsafe_allow_html=True)
+        inp_pe_high = st.number_input("", min_value=1, value=high_default, step=1, key="mval_pe_high", label_visibility="collapsed")
+
+    # ─── Computation ──────────────────────────────────────────────────────────
+    fcast_years = int(inp_forecast_years)
+    shares_total = inp_shares_b * 1e9
+
+    proj_rows = []
+    for i in range(1, fcast_years + 1):
+        yr = int(inp_base_year) + i
+        rev_b = inp_base_rev * ((1 + inp_rev_growth / 100) ** i)
+        profit_b = rev_b * (inp_margin / 100)
+        proj_rows.append({
+            lbl("Year", "שנה"): yr,
+            lbl("Revenue ($B)", "הכנסות (מ$)"):  round(rev_b, 2),
+            lbl("Margin (%)", "מרווח (%)"):      round(inp_margin, 2),
+            lbl("Profit ($B)", "רווח (מ$)"):     round(profit_b, 3),
+        })
+
+    df_proj = pd.DataFrame(proj_rows)
+
+    # Final year profit for valuation
+    final_profit_b = df_proj[lbl("Profit ($B)", "רווח (מ$)")].iloc[-1]
+    final_profit_total = final_profit_b * 1e9
+
+    def calc_scenario(pe_multiple):
+        future_mc   = final_profit_total * pe_multiple          # market cap in $
+        future_mc_b = future_mc / 1e9
+        target_price = (future_mc / shares_total) if shares_total > 0 else 0.0
+        cagr = ((target_price / inp_price) ** (1 / fcast_years) - 1) * 100 if inp_price > 0 and target_price > 0 else 0.0
+        upside = ((target_price - inp_price) / inp_price * 100) if inp_price > 0 else 0.0
+        return {
+            "target_price": target_price,
+            "market_cap_b": future_mc_b,
+            "cagr": cagr,
+            "upside": upside,
+            "pe": pe_multiple,
+        }
+
+    bear_res = calc_scenario(inp_pe_low)
+    base_res = calc_scenario(inp_pe_base)
+    bull_res = calc_scenario(inp_pe_high)
+
+    # ─── Projection Table ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(f"### {lbl('📅 Revenue & Profit Projection', '📅 תחזית הכנסות ורווח')}")
+    st.dataframe(df_proj, use_container_width=True, hide_index=True)
+
+    # ─── Bar Chart ────────────────────────────────────────────────────────────
+    fig_proj = go.Figure()
+    years_labels = [str(r[lbl("Year", "שנה")]) for r in proj_rows]
+    rev_vals  = [r[lbl("Revenue ($B)", "הכנסות (מ$)")] for r in proj_rows]
+    prof_vals = [r[lbl("Profit ($B)", "רווח (מ$)")] for r in proj_rows]
+
+    fig_proj.add_trace(go.Bar(
+        x=years_labels, y=rev_vals,
+        name=lbl("Revenue ($B)", "הכנסות (מ$)"),
+        marker_color='#3B82F6', opacity=0.85,
+        text=[f"{sym_cur}{v:.1f}B" for v in rev_vals], textposition='outside'
+    ))
+    fig_proj.add_trace(go.Bar(
+        x=years_labels, y=prof_vals,
+        name=lbl("Profit ($B)", "רווח (מ$)"),
+        marker_color='#10B981', opacity=0.85,
+        text=[f"{sym_cur}{v:.2f}B" for v in prof_vals], textposition='outside'
+    ))
+    fig_proj.update_layout(
+        title=f"<b>{lbl('Revenue & Profit Forecast', 'תחזית הכנסות ורווח')} ({inp_rev_growth:.1f}% {lbl('growth', 'צמיחה')}, {inp_margin:.1f}% {lbl('margin', 'מרווח')})</b>",
+        barmode='group', margin=dict(t=60, b=40, l=40, r=40),
+        xaxis_title=lbl("Year", "שנה"),
+        yaxis_title=lbl("$ Billion", "מיליארד $"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5)
+    )
+    st.plotly_chart(fig_proj, use_container_width=True)
+
+    # ─── Scenario Cards ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(f"### 🎯 {lbl('Target Price Scenarios', 'תרחישי מחיר יעד')} — {fcast_years} {lbl('Year', 'שנה')}")
+
+    def scenario_card(title, color, emoji, res, col):
+        arrow = "▲" if res['upside'] >= 0 else "▼"
+        col.markdown(f"""
+<div style="border:2px solid {color};border-radius:12px;padding:18px;background:rgba(0,0,0,0.25);min-height:200px;">
+  <p style="color:{color};font-size:16px;font-weight:bold;margin:0 0 10px 0;">{emoji} {title}</p>
+  <table style="width:100%;font-size:13px;color:#E2E8F0;">
+    <tr><td>{lbl('P/E Multiple:','מכפיל P/E:')}</td><td style="text-align:right;font-weight:bold;">{res['pe']}x</td></tr>
+    <tr><td>{lbl('Target Price:','מחיר יעד:')}</td><td style="text-align:right;font-weight:bold;font-size:17px;color:{color};">{sym_cur}{res['target_price']:.1f}</td></tr>
+    <tr><td>{lbl('Est. Market Cap:','שווי שוק משוער:')}</td><td style="text-align:right;">{sym_cur}{res['market_cap_b']:.1f}B</td></tr>
+    <tr><td>{lbl('Upside from now:','פוטנציאל מהיום:')}</td><td style="text-align:right;color:{color};">{arrow}{abs(res['upside']):.1f}%</td></tr>
+    <tr><td>{lbl('CAGR:','CAGR:')}</td><td style="text-align:right;color:{color};">{res['cagr']:.1f}% / {lbl('yr','שנה')}</td></tr>
+  </table>
+</div>""", unsafe_allow_html=True)
+
+    sc1, sc2, sc3 = st.columns(3)
+    scenario_card(lbl("🐻 Bear Valuation", "🐻 תרחיש פסימי"), "#F87171", "🐻", bear_res, sc1)
+    scenario_card(lbl("📊 Base Valuation", "📊 תרחיש ניטרלי"), "#60A5FA", "📊", base_res, sc2)
+    scenario_card(lbl("🐂 Bull Valuation", "🐂 תרחיש אופטימי"), "#34D399", "🐂", bull_res, sc3)
+
+    # ─── Scenario Comparison Chart ────────────────────────────────────────────
+    st.markdown("---")
+    scenarios = [lbl("Bear", "פסימי"), lbl("Base", "ניטרלי"), lbl("Bull", "אופטימי")]
+    target_prices = [bear_res['target_price'], base_res['target_price'], bull_res['target_price']]
+    colors_sc = ["#F87171", "#60A5FA", "#34D399"]
+
+    fig_sc = go.Figure()
+    fig_sc.add_trace(go.Bar(
+        x=scenarios, y=target_prices,
+        marker_color=colors_sc,
+        text=[f"{sym_cur}{p:.1f}" for p in target_prices],
+        textposition='outside',
+        textfont=dict(size=14, color='white'),
+        width=0.4,
+    ))
+    fig_sc.add_hline(
+        y=inp_price,
+        line_dash="solid", line_color="#FBBF24", line_width=2.5,
+        annotation_text=f"  {lbl('Current Price', 'מחיר נוכחי')}: {sym_cur}{inp_price:.2f}",
+        annotation_position="top right",
+        annotation_font=dict(color="#FBBF24", size=13)
+    )
+    fig_sc.update_layout(
+        title=f"<b>{lbl('Scenario Target Prices', 'מחירי יעד לפי תרחיש')} ({fcast_years} {lbl('Year Horizon', 'שנים')})</b>",
+        yaxis_title=lbl(f"Target Price ({sym_cur})", f"מחיר יעד ({sym_cur})"),
+        margin=dict(t=60, b=40, l=40, r=40),
+        showlegend=False
+    )
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+    # ─── Summary Table ────────────────────────────────────────────────────────
+    summary_data = [
+        {lbl("Scenario","תרחיש"): lbl("🐻 Bear","🐻 פסימי"),   lbl("P/E","P/E"): f"{inp_pe_low}x",  lbl("Target Price","מחיר יעד"): f"{sym_cur}{bear_res['target_price']:.2f}", lbl("Market Cap","שווי שוק"): f"{sym_cur}{bear_res['market_cap_b']:.1f}B", lbl("Upside","פוטנציאל"): f"{bear_res['upside']:+.1f}%", lbl("CAGR","CAGR"): f"{bear_res['cagr']:.1f}%"},
+        {lbl("Scenario","תרחיש"): lbl("📊 Base","📊 ניטרלי"),  lbl("P/E","P/E"): f"{inp_pe_base}x", lbl("Target Price","מחיר יעד"): f"{sym_cur}{base_res['target_price']:.2f}", lbl("Market Cap","שווי שוק"): f"{sym_cur}{base_res['market_cap_b']:.1f}B", lbl("Upside","פוטנציאל"): f"{base_res['upside']:+.1f}%", lbl("CAGR","CAGR"): f"{base_res['cagr']:.1f}%"},
+        {lbl("Scenario","תרחיש"): lbl("🐂 Bull","🐂 אופטימי"), lbl("P/E","P/E"): f"{inp_pe_high}x", lbl("Target Price","מחיר יעד"): f"{sym_cur}{bull_res['target_price']:.2f}", lbl("Market Cap","שווי שוק"): f"{sym_cur}{bull_res['market_cap_b']:.1f}B", lbl("Upside","פוטנציאל"): f"{bull_res['upside']:+.1f}%", lbl("CAGR","CAGR"): f"{bull_res['cagr']:.1f}%"},
+    ]
+    st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+
+
 
 
 # --- Helper Functions ---
@@ -3730,6 +3993,8 @@ if st.session_state.page_selector == "Dashboard":
                 # ==========================================
                 with tab9:
                     render_financial_forecasting_tab(df_fin_a)
+                    render_manual_valuation_calculator(info, df_fin_a)
+
             else:
                 st.error(tr("error_failed_retrieve_data"))
 
