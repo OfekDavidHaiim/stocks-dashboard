@@ -1012,11 +1012,15 @@ def render_financial_forecasting_tab(df_fin_a):
     st.dataframe(df_table, use_container_width=True, hide_index=True)
 
 
-def render_manual_valuation_calculator(info, df_fin_a):
+def render_manual_valuation_calculator(info, df_fin_a, ticker_sym=""):
     """
     Manual Valuation Calculator — Bull / Base / Bear scenarios.
     Auto-populates from live ticker data; user can override any field.
+    ticker_sym is included in every widget key so switching stocks
+    resets all inputs to the new stock's live values.
     """
+    # Sanitize ticker for use as a key suffix (remove special chars)
+    _k = ticker_sym.replace(".", "_").replace("-", "_").upper() if ticker_sym else "GENERIC"
     is_he = st.session_state.get("language", "en") == "he"
 
     # ─── Labels ───────────────────────────────────────────────────────────────
@@ -1081,45 +1085,45 @@ def render_manual_valuation_calculator(info, df_fin_a):
         inp_base_rev = st.number_input(
             lbl("Base Revenue ($ Billion)", "הכנסות בסיס (מיליארד $)"),
             min_value=0.0, value=round(base_rev_b, 2), step=0.5, format="%.2f",
-            key="mval_base_rev"
+            key=f"mval_base_rev_{_k}"
         )
         inp_rev_growth = st.number_input(
             lbl("Revenue Growth Rate (%)", "קצב צמיחת הכנסות (%)"),
             min_value=-50.0, max_value=200.0, value=float(round(auto_rev_growth, 1)), step=0.5,
-            key="mval_rev_growth"
+            key=f"mval_rev_growth_{_k}"
         )
         inp_margin = st.number_input(
             lbl("Target Net Profit Margin (%)", "מרווח רווח נקי יעד (%)"),
             min_value=-30.0, max_value=80.0, value=round(float(base_margin), 2), step=0.1,
-            key="mval_margin"
+            key=f"mval_margin_{_k}"
         )
         inp_forecast_years = st.number_input(
             lbl("Forecast Years", "מספר שנות תחזית"),
             min_value=1, max_value=10, value=5, step=1,
-            key="mval_years"
+            key=f"mval_years_{_k}"
         )
 
     with ci2:
         inp_price = st.number_input(
             lbl(f"Current Share Price ({sym_cur})", f"מחיר מניה נוכחי ({sym_cur})"),
             min_value=0.0, value=float(round(current_price, 2)), step=0.5, format="%.2f",
-            key="mval_price"
+            key=f"mval_price_{_k}"
         )
         inp_mc = st.number_input(
             lbl("Current Market Cap ($ Billion)", "שווי שוק נוכחי (מיליארד $)"),
             min_value=0.0, value=round(float(mc_b), 2), step=1.0, format="%.2f",
-            key="mval_mc"
+            key=f"mval_mc_{_k}"
         )
         inp_base_year = st.number_input(
             lbl("Starting Year", "שנת בסיס"),
             min_value=2000, max_value=2040,
             value=int(pd.Timestamp.now().year),
-            step=1, key="mval_start_year"
+            step=1, key=f"mval_start_year_{_k}"
         )
         inp_shares_b = st.number_input(
             lbl("Shares Outstanding (Billion)", "מניות במחזור (מיליארד)"),
             min_value=0.001, value=round(shares_out / 1e9, 3), step=0.01, format="%.3f",
-            key="mval_shares"
+            key=f"mval_shares_{_k}"
         )
 
     # ─── P/E Multiples ────────────────────────────────────────────────────────
@@ -1131,13 +1135,13 @@ def render_manual_valuation_calculator(info, df_fin_a):
     pm1, pm2, pm3 = st.columns(3)
     with pm1:
         st.markdown(f"<p style='color:#F87171;font-weight:bold'>🐻 {lbl('Low (Bear)', 'נמוך / פסימי')}</p>", unsafe_allow_html=True)
-        inp_pe_low = st.number_input("", min_value=1, value=low_default, step=1, key="mval_pe_low", label_visibility="collapsed")
+        inp_pe_low = st.number_input("", min_value=1, value=low_default, step=1, key=f"mval_pe_low_{_k}", label_visibility="collapsed")
     with pm2:
         st.markdown(f"<p style='color:#60A5FA;font-weight:bold'>📊 {lbl('Base (Neutral)', 'בסיס / ניטרלי')}</p>", unsafe_allow_html=True)
-        inp_pe_base = st.number_input("", min_value=1, value=base_default, step=1, key="mval_pe_base", label_visibility="collapsed")
+        inp_pe_base = st.number_input("", min_value=1, value=base_default, step=1, key=f"mval_pe_base_{_k}", label_visibility="collapsed")
     with pm3:
         st.markdown(f"<p style='color:#34D399;font-weight:bold'>🐂 {lbl('High (Bull)', 'גבוה / אופטימי')}</p>", unsafe_allow_html=True)
-        inp_pe_high = st.number_input("", min_value=1, value=high_default, step=1, key="mval_pe_high", label_visibility="collapsed")
+        inp_pe_high = st.number_input("", min_value=1, value=high_default, step=1, key=f"mval_pe_high_{_k}", label_visibility="collapsed")
 
     # ─── Computation ──────────────────────────────────────────────────────────
     fcast_years = int(inp_forecast_years)
@@ -3993,7 +3997,7 @@ if st.session_state.page_selector == "Dashboard":
                 # ==========================================
                 with tab9:
                     render_financial_forecasting_tab(df_fin_a)
-                    render_manual_valuation_calculator(info, df_fin_a)
+                    render_manual_valuation_calculator(info, df_fin_a, ticker_input)
 
             else:
                 st.error(tr("error_failed_retrieve_data"))
