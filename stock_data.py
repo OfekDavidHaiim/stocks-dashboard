@@ -563,6 +563,107 @@ if not hasattr(st, "_orig_plotly_chart"):
 # ============================================================
 # SECTOR SENTIMENT INTELLIGENCE
 # ============================================================
+# ──────────────────────────────────────────────────────────────────────────────
+# INDUSTRY-LEVEL ETF MAP (checked FIRST — most precise)
+# Keys match yfinance `info.get('industry')` strings exactly
+# ──────────────────────────────────────────────────────────────────────────────
+INDUSTRY_ETF_MAP = {
+    # ── Software ──────────────────────────────────────────────────────────────
+    "Software - Application":            ("IGV",  "iShares Expanded Tech-Software ETF"),
+    "Software - Infrastructure":         ("IGV",  "iShares Expanded Tech-Software ETF"),
+    "Information Technology Services":   ("IGV",  "iShares Expanded Tech-Software ETF"),
+    "Software": ("IGV", "iShares Expanded Tech-Software ETF"),
+    # ── Semiconductors ────────────────────────────────────────────────────────
+    "Semiconductors":                    ("SOXX", "iShares Semiconductor ETF"),
+    "Semiconductor Equipment & Materials": ("SOXX", "iShares Semiconductor ETF"),
+    # ── Consumer Electronics & Hardware ───────────────────────────────────────
+    "Consumer Electronics":              ("XLK",  "Technology Select Sector SPDR"),
+    "Electronic Components":             ("XLK",  "Technology Select Sector SPDR"),
+    "Computer Hardware":                 ("XLK",  "Technology Select Sector SPDR"),
+    "Scientific & Technical Instruments":("XLK",  "Technology Select Sector SPDR"),
+    # ── Internet / Communication Tech ─────────────────────────────────────────
+    "Internet Content & Information":    ("XLC",  "Communication Services SPDR"),
+    "Internet Retail":                   ("IBUY", "Amplify Online Retail ETF"),
+    "Telecom Services":                  ("XLC",  "Communication Services SPDR"),
+    "Entertainment":                     ("XLC",  "Communication Services SPDR"),
+    "Electronic Gaming & Multimedia":    ("XLC",  "Communication Services SPDR"),
+    # ── Financials ────────────────────────────────────────────────────────────
+    "Banks - Diversified":               ("KBE",  "SPDR S&P Bank ETF"),
+    "Banks - Regional":                  ("KRE",  "SPDR S&P Regional Banking ETF"),
+    "Insurance - Diversified":           ("KIE",  "SPDR S&P Insurance ETF"),
+    "Insurance - Life":                  ("KIE",  "SPDR S&P Insurance ETF"),
+    "Insurance - Property & Casualty":   ("KIE",  "SPDR S&P Insurance ETF"),
+    "Asset Management":                  ("XLF",  "Financial Select Sector SPDR"),
+    "Capital Markets":                   ("XLF",  "Financial Select Sector SPDR"),
+    "Credit Services":                   ("XLF",  "Financial Select Sector SPDR"),
+    "Financial Data & Stock Exchanges":  ("XLF",  "Financial Select Sector SPDR"),
+    "Mortgage Finance":                  ("XLF",  "Financial Select Sector SPDR"),
+    # ── Healthcare ────────────────────────────────────────────────────────────
+    "Biotechnology":                     ("XBI",  "SPDR S&P Biotech ETF"),
+    "Drug Manufacturers - General":      ("XPH",  "SPDR S&P Pharmaceuticals ETF"),
+    "Drug Manufacturers - Specialty":    ("XPH",  "SPDR S&P Pharmaceuticals ETF"),
+    "Medical Devices":                   ("IHI",  "iShares U.S. Medical Devices ETF"),
+    "Medical Instruments & Supplies":    ("IHI",  "iShares U.S. Medical Devices ETF"),
+    "Diagnostics & Research":            ("XLV",  "Health Care Select Sector SPDR"),
+    "Health Information Services":       ("XLV",  "Health Care Select Sector SPDR"),
+    "Healthcare Plans":                  ("XLV",  "Health Care Select Sector SPDR"),
+    # ── Energy ────────────────────────────────────────────────────────────────
+    "Oil & Gas E&P":                     ("XOP",  "SPDR S&P Oil & Gas Exploration ETF"),
+    "Oil & Gas Integrated":              ("XLE",  "Energy Select Sector SPDR"),
+    "Oil & Gas Midstream":               ("MLPA", "Global X MLP ETF"),
+    "Oil & Gas Refining & Marketing":    ("XLE",  "Energy Select Sector SPDR"),
+    "Oil & Gas Equipment & Services":    ("OIH",  "VanEck Oil Services ETF"),
+    "Uranium":                           ("URA",  "Global X Uranium ETF"),
+    # ── Consumer ──────────────────────────────────────────────────────────────
+    "Specialty Retail":                  ("XRT",  "SPDR S&P Retail ETF"),
+    "Apparel Retail":                    ("XRT",  "SPDR S&P Retail ETF"),
+    "Apparel Manufacturing":             ("XRT",  "SPDR S&P Retail ETF"),
+    "Auto Manufacturers":                ("CARZ", "First Trust NASDAQ Global Auto ETF"),
+    "Auto Parts":                        ("XLY",  "Consumer Discretionary SPDR"),
+    "Restaurants":                       ("XLY",  "Consumer Discretionary SPDR"),
+    "Leisure":                           ("XLY",  "Consumer Discretionary SPDR"),
+    "Gambling":                          ("XLY",  "Consumer Discretionary SPDR"),
+    "Travel Services":                   ("AWAY", "ETFMG Travel Tech ETF"),
+    "Airlines":                          ("JETS", "U.S. Global Jets ETF"),
+    "Lodging":                           ("XLY",  "Consumer Discretionary SPDR"),
+    "Beverages - Non-Alcoholic":         ("XLP",  "Consumer Staples SPDR"),
+    "Beverages - Alcoholic":             ("XLP",  "Consumer Staples SPDR"),
+    "Packaged Foods":                    ("XLP",  "Consumer Staples SPDR"),
+    "Grocery Stores":                    ("XLP",  "Consumer Staples SPDR"),
+    "Household & Personal Products":     ("XLP",  "Consumer Staples SPDR"),
+    "Discount Stores":                   ("XLP",  "Consumer Staples SPDR"),
+    # ── Industrials ───────────────────────────────────────────────────────────
+    "Aerospace & Defense":               ("ITA",  "iShares U.S. Aerospace & Defense ETF"),
+    "Industrial Distribution":           ("XLI",  "Industrial Select Sector SPDR"),
+    "Specialty Industrial Machinery":    ("XLI",  "Industrial Select Sector SPDR"),
+    "Electrical Equipment & Parts":      ("XLI",  "Industrial Select Sector SPDR"),
+    "Engineering & Construction":        ("XLI",  "Industrial Select Sector SPDR"),
+    "Railroads":                         ("XTN",  "SPDR S&P Transportation ETF"),
+    "Trucking":                          ("XTN",  "SPDR S&P Transportation ETF"),
+    "Integrated Freight & Logistics":    ("XTN",  "SPDR S&P Transportation ETF"),
+    # ── Materials ─────────────────────────────────────────────────────────────
+    "Gold":                              ("GDX",  "VanEck Gold Miners ETF"),
+    "Silver":                            ("SIL",  "Global X Silver Miners ETF"),
+    "Specialty Chemicals":               ("XLB",  "Materials Select Sector SPDR"),
+    "Steel":                             ("SLX",  "VanEck Steel ETF"),
+    "Copper":                            ("COPX", "Global X Copper Miners ETF"),
+    # ── Real Estate ───────────────────────────────────────────────────────────
+    "REIT - Diversified":                ("XLRE", "Real Estate Select Sector SPDR"),
+    "REIT - Industrial":                 ("XLRE", "Real Estate Select Sector SPDR"),
+    "REIT - Retail":                     ("XLRE", "Real Estate Select Sector SPDR"),
+    "REIT - Office":                     ("XLRE", "Real Estate Select Sector SPDR"),
+    "REIT - Residential":                ("XLRE", "Real Estate Select Sector SPDR"),
+    "REIT - Healthcare Facilities":      ("XLRE", "Real Estate Select Sector SPDR"),
+    "Real Estate Services":              ("XLRE", "Real Estate Select Sector SPDR"),
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    "Utilities - Regulated Electric":    ("XLU",  "Utilities Select Sector SPDR"),
+    "Utilities - Regulated Gas":         ("XLU",  "Utilities Select Sector SPDR"),
+    "Utilities - Diversified":           ("XLU",  "Utilities Select Sector SPDR"),
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECTOR-LEVEL ETF MAP (fallback when no industry match is found)
+# ──────────────────────────────────────────────────────────────────────────────
 SECTOR_ETF_MAP = {
     "Technology":               ("XLK",  "Technology Select Sector SPDR"),
     "Financial Services":       ("XLF",  "Financial Select Sector SPDR"),
@@ -576,15 +677,13 @@ SECTOR_ETF_MAP = {
     "Real Estate":              ("XLRE", "Real Estate Select Sector SPDR"),
     "Utilities":                ("XLU",  "Utilities Select Sector SPDR"),
     "Communication Services":   ("XLC",  "Communication Services SPDR"),
-    "Consumer Electronics":     ("XLY",  "Consumer Discretionary SPDR"),
-    "Semiconductor":            ("SOXX", "iShares Semiconductor ETF"),
-    "Software":                 ("IGV",  "iShares Expanded Tech-Software ETF"),
 }
 
 @st.cache_data(ttl=3600)
-def get_sector_sentiment_data(ticker_symbol: str, sector: str):
+def get_sector_sentiment_data(ticker_symbol: str, sector: str, industry: str = ""):
     """
-    Fetches 3-month performance data for both the stock and its sector ETF.
+    Fetches 3-month performance data for both the stock and its best-fit ETF.
+    Industry is checked FIRST (precise match), sector is the fallback.
     Returns a dict with returns, divergence score, and chart-ready DataFrames.
     """
     result = {
@@ -595,12 +694,22 @@ def get_sector_sentiment_data(ticker_symbol: str, sector: str):
         "stock_return_1m": None, "etf_return_1m": None,
         "stock_return_6m": None, "etf_return_6m": None,
         "stock_vol": None, "etf_vol": None,
+        "match_level": "none",  # 'industry' | 'sector' | 'none'
     }
 
-    # Find ETF for sector
-    etf_info = SECTOR_ETF_MAP.get(sector)
+    # 1️⃣ Try industry-level first (most precise)
+    etf_info = INDUSTRY_ETF_MAP.get(industry)
+    if etf_info:
+        result["match_level"] = "industry"
+    else:
+        # 2️⃣ Fall back to sector-level
+        etf_info = SECTOR_ETF_MAP.get(sector)
+        if etf_info:
+            result["match_level"] = "sector"
+
     if not etf_info:
         return result
+
     etf_ticker, etf_name = etf_info
     result["etf_ticker"] = etf_ticker
     result["etf_name"] = etf_name
@@ -3964,13 +4073,17 @@ if st.session_state.page_selector == "Dashboard":
                 with tab6:
 
                     # ── SECTION A: SECTOR INTELLIGENCE ──────────────────────────────
-                    raw_sector = info.get('sector', '')
+                    raw_sector   = info.get('sector', '')
+                    raw_industry = info.get('industry', '')
                     st.markdown(f"## {tr('sector_sentiment_title')}")
                     st.caption(tr('sector_sentiment_subtitle'))
 
-                    if raw_sector and raw_sector in SECTOR_ETF_MAP:
+                    has_etf = (raw_industry and raw_industry in INDUSTRY_ETF_MAP) or \
+                              (raw_sector and raw_sector in SECTOR_ETF_MAP)
+
+                    if has_etf:
                         with st.spinner(tr("sector_loading")):
-                            sd = get_sector_sentiment_data(ticker_input, raw_sector)
+                            sd = get_sector_sentiment_data(ticker_input, raw_sector, raw_industry)
 
                         etf_ticker  = sd["etf_ticker"]
                         etf_name    = sd["etf_name"]
@@ -4097,19 +4210,24 @@ if st.session_state.page_selector == "Dashboard":
                             fig_bar = apply_tradingview_plotly_style(fig_bar)
                             plotly_chart_styled(fig_bar)
 
-                        # ── ETF Info Footer ──
+                        # ── ETF Info Footer (shows whether industry or sector matched) ──
+                        match_level  = sd.get("match_level", "sector")
+                        match_badge  = f'<span style="background:#1e3a5f;color:#60a5fa;font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600;">Matched by Industry</span>' if match_level == "industry" else f'<span style="background:#2a1f4a;color:#a78bfa;font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600;">Matched by Sector</span>'
+                        industry_row = f'&nbsp;&nbsp;|&nbsp;&nbsp;<span style="color:#848e9c;font-size:12px;">🏭 {"Industry" if st.session_state.language == "en" else "תעשייה"}: </span><span style="color:#d1d4dc;font-size:13px;">{raw_industry}</span>' if raw_industry else ''
                         st.markdown(f"""
-                        <div style="background:#161b2d;border:1px solid #2a2e39;border-radius:8px;padding:12px 16px;margin-top:10px;">
+                        <div style="background:#161b2d;border:1px solid #2a2e39;border-radius:8px;padding:12px 16px;margin-top:10px;display:flex;flex-wrap:wrap;align-items:center;gap:8px;">
+                            {match_badge}
                             <span style="color:#848e9c;font-size:12px;">🏷️ {tr('sector_etf_label')}: </span>
                             <span style="color:#d1d4dc;font-weight:600;font-size:13px;">{etf_ticker} — {etf_name}</span>
                             &nbsp;&nbsp;|&nbsp;&nbsp;
                             <span style="color:#848e9c;font-size:12px;">📂 {tr('sector')}: </span>
                             <span style="color:#d1d4dc;font-size:13px;">{raw_sector}</span>
+                            {industry_row}
                         </div>
                         """, unsafe_allow_html=True)
 
                     else:
-                        st.info(tr("sector_no_etf") if raw_sector else "Sector information not available for this ticker.")
+                        st.info(tr("sector_no_etf") if (raw_sector or raw_industry) else "Sector information not available for this ticker.")
 
                     st.markdown("---")
 
