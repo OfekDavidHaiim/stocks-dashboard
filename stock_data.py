@@ -559,7 +559,208 @@ if st.session_state.language == "he":
 if not hasattr(st, "_orig_plotly_chart"):
     st._orig_plotly_chart = st.plotly_chart
 
+
+# ============================================================
+# SECTOR SENTIMENT INTELLIGENCE
+# ============================================================
+SECTOR_ETF_MAP = {
+    "Technology":               ("XLK",  "Technology Select Sector SPDR"),
+    "Financial Services":       ("XLF",  "Financial Select Sector SPDR"),
+    "Financials":               ("XLF",  "Financial Select Sector SPDR"),
+    "Healthcare":               ("XLV",  "Health Care Select Sector SPDR"),
+    "Consumer Cyclical":        ("XLY",  "Consumer Discretionary SPDR"),
+    "Consumer Defensive":       ("XLP",  "Consumer Staples SPDR"),
+    "Industrials":              ("XLI",  "Industrial Select Sector SPDR"),
+    "Basic Materials":          ("XLB",  "Materials Select Sector SPDR"),
+    "Energy":                   ("XLE",  "Energy Select Sector SPDR"),
+    "Real Estate":              ("XLRE", "Real Estate Select Sector SPDR"),
+    "Utilities":                ("XLU",  "Utilities Select Sector SPDR"),
+    "Communication Services":   ("XLC",  "Communication Services SPDR"),
+    "Consumer Electronics":     ("XLY",  "Consumer Discretionary SPDR"),
+    "Semiconductor":            ("SOXX", "iShares Semiconductor ETF"),
+    "Software":                 ("IGV",  "iShares Expanded Tech-Software ETF"),
+}
+
+@st.cache_data(ttl=3600)
+def get_sector_sentiment_data(ticker_symbol: str, sector: str):
+    """
+    Fetches 3-month performance data for both the stock and its sector ETF.
+    Returns a dict with returns, divergence score, and chart-ready DataFrames.
+    """
+    result = {
+        "etf_ticker": None, "etf_name": None,
+        "stock_return_3m": None, "etf_return_3m": None,
+        "divergence": None, "signal": "neutral",
+        "stock_hist": None, "etf_hist": None,
+        "stock_return_1m": None, "etf_return_1m": None,
+        "stock_return_6m": None, "etf_return_6m": None,
+        "stock_vol": None, "etf_vol": None,
+    }
+
+    # Find ETF for sector
+    etf_info = SECTOR_ETF_MAP.get(sector)
+    if not etf_info:
+        return result
+    etf_ticker, etf_name = etf_info
+    result["etf_ticker"] = etf_ticker
+    result["etf_name"] = etf_name
+
+    try:
+        # Fetch 7 months of data to cover 6m, 3m, 1m windows
+        end = pd.Timestamp.now()
+        start = end - pd.DateOffset(months=7)
+        stock_hist = yf.download(ticker_symbol, start=start, end=end, progress=False, auto_adjust=True)
+        etf_hist = yf.download(etf_ticker, start=start, end=end, progress=False, auto_adjust=True)
+
+        if stock_hist.empty or etf_hist.empty:
+            return result
+
+        # Flatten MultiIndex if present
+        if isinstance(stock_hist.columns, pd.MultiIndex):
+            stock_hist.columns = stock_hist.columns.get_level_values(0)
+        if isinstance(etf_hist.columns, pd.MultiIndex):
+            etf_hist.columns = etf_hist.columns.get_level_values(0)
+
+        def pct_return(df, months):
+            lookback = end - pd.DateOffset(months=months)
+            sub = df[df.index >= lookback]
+            if len(sub) < 5:
+                return None
+            return ((sub["Close"].iloc[-1] / sub["Close"].iloc[0]) - 1) * 100
+
+        result["stock_return_3m"] = pct_return(stock_hist, 3)
+        result["etf_return_3m"]   = pct_return(etf_hist, 3)
+        result["stock_return_1m"] = pct_return(stock_hist, 1)
+        result["etf_return_1m"]   = pct_return(etf_hist, 1)
+        result["stock_return_6m"] = pct_return(stock_hist, 6)
+        result["etf_return_6m"]   = pct_return(etf_hist, 6)
+
+        if result["stock_return_3m"] is not None and result["etf_return_3m"] is not None:
+            result["divergence"] = result["stock_return_3m"] - result["etf_return_3m"]
+            if result["divergence"] > 3:
+                result["signal"] = "bullish"
+            elif result["divergence"] < -3:
+                result["signal"] = "bearish"
+            else:
+                result["signal"] = "neutral"
+
+        # Normalize price series to 100 for comparison chart (use 3M window)
+        lookback_3m = end - pd.DateOffset(months=3)
+        s_slice = stock_hist[stock_hist.index >= lookback_3m]["Close"]
+        e_slice = etf_hist[etf_hist.index >= lookback_3m]["Close"]
+        if not s_slice.empty and not e_slice.empty:
+            result["stock_hist"] = (s_slice / s_slice.iloc[0]) * 100
+            result["etf_hist"]   = (e_slice / e_slice.iloc[0]) * 100
+
+        # Annualized volatility
+        def ann_vol(df, months):
+            lookback = end - pd.DateOffset(months=months)
+            sub = df[df.index >= lookback]["Close"].pct_change().dropna()
+            if len(sub) < 10:
+                return None
+            return sub.std() * (252 ** 0.5) * 100
+
+        result["stock_vol"] = ann_vol(stock_hist, 3)
+        result["etf_vol"]   = ann_vol(etf_hist, 3)
+
+    except Exception:
+        pass
+
+    return result
+
+
+def create_sector_divergence_chart(stock_hist, etf_hist, ticker_symbol, etf_ticker):
+    """Creates a normalized comparison chart of stock vs. sector ETF (base=100)."""
+    fig = go.Figure()
+
+    if stock_hist is not None and not stock_hist.empty:
+        fig.add_trace(go.Scatter(
+            x=stock_hist.index,
+            y=stock_hist.values,
+            name=ticker_symbol,
+            line=dict(color='#2962ff', width=2.5),
+            mode='lines'
+        ))
+
+    if etf_hist is not None and not etf_hist.empty:
+        fig.add_trace(go.Scatter(
+            x=etf_hist.index,
+            y=etf_hist.values,
+            name=f"{etf_ticker} (Sector)",
+            line=dict(color='#f59e0b', width=2, dash='dot'),
+            mode='lines'
+        ))
+
+    # Add baseline
+    fig.add_hline(y=100, line_dash="dash", line_color="#444c5e", line_width=1)
+
+    fig.update_layout(
+        yaxis_title="Normalized Price (Base = 100)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(t=40, b=20, l=40, r=20),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def create_sector_radar_chart(ticker_symbol, etf_ticker, divergence, stock_vol, etf_vol,
+                               stock_3m, etf_3m, stock_1m, etf_1m):
+    """Creates a radar chart comparing stock vs. sector across multiple dimensions."""
+    import math
+
+    def safe_score(val, center=0, scale=20, flip=False):
+        if val is None:
+            return 50
+        score = 50 + (val - center) / scale * 50
+        if flip:
+            score = 100 - score
+        return max(0, min(100, score))
+
+    div_score  = safe_score(divergence, center=0, scale=15)
+    mom_3m     = safe_score(stock_3m, center=0, scale=20)
+    mom_1m     = safe_score(stock_1m, center=0, scale=10)
+    # Lower volatility vs sector is better (flip)
+    vol_rel    = 50
+    if stock_vol is not None and etf_vol is not None and etf_vol > 0:
+        vol_rel = safe_score(etf_vol - stock_vol, center=0, scale=10)  # positive = stock less volatile
+
+    categories = ["Divergence vs Sector", "3M Momentum", "1M Momentum", "Relative Stability", "Divergence vs Sector"]
+    values_stock = [div_score, mom_3m, mom_1m, vol_rel, div_score]
+
+    # ETF baseline is always 50 (neutral)
+    values_etf = [50, 50, 50, 50, 50]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=values_stock,
+        theta=categories,
+        fill='toself',
+        name=ticker_symbol,
+        line=dict(color='#2962ff', width=2),
+        fillcolor='rgba(41, 98, 255, 0.2)'
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=values_etf,
+        theta=categories,
+        fill='toself',
+        name=f"{etf_ticker} Sector Baseline",
+        line=dict(color='#f59e0b', width=1.5, dash='dot'),
+        fillcolor='rgba(245, 158, 11, 0.1)'
+    ))
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(color='#848e9c', size=9)),
+            angularaxis=dict(tickfont=dict(color='#d1d4dc', size=10))
+        ),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+        margin=dict(t=30, b=60, l=60, r=60),
+    )
+    return fig
+
+
 def apply_tradingview_plotly_style(fig):
+
     if fig is None:
         return None
     
@@ -3761,13 +3962,165 @@ if st.session_state.page_selector == "Dashboard":
                 # TAB 6: NEWS & MARKET SENTIMENT
                 # ==========================================
                 with tab6:
+
+                    # ── SECTION A: SECTOR INTELLIGENCE ──────────────────────────────
+                    raw_sector = info.get('sector', '')
+                    st.markdown(f"## {tr('sector_sentiment_title')}")
+                    st.caption(tr('sector_sentiment_subtitle'))
+
+                    if raw_sector and raw_sector in SECTOR_ETF_MAP:
+                        with st.spinner(tr("sector_loading")):
+                            sd = get_sector_sentiment_data(ticker_input, raw_sector)
+
+                        etf_ticker  = sd["etf_ticker"]
+                        etf_name    = sd["etf_name"]
+                        divergence  = sd["divergence"]
+                        signal      = sd["signal"]
+
+                        # ── Signal Banner ──
+                        if divergence is not None:
+                            diff_abs = abs(divergence)
+                            if signal == "bullish":
+                                banner_msg = tr("sector_outperforming").format(ticker=ticker_input, etf=etf_ticker, diff=diff_abs)
+                                banner_color = "#0d2b1f"
+                                border_color = "#10b981"
+                                badge_color  = "#10b981"
+                                badge_label  = tr("divergence_bullish")
+                            elif signal == "bearish":
+                                banner_msg = tr("sector_underperforming").format(ticker=ticker_input, etf=etf_ticker, diff=diff_abs)
+                                banner_color = "#2b0f0f"
+                                border_color = "#ef4444"
+                                badge_color  = "#ef4444"
+                                badge_label  = tr("divergence_bearish")
+                            else:
+                                banner_msg = tr("sector_inline").format(ticker=ticker_input, etf=etf_ticker)
+                                banner_color = "#1c2030"
+                                border_color = "#848e9c"
+                                badge_color  = "#848e9c"
+                                badge_label  = tr("divergence_neutral")
+
+                            st.markdown(f"""
+                            <div style="background:{banner_color}; border-left:4px solid {border_color}; border-radius:8px;
+                                        padding:14px 18px; margin-bottom:18px; display:flex; align-items:center; gap:14px;">
+                                <span style="background:{badge_color}; color:#fff; font-weight:700; font-size:12px;
+                                             border-radius:5px; padding:4px 10px; white-space:nowrap;">{badge_label}</span>
+                                <span style="color:#d1d4dc; font-size:14px; font-family:'Outfit','Rubik',sans-serif;">{banner_msg}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        # ── Metric Cards ──
+                        col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns(5)
+
+                        def _fmt_ret(v):
+                            if v is None: return "N/A"
+                            color = "#10b981" if v >= 0 else "#ef4444"
+                            sign  = "+" if v >= 0 else ""
+                            return f'<span style="color:{color};font-weight:700;">{sign}{v:.2f}%</span>'
+
+                        def _fmt_div(v):
+                            if v is None: return "N/A"
+                            color = "#10b981" if v >= 0 else "#ef4444"
+                            sign  = "+" if v >= 0 else ""
+                            return f'<span style="color:{color};font-weight:800;font-size:22px;">{sign}{v:.2f}%</span>'
+
+                        def _mini_card(col, title, html_val, subtitle=""):
+                            col.markdown(f"""
+                            <div style="background:#1c2030;border:1px solid #2a2e39;border-radius:8px;padding:14px 12px;text-align:center;">
+                                <div style="color:#848e9c;font-size:11px;font-weight:600;text-transform:uppercase;margin-bottom:6px;font-family:'Outfit','Rubik',sans-serif;">{title}</div>
+                                <div style="font-size:20px;font-family:'Outfit','Rubik',sans-serif;">{html_val}</div>
+                                {f'<div style="color:#848e9c;font-size:10px;margin-top:4px;">{subtitle}</div>' if subtitle else ''}
+                            </div>""", unsafe_allow_html=True)
+
+                        _mini_card(col_s1, tr("stock_momentum"),   _fmt_ret(sd["stock_return_3m"]), "3M")
+                        _mini_card(col_s2, tr("sector_momentum"),  _fmt_ret(sd["etf_return_3m"]),   f"{etf_ticker} · 3M")
+                        _mini_card(col_s3, tr("divergence_score"), _fmt_div(divergence),             tr("divergence_explanation"))
+                        _mini_card(col_s4, tr("stock_momentum"),   _fmt_ret(sd["stock_return_1m"]), "1M")
+                        _mini_card(col_s5, tr("sector_momentum"),  _fmt_ret(sd["etf_return_1m"]),   f"{etf_ticker} · 1M")
+
+                        st.markdown("<br>", unsafe_allow_html=True)
+
+                        # ── Charts: Performance + Radar ──
+                        col_chart_left, col_chart_right = st.columns([3, 2])
+
+                        with col_chart_left:
+                            st.markdown(f"**{tr('stock_vs_sector_perf')}**")
+                            if sd["stock_hist"] is not None and sd["etf_hist"] is not None:
+                                fig_div = create_sector_divergence_chart(
+                                    sd["stock_hist"], sd["etf_hist"], ticker_input, etf_ticker
+                                )
+                                fig_div = apply_tradingview_plotly_style(fig_div)
+                                fig_div.update_layout(title=f"<b>{ticker_input} vs {etf_ticker}</b> · 3M Normalized (Base=100)")
+                                plotly_chart_styled(fig_div)
+                            else:
+                                st.info("Chart data unavailable.")
+
+                        with col_chart_right:
+                            st.markdown(f"**{tr('sector_radar_title')}**")
+                            fig_radar = create_sector_radar_chart(
+                                ticker_input, etf_ticker,
+                                divergence,
+                                sd["stock_vol"], sd["etf_vol"],
+                                sd["stock_return_3m"], sd["etf_return_3m"],
+                                sd["stock_return_1m"], sd["etf_return_1m"]
+                            )
+                            fig_radar = apply_tradingview_plotly_style(fig_radar)
+                            plotly_chart_styled(fig_radar)
+
+                        # ── 6-Month Return Comparison Bar ──
+                        if sd["stock_return_6m"] is not None and sd["etf_return_6m"] is not None:
+                            st.markdown("---")
+                            fig_bar = go.Figure()
+                            colors_bar = {
+                                ticker_input: "#2962ff",
+                                f"{etf_ticker} (Sector)": "#f59e0b"
+                            }
+                            for label, val in [(ticker_input, sd["stock_return_6m"]), (f"{etf_ticker} (Sector)", sd["etf_return_6m"])]:
+                                fig_bar.add_trace(go.Bar(
+                                    x=["1M Return", "3M Return", "6M Return"],
+                                    y=[
+                                        sd["stock_return_1m"] if label == ticker_input else sd["etf_return_1m"],
+                                        sd["stock_return_3m"] if label == ticker_input else sd["etf_return_3m"],
+                                        sd["stock_return_6m"] if label == ticker_input else sd["etf_return_6m"]
+                                    ],
+                                    name=label,
+                                    marker_color=colors_bar[label],
+                                    opacity=0.85
+                                ))
+                            fig_bar.update_layout(
+                                title=f"<b>{ticker_input} vs {etf_ticker}</b> — Multi-Period Return Comparison",
+                                barmode="group",
+                                yaxis_title="Return (%)",
+                                yaxis_ticksuffix="%",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                margin=dict(t=50, b=20)
+                            )
+                            fig_bar = apply_tradingview_plotly_style(fig_bar)
+                            plotly_chart_styled(fig_bar)
+
+                        # ── ETF Info Footer ──
+                        st.markdown(f"""
+                        <div style="background:#161b2d;border:1px solid #2a2e39;border-radius:8px;padding:12px 16px;margin-top:10px;">
+                            <span style="color:#848e9c;font-size:12px;">🏷️ {tr('sector_etf_label')}: </span>
+                            <span style="color:#d1d4dc;font-weight:600;font-size:13px;">{etf_ticker} — {etf_name}</span>
+                            &nbsp;&nbsp;|&nbsp;&nbsp;
+                            <span style="color:#848e9c;font-size:12px;">📂 {tr('sector')}: </span>
+                            <span style="color:#d1d4dc;font-size:13px;">{raw_sector}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    else:
+                        st.info(tr("sector_no_etf") if raw_sector else "Sector information not available for this ticker.")
+
+                    st.markdown("---")
+
+                    # ── SECTION B: NEWS FEED ──────────────────────────────────────────
                     st.subheader(tr("news_feed"))
                     try:
                         ticker_obj = yf.Ticker(ticker_input)
                         news_list = ticker_obj.news
                     except Exception:
                         news_list = []
-                    
+
                     if news_list and isinstance(news_list, list):
                         for item in news_list[:6]:
                             content = item.get("content", {})
@@ -3783,7 +4136,7 @@ if st.session_state.page_selector == "Dashboard":
                                 publisher = item.get("publisher", "")
                                 link = item.get("link", "")
                                 pub_time = item.get("providerPublishTime", "")
-                            
+
                             try:
                                 if isinstance(pub_time, (int, float)):
                                     date_str = pd.to_datetime(pub_time, unit='s').strftime('%Y-%m-%d %H:%M')
@@ -3791,17 +4144,18 @@ if st.session_state.page_selector == "Dashboard":
                                     date_str = pd.to_datetime(pub_time).strftime('%Y-%m-%d %H:%M')
                             except Exception:
                                 date_str = str(pub_time)
-                                
+
                             if st.session_state.language == "he":
                                 title = translate_text(title)
                                 publisher = translate_text(publisher)
-                                
+
                             st.markdown(f"#### {title}")
                             st.write(tr("published_by").format(publisher=publisher, date=date_str))
                             st.markdown(f"[**{tr('read_article')}**]({link})")
                             st.markdown("---")
                     else:
                         st.info(tr("no_news_available"))
+
 
                 # ==========================================
                 # TAB 7: DIVIDEND HISTORY
