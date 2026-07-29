@@ -46,3 +46,6 @@ Active_Resources/
 desktop.ini
 Thumbs.db
 .DS_Store
+
+# App Data / Local Cache Files
+screener_cache.json

@@ -2711,12 +2711,187 @@ def render_portfolio_card(label, value_str, status, description=""):
     return card_html
 
 
+
+# ============================================================
+# FINANCIAL SCREENER ENGINE
+# ============================================================
+SCREENER_CACHE_FILE = "screener_cache.json"
+
+SCREENER_UNIVERSE = list(dict.fromkeys([
+    # ── Mega-cap Tech ──────────────────────────────────────────────────────────
+    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "AMD", "QCOM", "AMAT", "KLAC", "LRCX",
+    "TXN", "MRVL", "ADI", "MCHP", "ON", "MPWR", "SNPS", "CDNS", "ANSS", "TER",
+    # ── Software / Cloud ───────────────────────────────────────────────────────
+    "CRM", "ADBE", "NOW", "INTU", "WDAY", "HUBS", "VEEV", "TEAM", "DDOG", "MDB",
+    "SNOW", "NET", "ZS", "CRWD", "PANW", "FTNT", "OKTA", "CFLT",
+    # ── Internet / Consumer Tech ───────────────────────────────────────────────
+    "NFLX", "META", "GOOGL", "AMZN", "TSLA", "SHOP", "ABNB", "UBER", "PINS",
+    "DASH", "EBAY",
+    # ── Financials ────────────────────────────────────────────────────────────
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "AXP", "V", "MA", "SPGI",
+    "MCO", "ICE", "CME", "BLK", "SCHW", "COF", "USB", "TFC", "PNC", "SYF",
+    # ── Healthcare / Biotech ──────────────────────────────────────────────────
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
+    "AMGN", "GILD", "REGN", "VRTX", "ISRG", "SYK", "MDT", "IDXX", "DXCM", "BSX",
+    "EW", "IQV", "MRNA", "GEHC",
+    # ── Consumer Discretionary ────────────────────────────────────────────────
+    "HD", "LOW", "MCD", "SBUX", "NKE", "LULU", "CMG", "TJX", "ROST",
+    "TGT", "DG", "DLTR", "YUM", "DRI", "BKNG",
+    # ── Consumer Staples ──────────────────────────────────────────────────────
+    "WMT", "COST", "PG", "KO", "PEP", "PM", "MDLZ", "CL", "KMB",
+    # ── Industrials ───────────────────────────────────────────────────────────
+    "HON", "CAT", "RTX", "GE", "EMR", "ETN", "PH", "ITW", "CTAS",
+    "UNP", "CSX", "LMT", "BA", "NOC", "GD", "FDX", "UPS", "FAST", "ROK",
+    # ── Energy ────────────────────────────────────────────────────────────────
+    "XOM", "CVX", "COP", "EOG", "MPC", "VLO", "SLB", "HAL", "DVN", "PSX",
+    # ── Communication Services ────────────────────────────────────────────────
+    "T", "VZ", "CMCSA", "DIS", "TTWO", "EA",
+    # ── Materials / Real Estate ───────────────────────────────────────────────
+    "LIN", "APD", "SHW", "ECL", "AMT", "PLD", "EQIX",
+]))
+
+METRIC_WEIGHTS = {
+    "revenue_growth":   0.20,
+    "earnings_growth":  0.20,
+    "gross_margin":     0.15,
+    "operating_margin": 0.15,
+    "net_margin":       0.10,
+    "roe":              0.10,
+    "fcf_margin":       0.10,
+}
+
+
+def _safe_metric(info, key, multiplier=100.0):
+    """Safely extract and scale a yfinance metric to percentage."""
+    try:
+        v = info.get(key)
+        if v is None:
+            return None
+        f = float(v)
+        import math
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return round(f * multiplier, 2)
+    except Exception:
+        return None
+
+
+def score_single_stock(sym, info):
+    """Extract raw financial metrics from a yfinance info dict."""
+    revenue  = info.get("totalRevenue")
+    fcf      = info.get("freeCashflow")
+    fcf_margin = None
+    try:
+        if revenue and fcf and float(revenue) > 0:
+            fcf_margin = round((float(fcf) / float(revenue)) * 100, 2)
+    except Exception:
+        pass
+
+    return {
+        "ticker":           sym,
+        "name":             info.get("longName") or info.get("shortName") or sym,
+        "sector":           info.get("sector", "N/A"),
+        "industry":         info.get("industry", "N/A"),
+        "market_cap":       info.get("marketCap", 0) or 0,
+        "current_price":    info.get("currentPrice") or info.get("regularMarketPrice") or 0,
+        "currency":         info.get("currency", "USD"),
+        "revenue_growth":   _safe_metric(info, "revenueGrowth"),
+        "earnings_growth":  _safe_metric(info, "earningsGrowth"),
+        "gross_margin":     _safe_metric(info, "grossMargins"),
+        "operating_margin": _safe_metric(info, "operatingMargins"),
+        "net_margin":       _safe_metric(info, "profitMargins"),
+        "roe":              _safe_metric(info, "returnOnEquity"),
+        "fcf_margin":       fcf_margin,
+        "composite_score":  0,
+    }
+
+
+def _percentile_score(all_values, target):
+    """Return 0-100 percentile score of target within a list (None-safe)."""
+    valid = [v for v in all_values if v is not None]
+    if not valid or target is None:
+        return 50.0
+    below = sum(1 for v in valid if v <= target)
+    return round((below / len(valid)) * 100, 1)
+
+
+def _compute_all_scores(rows):
+    """Compute percentile-based composite scores for all stocks in-place."""
+    for metric, weight in METRIC_WEIGHTS.items():
+        all_vals = [r[metric] for r in rows]
+        for r in rows:
+            pct = _percentile_score(all_vals, r[metric])
+            r["composite_score"] = round(r.get("composite_score", 0) + pct * weight, 2)
+    return rows
+
+
+def run_screener_scan(progress_bar=None, status_text=None):
+    """
+    Scan SCREENER_UNIVERSE, score each stock, persist top-20 to JSON.
+    Returns the full cache dict.
+    """
+    rows = []
+    total = len(SCREENER_UNIVERSE)
+    for i, sym in enumerate(SCREENER_UNIVERSE):
+        try:
+            info = yf.Ticker(sym).info
+            if info and info.get("regularMarketPrice") is not None or info.get("currentPrice"):
+                rows.append(score_single_stock(sym, info))
+        except Exception:
+            pass
+        if progress_bar is not None:
+            progress_bar.progress((i + 1) / total)
+        if status_text is not None:
+            status_text.markdown(
+                f'<span style="color:#848e9c;font-size:13px;">Scanning **{sym}** &nbsp;({i+1}/{total})</span>',
+                unsafe_allow_html=True
+            )
+
+    rows = _compute_all_scores(rows)
+    rows.sort(key=lambda x: x["composite_score"], reverse=True)
+    top_20 = rows[:20]
+
+    cache_data = {
+        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "universe_size": len(rows),
+        "top_20": top_20,
+    }
+    try:
+        with open(SCREENER_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        pass
+
+    return cache_data
+
+
+def load_screener_cache():
+    """Load previously saved screener results from disk. Returns None if not found."""
+    if not os.path.exists(SCREENER_CACHE_FILE):
+        return None
+    try:
+        with open(SCREENER_CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "top_20" in data and isinstance(data["top_20"], list):
+            return data
+    except Exception:
+        pass
+    return None
+
+
 st.set_page_config(page_title="Comprehensive Stock Dashboard", layout="wide")
+
 
 # --- Sidebar Navigation ---
 st.sidebar.title(tr("navigation"))
-pages = ["Dashboard", "Compare", "Watchlist", "Portfolio"]
-page_format_func = lambda x: tr("dashboard") if x == "Dashboard" else (tr("compare_stocks") if x == "Compare" else (tr("watchlist") if x == "Watchlist" else tr("portfolio")))
+pages = ["Dashboard", "Compare", "Watchlist", "Portfolio", "Screener"]
+page_format_func = lambda x: (
+    tr("dashboard") if x == "Dashboard" else
+    tr("compare_stocks") if x == "Compare" else
+    tr("watchlist") if x == "Watchlist" else
+    tr("screener") if x == "Screener" else
+    tr("portfolio")
+)
 try:
     page_index = pages.index(st.session_state.page_selector)
 except ValueError:
@@ -5571,6 +5746,200 @@ elif st.session_state.page_selector == "Portfolio":
                             s["sells"].append({"p": 0.0, "q": 0.0})
                             save_portfolio(st.session_state.portfolio_dict)
                             st.rerun()
+
+
+
+# ==========================================
+# PAGE 5: SCREENER — TOP 20 FINANCIAL PERFORMERS
+# ==========================================
+elif st.session_state.page_selector == "Screener":
+    st.title(tr("screener_page_title"))
+    st.caption(tr("screener_subtitle"))
+
+    # ── Load cached data from disk ─────────────────────────────────────────────
+    if "screener_cache" not in st.session_state:
+        st.session_state.screener_cache = load_screener_cache()
+
+    cache = st.session_state.screener_cache
+
+    # ── Header row: last scan info + re-scan button ────────────────────────────
+    hdr_left, hdr_right = st.columns([4, 1])
+    with hdr_left:
+        if cache:
+            ts  = cache.get("timestamp", "?")
+            cnt = cache.get("universe_size", "?")
+            st.markdown(
+                f'<span style="color:#848e9c;font-size:13px;">📅 {tr("screener_last_scan")}: '
+                f'<strong style="color:#d1d4dc;">{ts}</strong> &nbsp;|&nbsp; '
+                f'<strong style="color:#2962ff;">{cnt}</strong> {tr("screener_universe_size")}</span>',
+                unsafe_allow_html=True
+            )
+    with hdr_right:
+        btn_label = tr("screener_rescan_btn") if cache else tr("screener_scan_btn")
+        do_scan = st.button(btn_label, use_container_width=True, type="primary" if not cache else "secondary")
+
+    # ── Run scan if triggered ──────────────────────────────────────────────────
+    if do_scan or not cache:
+        if do_scan or (not cache):
+            scan_container = st.container()
+            with scan_container:
+                st.markdown("---")
+                st.markdown(f"**{tr('screener_scanning')}**")
+                prog_bar  = st.progress(0)
+                stat_text = st.empty()
+                cache = run_screener_scan(progress_bar=prog_bar, status_text=stat_text)
+                st.session_state.screener_cache = cache
+                prog_bar.empty()
+                stat_text.empty()
+                st.success(f"✅ Scan complete — {cache['universe_size']} stocks analyzed, Top 20 saved!")
+                st.rerun()
+
+    if not cache:
+        st.markdown("---")
+        st.info(tr("screener_no_cache"))
+        st.stop()
+
+    top_20 = cache.get("top_20", [])
+    if not top_20:
+        st.warning("No results in cache. Please re-scan.")
+        st.stop()
+
+    st.markdown("---")
+
+    # ── Sector filter ──────────────────────────────────────────────────────────
+    all_sectors = sorted(set(s.get("sector", "N/A") for s in top_20 if s.get("sector") and s.get("sector") != "N/A"))
+    filter_col, _ = st.columns([2, 5])
+    with filter_col:
+        sector_choice = st.selectbox(
+            tr("screener_sector_filter"),
+            [tr("screener_all_sectors")] + all_sectors,
+            key="screener_sector_filter"
+        )
+    filtered = top_20 if sector_choice == tr("screener_all_sectors") else [
+        s for s in top_20 if s.get("sector") == sector_choice
+    ]
+
+    # ── Helper: format metric cell ─────────────────────────────────────────────
+    def _cell(val, suffix="%", good_above=0):
+        if val is None:
+            return '<span style="color:#4a5568;">—</span>'
+        color = "#10b981" if val >= good_above else "#ef4444"
+        sign  = "+" if val > 0 else ""
+        return f'<span style="color:{color};font-weight:600;">{sign}{val:.1f}{suffix}</span>'
+
+    def _score_badge(score):
+        if score >= 75:
+            bg, fg = "#0d3321", "#10b981"
+        elif score >= 55:
+            bg, fg = "#1a2744", "#60a5fa"
+        else:
+            bg, fg = "#2b1111", "#ef4444"
+        return (f'<span style="background:{bg};color:{fg};font-weight:800;font-size:15px;'
+                f'padding:3px 10px;border-radius:6px;">{score:.1f}</span>')
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    # ── TOP 5 SPOTLIGHT CARDS ──────────────────────────────────────────────────
+    st.markdown(f"### {tr('screener_spotlight')}")
+    spot_cols = st.columns(min(5, len(filtered)))
+    for i, stock in enumerate(filtered[:5]):
+        medal   = medals[i] if i < 3 else f"#{i+1}"
+        score   = stock.get("composite_score", 0)
+        ticker  = stock.get("ticker", "")
+        name    = stock.get("name", ticker)
+        sector  = stock.get("sector", "N/A")
+        price   = stock.get("current_price", 0)
+        mcap    = stock.get("market_cap", 0)
+        mcap_str = f"${mcap/1e12:.2f}T" if mcap >= 1e12 else (f"${mcap/1e9:.1f}B" if mcap >= 1e9 else "N/A")
+        if score >= 75:
+            border_c, score_c = "#10b981", "#10b981"
+        elif score >= 55:
+            border_c, score_c = "#2962ff", "#60a5fa"
+        else:
+            border_c, score_c = "#ef4444", "#ef4444"
+
+        spot_cols[i].markdown(f"""
+        <div style="background:#1c2030;border:1px solid {border_c};border-top:3px solid {border_c};
+                    border-radius:10px;padding:16px 14px;text-align:center;min-height:180px;">
+            <div style="font-size:24px;margin-bottom:4px;">{medal}</div>
+            <div style="color:#ffffff;font-weight:800;font-size:18px;font-family:'Outfit','Rubik',sans-serif;">{ticker}</div>
+            <div style="color:#848e9c;font-size:10px;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:22]}</div>
+            <div style="color:{score_c};font-weight:800;font-size:26px;line-height:1;">{score:.1f}</div>
+            <div style="color:#848e9c;font-size:9px;margin-bottom:8px;">SCORE</div>
+            <div style="color:#d1d4dc;font-size:11px;">${price:,.2f} &nbsp;|&nbsp; {mcap_str}</div>
+            <div style="color:#848e9c;font-size:9px;margin-top:4px;">{sector}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── FULL LEADERBOARD ───────────────────────────────────────────────────────
+    st.markdown(f"### {tr('screener_leaderboard')}")
+
+    # Table header
+    col_widths = [0.4, 0.7, 2.0, 0.7, 0.8, 0.8, 0.9, 0.9, 0.8, 0.8, 0.8, 0.9]
+    hdr = st.columns(col_widths)
+    hdr_labels = [
+        tr("screener_rank"), "Ticker", "Company",
+        tr("screener_score"),
+        tr("screener_rev_growth"), tr("screener_ni_growth"),
+        tr("screener_gross_margin"), tr("screener_op_margin"), tr("screener_net_margin"),
+        tr("screener_roe"), tr("screener_fcf_margin"), ""
+    ]
+    for h, label in zip(hdr, hdr_labels):
+        h.markdown(f'<span style="color:#848e9c;font-size:10px;font-weight:700;text-transform:uppercase;">{label}</span>', unsafe_allow_html=True)
+
+    st.markdown('<hr style="border-color:#2a2e39;margin:4px 0 6px 0;">', unsafe_allow_html=True)
+
+    for rank_idx, stock in enumerate(filtered[:20], start=1):
+        ticker  = stock.get("ticker", "")
+        name    = stock.get("name", ticker)
+        score   = stock.get("composite_score", 0)
+        medal   = medals[rank_idx - 1] if rank_idx <= 3 else f"**#{rank_idx}**"
+
+        row_bg = "#1c2030" if rank_idx % 2 == 0 else "#161b2d"
+
+        cols = st.columns(col_widths)
+        cols[0].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{medal}</div>', unsafe_allow_html=True)
+        cols[1].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;font-weight:700;color:#ffffff;font-size:13px;">{ticker}</div>', unsafe_allow_html=True)
+        cols[2].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;color:#848e9c;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:28]}</div>', unsafe_allow_html=True)
+        cols[3].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;">{_score_badge(score)}</div>', unsafe_allow_html=True)
+        cols[4].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("revenue_growth"))}</div>', unsafe_allow_html=True)
+        cols[5].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("earnings_growth"))}</div>', unsafe_allow_html=True)
+        cols[6].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("gross_margin"), good_above=30)}</div>', unsafe_allow_html=True)
+        cols[7].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("operating_margin"), good_above=10)}</div>', unsafe_allow_html=True)
+        cols[8].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("net_margin"), good_above=5)}</div>', unsafe_allow_html=True)
+        cols[9].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("roe"), good_above=10)}</div>', unsafe_allow_html=True)
+        cols[10].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("fcf_margin"), good_above=5)}</div>', unsafe_allow_html=True)
+        with cols[11]:
+            if st.button(tr("screener_open_dashboard"), key=f"open_dash_{ticker}_{rank_idx}", use_container_width=True):
+                st.session_state.selected_ticker  = ticker
+                st.session_state.page_selector    = "Dashboard"
+                st.rerun()
+
+        st.markdown('<div style="border-bottom:1px solid #2a2e3930;"></div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Score methodology explainer ────────────────────────────────────────────
+    with st.expander("ℹ️ How the Score is Calculated", expanded=False):
+        st.markdown("""
+        The **Composite Score** (0–100) is a **percentile-ranked**, weighted average of 7 financial metrics.
+        Each metric is scored against all stocks in the scanned universe, then weighted:
+
+        | Metric | Weight | Source |
+        |---|---|---|
+        | Revenue Growth (YoY) | **20%** | `revenueGrowth` |
+        | Net Income Growth (YoY) | **20%** | `earningsGrowth` |
+        | Gross Margin | **15%** | `grossMargins` |
+        | Operating Margin | **15%** | `operatingMargins` |
+        | Net Profit Margin | **10%** | `profitMargins` |
+        | Return on Equity (ROE) | **10%** | `returnOnEquity` |
+        | Free Cash Flow Margin | **10%** | `freeCashflow / totalRevenue` |
+
+        A score of **75+** = Top quartile. **55–75** = Above average. **<55** = Below average within this universe.
+        Data is sourced from Yahoo Finance (`yfinance`). A `—` means the metric was not reported.
+        """)
 
 
 # --- Execution Wrapper ---
