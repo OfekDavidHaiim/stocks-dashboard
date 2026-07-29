@@ -2718,36 +2718,70 @@ def render_portfolio_card(label, value_str, status, description=""):
 SCREENER_CACHE_FILE = "screener_cache.json"
 
 SCREENER_UNIVERSE = list(dict.fromkeys([
-    # ── Mega-cap Tech ──────────────────────────────────────────────────────────
-    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "AMD", "QCOM", "AMAT", "KLAC", "LRCX",
-    "TXN", "MRVL", "ADI", "MCHP", "ON", "MPWR", "SNPS", "CDNS", "ANSS", "TER",
-    # ── Software / Cloud ───────────────────────────────────────────────────────
-    "CRM", "ADBE", "NOW", "INTU", "WDAY", "HUBS", "VEEV", "TEAM", "DDOG", "MDB",
-    "SNOW", "NET", "ZS", "CRWD", "PANW", "FTNT", "OKTA", "CFLT",
-    # ── Internet / Consumer Tech ───────────────────────────────────────────────
-    "NFLX", "META", "GOOGL", "AMZN", "TSLA", "SHOP", "ABNB", "UBER", "PINS",
-    "DASH", "EBAY",
-    # ── Financials ────────────────────────────────────────────────────────────
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "AXP", "V", "MA", "SPGI",
-    "MCO", "ICE", "CME", "BLK", "SCHW", "COF", "USB", "TFC", "PNC", "SYF",
-    # ── Healthcare / Biotech ──────────────────────────────────────────────────
-    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
-    "AMGN", "GILD", "REGN", "VRTX", "ISRG", "SYK", "MDT", "IDXX", "DXCM", "BSX",
-    "EW", "IQV", "MRNA", "GEHC",
-    # ── Consumer Discretionary ────────────────────────────────────────────────
-    "HD", "LOW", "MCD", "SBUX", "NKE", "LULU", "CMG", "TJX", "ROST",
-    "TGT", "DG", "DLTR", "YUM", "DRI", "BKNG",
-    # ── Consumer Staples ──────────────────────────────────────────────────────
-    "WMT", "COST", "PG", "KO", "PEP", "PM", "MDLZ", "CL", "KMB",
-    # ── Industrials ───────────────────────────────────────────────────────────
-    "HON", "CAT", "RTX", "GE", "EMR", "ETN", "PH", "ITW", "CTAS",
-    "UNP", "CSX", "LMT", "BA", "NOC", "GD", "FDX", "UPS", "FAST", "ROK",
-    # ── Energy ────────────────────────────────────────────────────────────────
-    "XOM", "CVX", "COP", "EOG", "MPC", "VLO", "SLB", "HAL", "DVN", "PSX",
+    # ── Information Technology ─────────────────────────────────────────────────
+    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "AMD", "QCOM", "AMAT", "TXN", "KLAC",
+    "LRCX", "ADI", "MCHP", "MPWR", "ON", "SNPS", "CDNS", "ANSS", "TER", "MRVL",
+    "CRM", "ADBE", "NOW", "INTU", "CTSH", "IBM", "CSCO", "ACN", "FI", "IT",
+    "EPAM", "PTC", "AKAM", "CDW", "HPQ", "HPE", "WDC", "STX", "NTAP", "KEYS",
+    "TRMB", "GDDY", "GEN", "JNPR", "QRVO", "SWKS", "TEL", "APH", "GLW", "FFIV",
+    "PAYC", "GFS", "TYL", "SMCI",
+    # ── Software / Cloud / Cybersecurity ──────────────────────────────────────
+    "PANW", "CRWD", "FTNT", "ZS", "NET", "OKTA", "DDOG", "MDB", "SNOW", "TEAM",
+    "CFLT", "WDAY", "HUBS", "VEEV",
     # ── Communication Services ────────────────────────────────────────────────
-    "T", "VZ", "CMCSA", "DIS", "TTWO", "EA",
-    # ── Materials / Real Estate ───────────────────────────────────────────────
-    "LIN", "APD", "SHW", "ECL", "AMT", "PLD", "EQIX",
+    "META", "GOOGL", "GOOG", "NFLX", "DIS", "CMCSA", "T", "VZ", "TTWO", "EA",
+    "WBD", "FOXA", "FOX", "PARA", "NWSA", "NWS", "CHTR", "TMUS", "LYV", "IPG",
+    "OMC", "MTCH",
+    # ── Consumer Discretionary ────────────────────────────────────────────────
+    "AMZN", "TSLA", "HD", "MCD", "LOW", "NKE", "SBUX", "TJX", "BKNG", "CMG",
+    "ROST", "ORLY", "AZO", "TGT", "LULU", "YUM", "DRI", "DPZ", "F", "GM",
+    "APTV", "BWA", "LKQ", "GRMN", "RL", "TPR", "HAS", "MAR", "HLT", "WYNN",
+    "LVS", "MGM", "CZR", "NCLH", "CCL", "RCL", "EXPE", "ABNB", "ULTA", "BBWI",
+    "BBY", "DG", "DLTR", "DAL", "UAL", "LUV", "NVR", "PHM", "LEN", "DHI",
+    "TOL", "MTH", "POOL", "SWK", "BLDR",
+    # ── Consumer Staples ──────────────────────────────────────────────────────
+    "WMT", "COST", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "KMB",
+    "KHC", "GIS", "SJM", "CPB", "HRL", "TSN", "CAG", "MKC", "CHD", "CLX",
+    "K", "KDP", "TAP", "STZ", "MNST", "BF-B",
+    # ── Financials ────────────────────────────────────────────────────────────
+    "JPM", "BAC", "WFC", "GS", "MS", "C", "AXP", "BK", "BLK", "SCHW",
+    "V", "MA", "SPGI", "MCO", "ICE", "CME", "CBOE", "NDAQ", "FI", "COF",
+    "USB", "TFC", "PNC", "MTB", "FITB", "HBAN", "CFG", "RF", "KEY", "ZION",
+    "CMA", "ALLY", "SYF", "DFS", "AIG", "MET", "PRU", "AFL", "ALL", "PGR",
+    "CB", "TRV", "HIG", "ACGL", "MKL", "AJG", "MMC", "WTW", "AON", "CINF",
+    "GL", "LNC", "UNM", "EG", "AIZ", "PFG", "RJF", "IVZ", "BEN", "FLT",
+    "PYPL", "GPN", "FIS", "JKHY", "KKR", "BX", "APO", "ARES",
+    # ── Healthcare ────────────────────────────────────────────────────────────
+    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
+    "AMGN", "GILD", "REGN", "VRTX", "ISRG", "SYK", "MDT", "BSX", "EW", "IDXX",
+    "DXCM", "IQV", "MRNA", "GEHC", "ZBH", "RMD", "HOLX", "PODD", "TECH",
+    "MTD", "A", "WAT", "RVTY", "INCY", "BIIB", "ILMN", "ALGN", "HSIC",
+    "DGX", "LH", "CTLT", "BDX", "CAH", "MCK", "COR", "MOH", "HCA",
+    "ELV", "CI", "HUM", "CNC",
+    # ── Industrials ───────────────────────────────────────────────────────────
+    "HON", "CAT", "RTX", "GE", "GEV", "EMR", "ETN", "PH", "ITW", "CTAS",
+    "UNP", "CSX", "NSC", "UPS", "FDX", "LMT", "BA", "NOC", "GD", "HII",
+    "TDG", "HWM", "TT", "IR", "ROK", "DOV", "AME", "FTV", "LDOS", "LHX",
+    "AXON", "MSI", "FAST", "GWW", "CHRW", "JBHT", "ODFL", "EXPD", "XYL",
+    "DAY", "HUBB", "AOS", "SWK", "ALLE", "OTIS", "CARR", "PWR", "BLDR",
+    "VMC", "MLM", "NUE", "STLD", "RS", "CMI", "DE", "PCAR", "WAB",
+    "TXT", "L", "J", "MAS", "WM", "RSG", "TRGP",
+    # ── Energy ────────────────────────────────────────────────────────────────
+    "XOM", "CVX", "COP", "EOG", "MPC", "VLO", "PSX", "SLB", "HAL", "BKR",
+    "DVN", "FANG", "OXY", "HES", "MRO", "APA", "EQT", "KMI", "WMB", "OKE",
+    "NRG", "VST", "CEG", "PCG", "EXC",
+    # ── Materials ─────────────────────────────────────────────────────────────
+    "LIN", "APD", "SHW", "ECL", "FCX", "NEM", "ALB", "CE", "DD", "DOW",
+    "LYB", "EMN", "IFF", "PPG", "AVY", "PKG", "IP", "WRK", "CF", "MOS",
+    "FMC", "CTVA",
+    # ── Real Estate ───────────────────────────────────────────────────────────
+    "AMT", "PLD", "EQIX", "CCI", "SPG", "WELL", "VTR", "EQR", "ESS", "AVB",
+    "ARE", "DRE", "PSA", "EXR", "IRM", "SBAC", "INVH", "UDR", "CPT", "MAA",
+    "FRT", "REG", "BXP", "KIM", "CBRE",
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    "NEE", "SO", "DUK", "AEP", "SRE", "D", "EXC", "XEL", "WEC", "ES",
+    "ED", "PEG", "ETR", "EIX", "FE", "PPL", "DTE", "CMS", "AES", "AEE",
+    "LNT", "NI", "EVRG", "PNW", "CNP",
 ]))
 
 METRIC_WEIGHTS = {
