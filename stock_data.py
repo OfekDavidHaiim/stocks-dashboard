@@ -1643,18 +1643,42 @@ def render_ticker_tape():
         unsafe_allow_html=True
     )
 
+def _fetch_statement(ticker_obj, method_name, freq, fallback_attr):
+    """
+    Try the newer get_* API first (returns 5 yrs), fall back to old property (4 yrs).
+    Returns a DataFrame transposed so rows=dates, cols=metrics.
+    """
+    try:
+        fn = getattr(ticker_obj, method_name)
+        df = fn(freq=freq, pretty=True, as_dict=False)
+        if df is not None and not df.empty:
+            return df.T          # new API: rows=metrics, cols=dates → transpose
+    except Exception:
+        pass
+    try:
+        df = getattr(ticker_obj, fallback_attr)
+        if df is not None and not df.empty:
+            return df.T          # old property: same layout
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 def fetch_financial_data(ticker_symbol: str):
     stock = yf.Ticker(ticker_symbol)
 
     try:
-        financials = stock.financials.T
-        balance_sheet = stock.balance_sheet.T
-        cashflow = stock.cashflow.T
-        quarterly_financials = stock.quarterly_financials.T
-        quarterly_balance_sheet = stock.quarterly_balance_sheet.T
-        quarterly_cashflow = stock.quarterly_cashflow.T
+        # ── Annual (5 years via new API, fallback to 4 years) ─────────────────
+        financials            = _fetch_statement(stock, "get_income_stmt",   "yearly",    "financials")
+        balance_sheet         = _fetch_statement(stock, "get_balance_sheet",  "yearly",    "balance_sheet")
+        cashflow              = _fetch_statement(stock, "get_cash_flow",      "yearly",    "cashflow")
+        # ── Quarterly ─────────────────────────────────────────────────────────
+        quarterly_financials  = _fetch_statement(stock, "get_income_stmt",   "quarterly", "quarterly_financials")
+        quarterly_balance_sheet = _fetch_statement(stock, "get_balance_sheet","quarterly", "quarterly_balance_sheet")
+        quarterly_cashflow    = _fetch_statement(stock, "get_cash_flow",     "quarterly", "quarterly_cashflow")
+
         history = stock.history(period="10y")
-        info = dict(stock.info) if stock.info else {}
+        info    = dict(stock.info) if stock.info else {}
     except Exception:
         return None, None, None, None, None, None, None, None
 
@@ -3204,6 +3228,22 @@ if st.session_state.page_selector == "Dashboard":
                     x_label = tr("quarter") if is_quarterly else tr("year")
                     time_prefix = tr("timeframe_quarterly").split()[0] if is_quarterly else tr("timeframe_annual").split()[0]
 
+                    # ── Data coverage info banner ─────────────────────────────────
+                    if df_fin is not None and not df_fin.empty:
+                        n_periods = len(df_fin)
+                        if is_quarterly:
+                            coverage_note = f"{n_periods} quarters" if st.session_state.language == "en" else f"{n_periods} רבעונים"
+                        else:
+                            coverage_note = f"{n_periods} years (Yahoo Finance provides up to 5 annual years)" if st.session_state.language == "en" else f"{n_periods} שנים (Yahoo Finance מספק עד 5 שנים שנתיות)"
+                        st.markdown(
+                            f'<div style="background:#1a2035;border:1px solid #2a2e39;border-left:3px solid #2962ff;'
+                            f'border-radius:6px;padding:8px 14px;margin-bottom:12px;font-size:12px;color:#848e9c;">'
+                            f'📅 <strong style="color:#d1d4dc;">{coverage_note}</strong> &#x2014; '
+                            f'{"Source: Yahoo Finance via yfinance" if st.session_state.language == "en" else "מקור: Yahoo Finance"}'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
                     if df_fin is not None and not df_fin.empty:
                         earnings_choice = st.radio(
                             tr("select_earnings_metric"),
@@ -3224,6 +3264,18 @@ if st.session_state.page_selector == "Dashboard":
                             if fig_rev:
                                 col_f1.plotly_chart(fig_rev, use_container_width=True)
 
+                        # ── Gross Profit chart ─────────────────────────────
+                        gross_col = 'Gross Profit' if 'Gross Profit' in df_fin.columns else None
+                        if gross_col:
+                            gp_title = ("Quarterly Gross Profit" if is_quarterly else "Annual Gross Profit") if st.session_state.language == "en" else ("רווח גולמי רבעוני" if is_quarterly else "רווח גולמי שנתי")
+                            fig_gp = create_combo_chart(df_fin, gross_col, gp_title, "#00b09b",
+                                                         change_label, x_label)
+                            if fig_gp:
+                                col_f2.plotly_chart(fig_gp, use_container_width=True)
+                        else:
+                            # Fall back: show earnings chart in col_f2
+                            pass
+
                         earn_target_col = None
                         if earnings_choice == "Net Income (Bottom Line)":
                             earn_target_col = 'Net Income' if 'Net Income' in df_fin.columns else None
@@ -3233,25 +3285,67 @@ if st.session_state.page_selector == "Dashboard":
                             elif 'EBIT' in df_fin.columns:
                                 earn_target_col = 'EBIT'
 
+                        col_f3, col_f4 = st.columns(2)
                         if earn_target_col and earn_target_col in df_fin.columns:
                             earn_title = (tr("quarterly_earnings") if is_quarterly else tr("annual_earnings")).format(metric=earnings_choice_translated)
                             fig_net = create_combo_chart(df_fin, earn_target_col,
                                                          earn_title, "#1f77b4",
                                                          change_label, x_label)
                             if fig_net:
-                                col_f2.plotly_chart(fig_net, use_container_width=True)
+                                col_f3.plotly_chart(fig_net, use_container_width=True)
                         else:
-                            col_f2.warning(
+                            col_f3.warning(
                                 tr("data_unavailable").format(metric=earnings_choice_translated, timeframe=time_prefix))
 
-                        # --- NEW: Profit Margin Chart ---
+                        # ── Cost of Revenue chart ──────────────────────────
+                        cor_col = 'Cost Of Revenue' if 'Cost Of Revenue' in df_fin.columns else (
+                            'Cost of Revenue' if 'Cost of Revenue' in df_fin.columns else None)
+                        if cor_col:
+                            cor_title = ("Cost of Revenue" if st.session_state.language == "en" else "עלות ההכנסות") + (" (Quarterly)" if is_quarterly else " (Annual)")
+                            fig_cor = create_combo_chart(df_fin, cor_col, cor_title, "#ff7043",
+                                                         change_label, x_label)
+                            if fig_cor:
+                                col_f4.plotly_chart(fig_cor, use_container_width=True)
+
+                        # --- Margin Charts (Gross + Net/Op side by side) ---
+                        col_mg1, col_mg2 = st.columns(2)
+
+                        # Gross Margin %
+                        if gross_col and rev_col and gross_col in df_fin.columns and rev_col in df_fin.columns:
+                            gm_df = df_fin[[rev_col, gross_col]].copy().dropna()
+                            gm_df = gm_df[gm_df[rev_col] != 0]
+                            if not gm_df.empty:
+                                gm_df['Gross Margin (%)'] = (gm_df[gross_col] / gm_df[rev_col]) * 100
+                                fig_gm = go.Figure()
+                                fig_gm.add_trace(go.Scatter(
+                                    x=gm_df.index,
+                                    y=gm_df['Gross Margin (%)'],
+                                    mode='lines+markers+text',
+                                    name='Gross Margin %',
+                                    text=gm_df['Gross Margin (%)'].round(1).astype(str) + '%',
+                                    textposition='top center',
+                                    line=dict(color='#00b09b', width=3),
+                                    marker=dict(size=8, color='#00b09b'),
+                                    fill='tozeroy',
+                                    fillcolor='rgba(0,176,155,0.1)',
+                                    cliponaxis=False
+                                ))
+                                x_pad = 0.5
+                                fig_gm.update_layout(
+                                    title=f"<b>{'Gross Margin %' if st.session_state.language == 'en' else 'מרווח גולמי %'} ({time_prefix})</b>",
+                                    xaxis=dict(title=x_label, type='category', range=[-x_pad, len(gm_df) - 1 + x_pad]),
+                                    yaxis=dict(title='%', ticksuffix='%'),
+                                    hovermode="x unified", margin=dict(t=40, b=20)
+                                )
+                                fig_gm = apply_tradingview_plotly_style(fig_gm)
+                                col_mg1.plotly_chart(fig_gm, use_container_width=True)
+
+                        # Net / Operating Profit Margin %
                         if rev_col and earn_target_col and rev_col in df_fin.columns and earn_target_col in df_fin.columns:
                             margin_df = df_fin[[rev_col, earn_target_col]].copy().dropna()
-                            margin_df = margin_df[margin_df[rev_col] != 0]  # Prevent division by zero
-
+                            margin_df = margin_df[margin_df[rev_col] != 0]
                             if not margin_df.empty:
                                 margin_df['Margin (%)'] = (margin_df[earn_target_col] / margin_df[rev_col]) * 100
-
                                 fig_margin = go.Figure()
                                 fig_margin.add_trace(go.Scatter(
                                     x=margin_df.index,
@@ -3264,25 +3358,19 @@ if st.session_state.page_selector == "Dashboard":
                                     marker=dict(size=8, color='#d62728'),
                                     fill='tozeroy',
                                     fillcolor='rgba(214, 39, 40, 0.1)',
-                                    cliponaxis=False  # Prevents text/markers from being cut off at the edges
+                                    cliponaxis=False
                                 ))
-
-                                # Add padding to the x-axis to prevent clipping on the left and right
                                 x_padding = 0.5
                                 x_max_index = len(margin_df) - 1
-
                                 fig_margin.update_layout(
                                     title=f"<b>{tr('profit_margin')} ({time_prefix})</b> ({earnings_choice_translated} / {tr('revenue')})",
-                                    xaxis=dict(
-                                        title=x_label,
-                                        type='category',
-                                        range=[-x_padding, x_max_index + x_padding]
-                                    ),
-                                    yaxis=dict(title=tr("percentage")),
-                                    hovermode="x unified",
-                                    margin=dict(t=40, b=20)
+                                    xaxis=dict(title=x_label, type='category', range=[-x_padding, x_max_index + x_padding]),
+                                    yaxis=dict(title=tr("percentage"), ticksuffix='%'),
+                                    hovermode="x unified", margin=dict(t=40, b=20)
                                 )
-                                st.plotly_chart(fig_margin, use_container_width=True)
+                                fig_margin = apply_tradingview_plotly_style(fig_margin)
+                                col_mg2.plotly_chart(fig_margin, use_container_width=True)
+
                     else:
                         st.warning(tr("income_statement_unavailable").format(timeframe=time_prefix))
 
