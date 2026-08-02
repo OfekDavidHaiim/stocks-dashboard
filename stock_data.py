@@ -2741,74 +2741,98 @@ def render_portfolio_card(label, value_str, status, description=""):
 # ============================================================
 SCREENER_CACHE_FILE = "screener_cache.json"
 
-SCREENER_UNIVERSE = list(dict.fromkeys([
-    # ── Information Technology ─────────────────────────────────────────────────
-    "AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "AMD", "QCOM", "AMAT", "TXN", "KLAC",
-    "LRCX", "ADI", "MCHP", "MPWR", "ON", "SNPS", "CDNS", "ANSS", "TER", "MRVL",
-    "CRM", "ADBE", "NOW", "INTU", "CTSH", "IBM", "CSCO", "ACN", "FI", "IT",
-    "EPAM", "PTC", "AKAM", "CDW", "HPQ", "HPE", "WDC", "STX", "NTAP", "KEYS",
-    "TRMB", "GDDY", "GEN", "JNPR", "QRVO", "SWKS", "TEL", "APH", "GLW", "FFIV",
-    "PAYC", "GFS", "TYL", "SMCI",
-    # ── Software / Cloud / Cybersecurity ──────────────────────────────────────
-    "PANW", "CRWD", "FTNT", "ZS", "NET", "OKTA", "DDOG", "MDB", "SNOW", "TEAM",
-    "CFLT", "WDAY", "HUBS", "VEEV",
-    # ── Communication Services ────────────────────────────────────────────────
-    "META", "GOOGL", "GOOG", "NFLX", "DIS", "CMCSA", "T", "VZ", "TTWO", "EA",
-    "WBD", "FOXA", "FOX", "PARA", "NWSA", "NWS", "CHTR", "TMUS", "LYV", "IPG",
-    "OMC", "MTCH",
-    # ── Consumer Discretionary ────────────────────────────────────────────────
-    "AMZN", "TSLA", "HD", "MCD", "LOW", "NKE", "SBUX", "TJX", "BKNG", "CMG",
-    "ROST", "ORLY", "AZO", "TGT", "LULU", "YUM", "DRI", "DPZ", "F", "GM",
-    "APTV", "BWA", "LKQ", "GRMN", "RL", "TPR", "HAS", "MAR", "HLT", "WYNN",
-    "LVS", "MGM", "CZR", "NCLH", "CCL", "RCL", "EXPE", "ABNB", "ULTA", "BBWI",
-    "BBY", "DG", "DLTR", "DAL", "UAL", "LUV", "NVR", "PHM", "LEN", "DHI",
-    "TOL", "MTH", "POOL", "SWK", "BLDR",
-    # ── Consumer Staples ──────────────────────────────────────────────────────
-    "WMT", "COST", "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL", "KMB",
-    "KHC", "GIS", "SJM", "CPB", "HRL", "TSN", "CAG", "MKC", "CHD", "CLX",
-    "K", "KDP", "TAP", "STZ", "MNST", "BF-B",
-    # ── Financials ────────────────────────────────────────────────────────────
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "AXP", "BK", "BLK", "SCHW",
-    "V", "MA", "SPGI", "MCO", "ICE", "CME", "CBOE", "NDAQ", "FI", "COF",
-    "USB", "TFC", "PNC", "MTB", "FITB", "HBAN", "CFG", "RF", "KEY", "ZION",
-    "CMA", "ALLY", "SYF", "DFS", "AIG", "MET", "PRU", "AFL", "ALL", "PGR",
-    "CB", "TRV", "HIG", "ACGL", "MKL", "AJG", "MMC", "WTW", "AON", "CINF",
-    "GL", "LNC", "UNM", "EG", "AIZ", "PFG", "RJF", "IVZ", "BEN", "FLT",
-    "PYPL", "GPN", "FIS", "JKHY", "KKR", "BX", "APO", "ARES",
-    # ── Healthcare ────────────────────────────────────────────────────────────
-    "UNH", "JNJ", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT", "DHR", "BMY",
-    "AMGN", "GILD", "REGN", "VRTX", "ISRG", "SYK", "MDT", "BSX", "EW", "IDXX",
-    "DXCM", "IQV", "MRNA", "GEHC", "ZBH", "RMD", "HOLX", "PODD", "TECH",
-    "MTD", "A", "WAT", "RVTY", "INCY", "BIIB", "ILMN", "ALGN", "HSIC",
-    "DGX", "LH", "CTLT", "BDX", "CAH", "MCK", "COR", "MOH", "HCA",
-    "ELV", "CI", "HUM", "CNC",
-    # ── Industrials ───────────────────────────────────────────────────────────
-    "HON", "CAT", "RTX", "GE", "GEV", "EMR", "ETN", "PH", "ITW", "CTAS",
-    "UNP", "CSX", "NSC", "UPS", "FDX", "LMT", "BA", "NOC", "GD", "HII",
-    "TDG", "HWM", "TT", "IR", "ROK", "DOV", "AME", "FTV", "LDOS", "LHX",
-    "AXON", "MSI", "FAST", "GWW", "CHRW", "JBHT", "ODFL", "EXPD", "XYL",
-    "DAY", "HUBB", "AOS", "SWK", "ALLE", "OTIS", "CARR", "PWR", "BLDR",
-    "VMC", "MLM", "NUE", "STLD", "RS", "CMI", "DE", "PCAR", "WAB",
-    "TXT", "L", "J", "MAS", "WM", "RSG", "TRGP",
-    # ── Energy ────────────────────────────────────────────────────────────────
-    "XOM", "CVX", "COP", "EOG", "MPC", "VLO", "PSX", "SLB", "HAL", "BKR",
-    "DVN", "FANG", "OXY", "HES", "MRO", "APA", "EQT", "KMI", "WMB", "OKE",
-    "NRG", "VST", "CEG", "PCG", "EXC",
-    # ── Materials ─────────────────────────────────────────────────────────────
-    "LIN", "APD", "SHW", "ECL", "FCX", "NEM", "ALB", "CE", "DD", "DOW",
-    "LYB", "EMN", "IFF", "PPG", "AVY", "PKG", "IP", "WRK", "CF", "MOS",
-    "FMC", "CTVA",
-    # ── Real Estate ───────────────────────────────────────────────────────────
-    "AMT", "PLD", "EQIX", "CCI", "SPG", "WELL", "VTR", "EQR", "ESS", "AVB",
-    "ARE", "DRE", "PSA", "EXR", "IRM", "SBAC", "INVH", "UDR", "CPT", "MAA",
-    "FRT", "REG", "BXP", "KIM", "CBRE",
-    # ── Utilities ─────────────────────────────────────────────────────────────
-    "NEE", "SO", "DUK", "AEP", "SRE", "D", "EXC", "XEL", "WEC", "ES",
-    "ED", "PEG", "ETR", "EIX", "FE", "PPL", "DTE", "CMS", "AES", "AEE",
-    "LNT", "NI", "EVRG", "PNW", "CNP",
-]))
+# ── Fallback static list (used if dynamic fetch fails) ───────────────────────
+_SP500_FALLBACK = [
+    "AAPL","MSFT","NVDA","AVGO","ORCL","AMD","QCOM","AMAT","TXN","KLAC",
+    "LRCX","ADI","MCHP","MPWR","ON","SNPS","CDNS","CRM","ADBE","NOW","INTU",
+    "CSCO","META","GOOGL","GOOG","NFLX","AMZN","TSLA","HD","MCD","SBUX","BKNG",
+    "JPM","BAC","WFC","GS","MS","V","MA","UNH","JNJ","LLY","ABBV","MRK","PFE",
+    "XOM","CVX","COP","NEE","SO","DUK","WMT","COST","PG","KO","PEP","PM",
+    "HON","CAT","RTX","GE","EMR","ETN","UNP","CSX","UPS","FDX","LMT","BA",
+    "LIN","APD","SHW","AMT","PLD","EQIX","PANW","CRWD","FTNT","ZS","NET","DDOG",
+    "SNOW","TEAM","WDAY","HUBS","VEEV","PYPL","SPGI","MCO","ICE","CME","BLK","SCHW",
+    "TMO","ABT","DHR","BMY","AMGN","GILD","REGN","VRTX","ISRG","SYK","MDT","BSX",
+    "AXON","MSI","FAST","GWW","NUE","STLD","FCX","NEM","IBM",
+]
+
+
+@st.cache_data(ttl=86400)  # cache universe for 24 hours
+def get_full_us_universe() -> list:
+    """
+    Dynamically fetch combined S&P 500 + NASDAQ Listed universe.
+      - S&P 500 : scraped from Wikipedia (~503 stocks)
+      - NASDAQ  : downloaded from NASDAQ Trader FTP (~3,500+ stocks)
+      - Other   : NYSE + other exchanges via NASDAQ data feed
+    Returns a deduplicated, alphabetically sorted list of clean ticker symbols.
+    Falls back to _SP500_FALLBACK if both sources fail.
+    """
+    import requests
+    from io import StringIO
+    tickers = set()
+
+    # 1. S&P 500 from Wikipedia
+    try:
+        wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        resp = requests.get(wiki_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            tables = pd.read_html(StringIO(resp.text))
+            sp500_df = tables[0]
+            col = "Symbol" if "Symbol" in sp500_df.columns else sp500_df.columns[0]
+            for s in sp500_df[col].dropna().tolist():
+                tickers.add(str(s).strip().replace(".", "-"))
+    except Exception:
+        pass
+
+    # 2. Full NASDAQ listed
+    try:
+        nasdaq_url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+        resp2 = requests.get(nasdaq_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if resp2.status_code == 200:
+            for line in resp2.text.splitlines()[1:]:
+                parts = line.split("|")
+                if len(parts) >= 2:
+                    sym = parts[0].strip()
+                    if sym and sym != "Symbol" and len(sym) <= 5:
+                        tickers.add(sym)
+    except Exception:
+        pass
+
+    # 3. Other listed (NYSE stocks included in NASDAQ data feed)
+    try:
+        other_url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+        resp3 = requests.get(other_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if resp3.status_code == 200:
+            for line in resp3.text.splitlines()[1:]:
+                parts = line.split("|")
+                if len(parts) >= 2:
+                    sym = parts[0].strip()
+                    if sym and sym != "ACT Symbol" and len(sym) <= 5:
+                        tickers.add(sym)
+    except Exception:
+        pass
+
+    # Fallback
+    if len(tickers) < 50:
+        tickers.update(_SP500_FALLBACK)
+
+    # Keep only clean alpha-only symbols (≤5 chars), exclude test/dummy tickers
+    _bad = {"TEST", "ZZZZ", "ZVZZT", "ZAZZT", "ZBZZT", "ZCZZT"}
+    return sorted([t for t in tickers if t and len(t) <= 5 and t.isalpha() and t not in _bad])
+
+
+def _get_screener_universe() -> list:
+    """Return full universe, falling back to static list on error."""
+    try:
+        u = get_full_us_universe()
+        if u and len(u) >= 100:
+            return u
+    except Exception:
+        pass
+    return _SP500_FALLBACK
+
 
 METRIC_WEIGHTS = {
+
     "revenue_growth":   0.20,
     "earnings_growth":  0.20,
     "gross_margin":     0.15,
@@ -2883,36 +2907,70 @@ def _compute_all_scores(rows):
     return rows
 
 
-def run_screener_scan(progress_bar=None, status_text=None):
+def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 20, top_n: int = 20):
     """
-    Scan SCREENER_UNIVERSE, score each stock, persist top-20 to JSON.
+    Fetch the full NASDAQ + S&P 500 universe, score each stock in parallel
+    using ThreadPoolExecutor, persist top-N results to JSON.
     Returns the full cache dict.
     """
+    import concurrent.futures, threading
+
+    universe = _get_screener_universe()
+    total = len(universe)
     rows = []
-    total = len(SCREENER_UNIVERSE)
-    for i, sym in enumerate(SCREENER_UNIVERSE):
+    completed = [0]
+    lock = threading.Lock()
+
+    def _fetch_one(sym):
         try:
             info = yf.Ticker(sym).info
-            if info and info.get("regularMarketPrice") is not None or info.get("currentPrice"):
-                rows.append(score_single_stock(sym, info))
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            if info and price:
+                return score_single_stock(sym, info)
         except Exception:
             pass
-        if progress_bar is not None:
-            progress_bar.progress((i + 1) / total)
-        if status_text is not None:
-            status_text.markdown(
-                f'<span style="color:#848e9c;font-size:13px;">Scanning **{sym}** &nbsp;({i+1}/{total})</span>',
-                unsafe_allow_html=True
-            )
+        return None
+
+    def _task(sym):
+        result = _fetch_one(sym)
+        with lock:
+            completed[0] += 1
+            pct = completed[0] / total
+            if progress_bar is not None:
+                try:
+                    progress_bar.progress(min(pct, 1.0))
+                except Exception:
+                    pass
+            if status_text is not None:
+                try:
+                    status_text.markdown(
+                        f'<span style="color:#848e9c;font-size:13px;">'
+                        f'Scanning <b>{sym}</b>&nbsp;({completed[0]}/{total})'
+                        f'</span>',
+                        unsafe_allow_html=True
+                    )
+                except Exception:
+                    pass
+        return result
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_task, sym): sym for sym in universe}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                res = fut.result()
+                if res is not None:
+                    rows.append(res)
+            except Exception:
+                pass
 
     rows = _compute_all_scores(rows)
     rows.sort(key=lambda x: x["composite_score"], reverse=True)
-    top_20 = rows[:20]
+    top = rows[:top_n]
 
     cache_data = {
-        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "timestamp":     pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
         "universe_size": len(rows),
-        "top_20": top_20,
+        "top_20":        top,
     }
     try:
         with open(SCREENER_CACHE_FILE, "w", encoding="utf-8") as f:
