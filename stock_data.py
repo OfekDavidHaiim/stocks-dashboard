@@ -1,3 +1,13 @@
+import warnings
+import logging
+
+warnings.filterwarnings("ignore", message=".*use_container_width.*")
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -1664,23 +1674,167 @@ def _fetch_statement(ticker_obj, method_name, freq, fallback_attr):
     return pd.DataFrame()
 
 
+
+# ============================================================
+# ECONOMIC MOAT SCORING ENGINE
+# ============================================================
+
+def compute_moat_score(info: dict, cashflow_df=None, balance_sheet_df=None) -> dict:
+    """
+    Compute an Economic Moat score (1-10) using quantitative proxies.
+
+    The five moat sources (Warren Buffett) mapped to measurable metrics:
+    ─────────────────────────────────────────────────────────────────────
+    1. Intangible Assets (brand/patents/licenses) → Gross Margin %
+    2. Scale / Economies of Scale                 → Operating Margin %
+    3. Switching Costs                            → Return on Equity %
+    4. Free Cash Flow Generation                  → FCF Margin %
+    5. Network Effects / Growth Consistency       → Revenue Growth %
+
+    Each dimension scores 0-2, total 0-10 mapped to 1-10.
+    """
+    def _safe(key, mult=100.0):
+        try:
+            v = info.get(key)
+            if v is None: return None
+            f = float(v)
+            import math
+            if math.isnan(f) or math.isinf(f): return None
+            return round(f * mult, 2)
+        except Exception:
+            return None
+
+    # ── 1. Pricing Power (Intangible Assets) — Gross Margin ────────────
+    gross_margin = _safe("grossMargins")
+    if gross_margin is None:    pp = 0.0
+    elif gross_margin >= 60:    pp = 2.0
+    elif gross_margin >= 40:    pp = 1.5
+    elif gross_margin >= 25:    pp = 1.0
+    elif gross_margin >= 10:    pp = 0.5
+    else:                       pp = 0.0
+
+    # ── 2. Scale Advantages — Operating Margin ─────────────────────────
+    op_margin = _safe("operatingMargins")
+    if op_margin is None:       scale = 0.0
+    elif op_margin >= 30:       scale = 2.0
+    elif op_margin >= 20:       scale = 1.5
+    elif op_margin >= 12:       scale = 1.0
+    elif op_margin >= 5:        scale = 0.5
+    else:                       scale = 0.0
+
+    # ── 3. Switching Costs — Return on Equity ──────────────────────────
+    roe = _safe("returnOnEquity")
+    if roe is None:             sw = 0.0
+    elif roe >= 35:             sw = 2.0
+    elif roe >= 20:             sw = 1.5
+    elif roe >= 12:             sw = 1.0
+    elif roe >= 5:              sw = 0.5
+    else:                       sw = 0.0
+
+    # ── 4. FCF Moat — Free Cash Flow Margin ────────────────────────────
+    revenue  = info.get("totalRevenue")
+    fcf_val  = info.get("freeCashflow")
+    fcf_margin = None
+    try:
+        if revenue and fcf_val and float(revenue) > 0:
+            fcf_margin = round((float(fcf_val) / float(revenue)) * 100, 2)
+    except Exception:
+        pass
+    if fcf_margin is None:      fcf_m = 0.0
+    elif fcf_margin >= 25:      fcf_m = 2.0
+    elif fcf_margin >= 15:      fcf_m = 1.5
+    elif fcf_margin >= 8:       fcf_m = 1.0
+    elif fcf_margin >= 3:       fcf_m = 0.5
+    else:                       fcf_m = 0.0
+
+    # ── 5. Network / Growth Consistency — Revenue Growth ───────────────
+    rev_growth = _safe("revenueGrowth")
+    if rev_growth is None:      net = 0.0
+    elif rev_growth >= 20:      net = 2.0
+    elif rev_growth >= 10:      net = 1.5
+    elif rev_growth >= 5:       net = 1.0
+    elif rev_growth >= 0:       net = 0.5
+    else:                       net = 0.0
+
+    # ── Compute Raw Total (0-10) ────────────────────────────────────────
+    raw = pp + scale + sw + fcf_m + net  # 0.0 – 10.0
+
+    # Clamp to 1-10 (no company gets 0; even terrible companies have some structure)
+    moat_score = max(1, min(10, round(raw, 1)))
+
+    # ── Moat Label & Grade ──────────────────────────────────────────────
+    if moat_score >= 8:
+        moat_label = "Wide Moat"
+        moat_label_he = "חפיר רחב"
+        moat_color = "#089981"   # green
+        moat_icon  = "🏰"
+    elif moat_score >= 5:
+        moat_label = "Narrow Moat"
+        moat_label_he = "חפיר צר"
+        moat_color = "#f0b90b"   # yellow
+        moat_icon  = "🛡️"
+    else:
+        moat_label = "No / Weak Moat"
+        moat_label_he = "חפיר חלש"
+        moat_color = "#f23645"   # red
+        moat_icon  = "⚠️"
+
+    return {
+        "score":        moat_score,
+        "label":        moat_label,
+        "label_he":     moat_label_he,
+        "color":        moat_color,
+        "icon":         moat_icon,
+        "breakdown": {
+            "pricing_power":  round(pp,    1),   # Intangible Assets
+            "scale":          round(scale, 1),   # Scale Advantages
+            "switching_costs":round(sw,    1),   # Switching Costs
+            "fcf_generation": round(fcf_m, 1),   # FCF Moat
+            "network_growth": round(net,   1),   # Network / Growth
+        },
+        "raw_metrics": {
+            "gross_margin":   gross_margin,
+            "op_margin":      op_margin,
+            "roe":            roe,
+            "fcf_margin":     fcf_margin,
+            "rev_growth":     rev_growth,
+        }
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financial_data(ticker_symbol: str):
+
     stock = yf.Ticker(ticker_symbol)
 
-    try:
-        # ── Annual (5 years via new API, fallback to 4 years) ─────────────────
-        financials            = _fetch_statement(stock, "get_income_stmt",   "yearly",    "financials")
-        balance_sheet         = _fetch_statement(stock, "get_balance_sheet",  "yearly",    "balance_sheet")
-        cashflow              = _fetch_statement(stock, "get_cash_flow",      "yearly",    "cashflow")
-        # ── Quarterly ─────────────────────────────────────────────────────────
-        quarterly_financials  = _fetch_statement(stock, "get_income_stmt",   "quarterly", "quarterly_financials")
-        quarterly_balance_sheet = _fetch_statement(stock, "get_balance_sheet","quarterly", "quarterly_balance_sheet")
-        quarterly_cashflow    = _fetch_statement(stock, "get_cash_flow",     "quarterly", "quarterly_cashflow")
+    # ── Annual ────────────────────────────────────────────────────────────
+    financials              = _fetch_statement(stock, "get_income_stmt",   "yearly",    "financials")
+    balance_sheet           = _fetch_statement(stock, "get_balance_sheet",  "yearly",    "balance_sheet")
+    cashflow                = _fetch_statement(stock, "get_cash_flow",      "yearly",    "cashflow")
+    # ── Quarterly ─────────────────────────────────────────────────────────
+    quarterly_financials    = _fetch_statement(stock, "get_income_stmt",   "quarterly", "quarterly_financials")
+    quarterly_balance_sheet = _fetch_statement(stock, "get_balance_sheet","quarterly", "quarterly_balance_sheet")
+    quarterly_cashflow      = _fetch_statement(stock, "get_cash_flow",     "quarterly", "quarterly_cashflow")
 
-        history = stock.history(period="10y")
-        info    = dict(stock.info) if stock.info else {}
+    # ── History with robust fallback periods ──────────────────────────────
+    history = None
+    for p in ["10y", "max", "5y", "1y", "6m"]:
+        try:
+            h = stock.history(period=p)
+            if h is not None and not h.empty:
+                history = h
+                break
+        except Exception:
+            pass
+
+    if history is None:
+        history = pd.DataFrame()
+
+    # ── Info ──────────────────────────────────────────────────────────────
+    try:
+        info = dict(stock.info) if stock.info else {}
     except Exception:
-        return None, None, None, None, None, None, None, None
+        info = {}
 
     # Handle ILA Agora currency scaling to standard Shekels (ILS)
     try:
@@ -1709,36 +1863,54 @@ def fetch_financial_data(ticker_symbol: str):
         pass
 
     df_fin_a = financials.sort_index() if not financials.empty else pd.DataFrame()
-    df_bs_a = balance_sheet.sort_index() if not balance_sheet.empty else pd.DataFrame()
-    df_cf_a = cashflow.sort_index() if not cashflow.empty else pd.DataFrame()
+    df_bs_a  = balance_sheet.sort_index() if not balance_sheet.empty else pd.DataFrame()
+    df_cf_a  = cashflow.sort_index() if not cashflow.empty else pd.DataFrame()
 
     df_fin_q = quarterly_financials.sort_index() if not quarterly_financials.empty else pd.DataFrame()
-    df_bs_q = quarterly_balance_sheet.sort_index() if not quarterly_balance_sheet.empty else pd.DataFrame()
-    df_cf_q = quarterly_cashflow.sort_index() if not quarterly_cashflow.empty else pd.DataFrame()
+    df_bs_q  = quarterly_balance_sheet.sort_index() if not quarterly_balance_sheet.empty else pd.DataFrame()
+    df_cf_q  = quarterly_cashflow.sort_index() if not quarterly_cashflow.empty else pd.DataFrame()
 
-    if not df_fin_a.empty:
-        df_fin_a.index = pd.to_datetime(df_fin_a.index).year
-        df_fin_a = df_fin_a[~df_fin_a.index.duplicated(keep='last')]
+    try:
+        if not df_fin_a.empty:
+            df_fin_a.index = pd.to_datetime(df_fin_a.index).year
+            df_fin_a = df_fin_a[~df_fin_a.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
-    if not df_bs_a.empty:
-        df_bs_a.index = pd.to_datetime(df_bs_a.index).year
-        df_bs_a = df_bs_a[~df_bs_a.index.duplicated(keep='last')]
+    try:
+        if not df_bs_a.empty:
+            df_bs_a.index = pd.to_datetime(df_bs_a.index).year
+            df_bs_a = df_bs_a[~df_bs_a.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
-    if not df_cf_a.empty:
-        df_cf_a.index = pd.to_datetime(df_cf_a.index).year
-        df_cf_a = df_cf_a[~df_cf_a.index.duplicated(keep='last')]
+    try:
+        if not df_cf_a.empty:
+            df_cf_a.index = pd.to_datetime(df_cf_a.index).year
+            df_cf_a = df_cf_a[~df_cf_a.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
-    if not df_fin_q.empty:
-        df_fin_q.index = pd.to_datetime(df_fin_q.index).to_period('Q').astype(str)
-        df_fin_q = df_fin_q[~df_fin_q.index.duplicated(keep='last')]
+    try:
+        if not df_fin_q.empty:
+            df_fin_q.index = pd.to_datetime(df_fin_q.index).to_period('Q').astype(str)
+            df_fin_q = df_fin_q[~df_fin_q.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
-    if not df_bs_q.empty:
-        df_bs_q.index = pd.to_datetime(df_bs_q.index).to_period('Q').astype(str)
-        df_bs_q = df_bs_q[~df_bs_q.index.duplicated(keep='last')]
+    try:
+        if not df_bs_q.empty:
+            df_bs_q.index = pd.to_datetime(df_bs_q.index).to_period('Q').astype(str)
+            df_bs_q = df_bs_q[~df_bs_q.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
-    if not df_cf_q.empty:
-        df_cf_q.index = pd.to_datetime(df_cf_q.index).to_period('Q').astype(str)
-        df_cf_q = df_cf_q[~df_cf_q.index.duplicated(keep='last')]
+    try:
+        if not df_cf_q.empty:
+            df_cf_q.index = pd.to_datetime(df_cf_q.index).to_period('Q').astype(str)
+            df_cf_q = df_cf_q[~df_cf_q.index.duplicated(keep='last')]
+    except Exception:
+        pass
 
     return df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q, history, info
 
@@ -2759,34 +2931,56 @@ _SP500_FALLBACK = [
 @st.cache_data(ttl=86400)  # cache universe for 24 hours
 def get_full_us_universe() -> list:
     """
-    Dynamically fetch combined S&P 500 + NASDAQ Listed universe.
-      - S&P 500 : scraped from Wikipedia (~503 stocks)
-      - NASDAQ  : downloaded from NASDAQ Trader FTP (~3,500+ stocks)
-      - Other   : NYSE + other exchanges via NASDAQ data feed
+    Dynamically fetch combined US Stock Universe (SEC EDGAR + S&P 500 + NASDAQ/NYSE).
     Returns a deduplicated, alphabetically sorted list of clean ticker symbols.
-    Falls back to _SP500_FALLBACK if both sources fail.
+    Falls back to _SP500_FALLBACK if online sources fail.
     """
     import requests
     from io import StringIO
+    from bs4 import BeautifulSoup
     tickers = set()
 
-    # 1. S&P 500 from Wikipedia
+    # 1. SEC EDGAR Official US Tickers API (~10,000 stocks)
     try:
-        wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(wiki_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200:
-            tables = pd.read_html(StringIO(resp.text))
-            sp500_df = tables[0]
-            col = "Symbol" if "Symbol" in sp500_df.columns else sp500_df.columns[0]
-            for s in sp500_df[col].dropna().tolist():
-                tickers.add(str(s).strip().replace(".", "-"))
+        sec_url = "https://www.sec.gov/files/company_tickers.json"
+        resp_sec = requests.get(sec_url, headers={"User-Agent": "StocksDashboard app@example.com"}, timeout=10)
+        if resp_sec.status_code == 200:
+            data = resp_sec.json()
+            for v in data.values():
+                sym = str(v.get("ticker", "")).strip().upper().replace(".", "-")
+                if sym and len(sym) <= 5 and sym.replace("-", "").isalpha():
+                    tickers.add(sym)
     except Exception:
         pass
 
-    # 2. Full NASDAQ listed
+    # 2. S&P 500 from Wikipedia (~503 stocks)
+    try:
+        wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        resp = requests.get(wiki_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            try:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                table = soup.find("table", {"id": "constituents"})
+                if table:
+                    for tr in table.find_all("tr")[1:]:
+                        tds = tr.find_all("td")
+                        if tds:
+                            sym = tds[0].text.strip().upper().replace(".", "-")
+                            if sym:
+                                tickers.add(sym)
+            except Exception:
+                tables = pd.read_html(StringIO(resp.text))
+                sp500_df = tables[0]
+                col = "Symbol" if "Symbol" in sp500_df.columns else sp500_df.columns[0]
+                for s in sp500_df[col].dropna().tolist():
+                    tickers.add(str(s).strip().replace(".", "-"))
+    except Exception:
+        pass
+
+    # 3. Full NASDAQ listed FTP
     try:
         nasdaq_url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-        resp2 = requests.get(nasdaq_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp2 = requests.get(nasdaq_url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
         if resp2.status_code == 200:
             for line in resp2.text.splitlines()[1:]:
                 parts = line.split("|")
@@ -2797,27 +2991,22 @@ def get_full_us_universe() -> list:
     except Exception:
         pass
 
-    # 3. Other listed (NYSE stocks included in NASDAQ data feed)
-    try:
-        other_url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
-        resp3 = requests.get(other_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        if resp3.status_code == 200:
-            for line in resp3.text.splitlines()[1:]:
-                parts = line.split("|")
-                if len(parts) >= 2:
-                    sym = parts[0].strip()
-                    if sym and sym != "ACT Symbol" and len(sym) <= 5:
-                        tickers.add(sym)
-    except Exception:
-        pass
-
-    # Fallback
+    # Fallback if fetched < 50 items
     if len(tickers) < 50:
         tickers.update(_SP500_FALLBACK)
 
-    # Keep only clean alpha-only symbols (≤5 chars), exclude test/dummy tickers
     _bad = {"TEST", "ZZZZ", "ZVZZT", "ZAZZT", "ZBZZT", "ZCZZT"}
-    return sorted([t for t in tickers if t and len(t) <= 5 and t.isalpha() and t not in _bad])
+    clean_universe = []
+    for t in tickers:
+        if not t or len(t) > 5 or t in _bad:
+            continue
+        if not t.replace("-", "").isalpha():
+            continue
+        # Exclude 5-letter tickers ending in W (warrants), R (rights), U (units), P (preferreds)
+        if len(t) == 5 and t[-1] in {"W", "R", "U", "P"}:
+            continue
+        clean_universe.append(t)
+    return sorted(clean_universe)
 
 
 def _get_screener_universe() -> list:
@@ -2831,146 +3020,337 @@ def _get_screener_universe() -> list:
     return _SP500_FALLBACK
 
 
+# ── New Screener Scoring Weights (must sum to 1.0) ────────────────────────────
+# Each criterion is evaluated via percentile rank across the universe,
 METRIC_WEIGHTS = {
-
-    "revenue_growth":   0.20,
-    "earnings_growth":  0.20,
-    "gross_margin":     0.15,
-    "operating_margin": 0.15,
-    "net_margin":       0.10,
-    "roe":              0.10,
-    "fcf_margin":       0.10,
+    "revenue_growth":       0.20,  # YoY revenue growth (strongest = best)
+    "earnings_growth":      0.20,  # YoY net income / EPS growth
+    "profit_margins":       0.15,  # Combined: gross + operating + net margin
+    "fcf_growth_score":     0.15,  # FCF growing over time (trend score)
+    "buyback_score":        0.10,  # Share count shrinking = positive
+    "low_leverage_score":   0.10,  # Low debt-to-assets = positive
+    "balance_strength":     0.10,  # Assets >> Liabilities ratio
 }
+
+
+def _safe_float(val):
+    """Safely convert a value to float, returning None on failure."""
+    import math
+    try:
+        if val is None:
+            return None
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
 
 
 def _safe_metric(info, key, multiplier=100.0):
     """Safely extract and scale a yfinance metric to percentage."""
+    v = _safe_float(info.get(key))
+    if v is None:
+        return None
+    return round(v * multiplier, 2)
+
+
+def _compute_fcf_growth_score(cashflow_df):
+    """
+    Return a trend score for FCF growth.
+    Uses the annual cashflow DataFrame (rows=metrics, cols=dates).
+    Score: % of consecutive year-pairs where FCF increased.
+    Returns None if insufficient data.
+    """
+    import math
     try:
-        v = info.get(key)
-        if v is None:
+        if cashflow_df is None or cashflow_df.empty:
             return None
-        f = float(v)
-        import math
-        if math.isnan(f) or math.isinf(f):
+        cf_cols = [c for c in cashflow_df.columns if 'free cash flow' in str(c).lower()]
+        if not cf_cols:
+            # Try row-based (transposed)
+            if 'Free Cash Flow' not in cashflow_df.index:
+                return None
+            fcf_series = cashflow_df.loc['Free Cash Flow'].dropna().sort_index()
+        else:
+            fcf_series = cashflow_df[cf_cols[0]].dropna().sort_index()
+
+        vals = [_safe_float(v) for v in fcf_series.values]
+        vals = [v for v in vals if v is not None and v != 0]
+        if len(vals) < 2:
             return None
-        return round(f * multiplier, 2)
+        improvements = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i - 1])
+        return round((improvements / (len(vals) - 1)) * 100, 1)
     except Exception:
         return None
 
 
-def score_single_stock(sym, info):
-    """Extract raw financial metrics from a yfinance info dict."""
-    revenue  = info.get("totalRevenue")
-    fcf      = info.get("freeCashflow")
+def _compute_buyback_score(balance_sheet_df):
+    """
+    Return a buyback score based on whether shares outstanding are shrinking.
+    Uses annual balance sheet. Score: % of consecutive year-pairs where shares decreased.
+    Returns None if insufficient data. Higher is better (more buybacks).
+    """
+    try:
+        if balance_sheet_df is None or balance_sheet_df.empty:
+            return None
+        share_row = None
+        for candidate in ['Ordinary Shares Number', 'Share Issued', 'Common Stock Equity']:
+            if candidate in balance_sheet_df.index:
+                share_row = candidate
+                break
+        if share_row is None:
+            return None
+        series = balance_sheet_df.loc[share_row].dropna().sort_index()
+        vals = [_safe_float(v) for v in series.values]
+        vals = [v for v in vals if v is not None and v > 0]
+        if len(vals) < 2:
+            return None
+        reductions = sum(1 for i in range(1, len(vals)) if vals[i] < vals[i - 1])
+        return round((reductions / (len(vals) - 1)) * 100, 1)
+    except Exception:
+        return None
+
+
+def score_single_stock(sym, info, cashflow_df=None, balance_sheet_df=None):
+    """Extract and compute raw financial metrics for a stock."""
+    revenue     = _safe_float(info.get("totalRevenue"))
+    fcf         = _safe_float(info.get("freeCashflow"))
+
+    # ── Extract balance sheet figures (from info or annual balance sheet) ──
+    total_debt   = _safe_float(info.get("totalDebt"))
+    total_assets = _safe_float(info.get("totalAssets"))
+    total_liab   = _safe_float(info.get("totalLiab")) or _safe_float(info.get("totalLiabilities"))
+
+    # Fallback: extract from the balance sheet DataFrame (most reliable source)
+    if balance_sheet_df is not None and not balance_sheet_df.empty:
+        bs = balance_sheet_df
+        def _bs_val(candidates):
+            for c in candidates:
+                if c in bs.index:
+                    vals = [_safe_float(v) for v in bs.loc[c].dropna().values]
+                    vals = [v for v in vals if v is not None and v > 0]
+                    if vals:
+                        return vals[0]  # most recent year
+            return None
+        if total_assets is None:
+            total_assets = _bs_val(["Total Assets", "TotalAssets"])
+        if total_liab is None:
+            total_liab = _bs_val([
+                "Total Liabilities Net Minority Interest",
+                "Total Liabilities",
+                "TotalLiabilitiesNetMinorityInterest",
+            ])
+        if total_debt is None:
+            total_debt = _bs_val(["Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt"])
+
+    # ── FCF margin (for display only, not scoring) ────────────────────────
     fcf_margin = None
     try:
-        if revenue and fcf and float(revenue) > 0:
-            fcf_margin = round((float(fcf) / float(revenue)) * 100, 2)
+        if revenue and fcf and revenue > 0:
+            fcf_margin = round((fcf / revenue) * 100, 2)
     except Exception:
         pass
 
+    # ── Profit Margins composite (gross + operating + net, equal weight) ──
+    gross  = _safe_float(info.get("grossMargins"))
+    op     = _safe_float(info.get("operatingMargins"))
+    net    = _safe_float(info.get("profitMargins"))
+    margin_vals = [v * 100 for v in [gross, op, net] if v is not None]
+    profit_margins = round(sum(margin_vals) / len(margin_vals), 2) if margin_vals else None
+
+    # ── Low leverage score: debt-to-assets ratio (lower = better) ─────────
+    debt_ratio = None
+    if total_assets and total_assets > 0 and total_debt is not None:
+        debt_ratio = round((total_debt / total_assets) * 100, 2)
+
+    # ── Balance strength: assets-to-liabilities ratio ─────────────────────
+    balance_ratio = None
+    if total_assets and total_assets > 0 and total_liab and total_liab > 0:
+
+        balance_ratio = round(total_assets / total_liab, 4)
+
+    # ── FCF growth trend (from annual cashflow) ───────────────────────────
+    fcf_growth_score = _compute_fcf_growth_score(cashflow_df)
+
+    # ── Buyback score (from annual balance sheet) ─────────────────────────
+    buyback_score = _compute_buyback_score(balance_sheet_df)
+
     return {
-        "ticker":           sym,
-        "name":             info.get("longName") or info.get("shortName") or sym,
-        "sector":           info.get("sector", "N/A"),
-        "industry":         info.get("industry", "N/A"),
-        "market_cap":       info.get("marketCap", 0) or 0,
-        "current_price":    info.get("currentPrice") or info.get("regularMarketPrice") or 0,
-        "currency":         info.get("currency", "USD"),
-        "revenue_growth":   _safe_metric(info, "revenueGrowth"),
-        "earnings_growth":  _safe_metric(info, "earningsGrowth"),
-        "gross_margin":     _safe_metric(info, "grossMargins"),
-        "operating_margin": _safe_metric(info, "operatingMargins"),
-        "net_margin":       _safe_metric(info, "profitMargins"),
-        "roe":              _safe_metric(info, "returnOnEquity"),
-        "fcf_margin":       fcf_margin,
-        "composite_score":  0,
+        "ticker":            sym,
+        "name":              info.get("longName") or info.get("shortName") or sym,
+        "sector":            info.get("sector", "N/A"),
+        "industry":          info.get("industry", "N/A"),
+        "market_cap":        info.get("marketCap", 0) or 0,
+        "current_price":     info.get("currentPrice") or info.get("regularMarketPrice") or 0,
+        "currency":          info.get("currency", "USD"),
+        # ── Scoring metrics ──────────────────────────────────────────────
+        "revenue_growth":    _safe_metric(info, "revenueGrowth"),          # % YoY
+        "earnings_growth":   _safe_metric(info, "earningsGrowth"),         # % YoY
+        "profit_margins":    profit_margins,                                # avg margin %
+        "fcf_growth_score":  fcf_growth_score,                             # 0-100, % years FCF grew
+        "buyback_score":     buyback_score,                                 # 0-100, % years shares shrank
+        "debt_ratio":        debt_ratio,                                    # % (lower=better, inverted in scoring)
+        "balance_ratio":     balance_ratio,                                 # assets/liabilities (higher=better)
+        # ── Display-only metrics ─────────────────────────────────────────
+        "gross_margin":      _safe_metric(info, "grossMargins"),
+        "operating_margin":  _safe_metric(info, "operatingMargins"),
+        "net_margin":        _safe_metric(info, "profitMargins"),
+        "roe":               _safe_metric(info, "returnOnEquity"),
+        "fcf_margin":        fcf_margin,
+        "composite_score":   0,
     }
 
 
-def _percentile_score(all_values, target):
-    """Return 0-100 percentile score of target within a list (None-safe)."""
+def _percentile_score(all_values, target, invert=False):
+    """
+    Return 0-100 percentile score of target within a list (None-safe).
+    If invert=True, lower values score higher (used for debt ratio).
+    """
     valid = [v for v in all_values if v is not None]
     if not valid or target is None:
         return 50.0
     below = sum(1 for v in valid if v <= target)
-    return round((below / len(valid)) * 100, 1)
+    pct = round((below / len(valid)) * 100, 1)
+    return (100.0 - pct) if invert else pct
 
 
 def _compute_all_scores(rows):
-    """Compute percentile-based composite scores for all stocks in-place."""
-    for metric, weight in METRIC_WEIGHTS.items():
-        all_vals = [r[metric] for r in rows]
+    """
+    Compute percentile-based composite scores.
+    Uses METRIC_WEIGHTS. debt_ratio is inverted (lower=better).
+    low_leverage_score and balance_strength are mapped from debt_ratio/balance_ratio.
+    """
+    # Map internal fields to scoring keys
+    field_map = {
+        "revenue_growth":     ("revenue_growth",   False),
+        "earnings_growth":    ("earnings_growth",  False),
+        "profit_margins":     ("profit_margins",   False),
+        "fcf_growth_score":   ("fcf_growth_score", False),
+        "buyback_score":      ("buyback_score",    False),
+        "low_leverage_score": ("debt_ratio",       True),   # inverted: lower debt = better
+        "balance_strength":   ("balance_ratio",    False),  # higher assets/liab = better
+    }
+
+    for weight_key, (field, invert) in field_map.items():
+        weight = METRIC_WEIGHTS.get(weight_key, 0)
+        all_vals = [r.get(field) for r in rows]
         for r in rows:
-            pct = _percentile_score(all_vals, r[metric])
+            pct = _percentile_score(all_vals, r.get(field), invert=invert)
             r["composite_score"] = round(r.get("composite_score", 0) + pct * weight, 2)
     return rows
 
 
-def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 20, top_n: int = 20):
-    """
-    Fetch the full NASDAQ + S&P 500 universe, score each stock in parallel
-    using ThreadPoolExecutor, persist top-N results to JSON.
-    Returns the full cache dict.
-    """
-    import concurrent.futures, threading
 
-    universe = _get_screener_universe()
-    total = len(universe)
-    rows = []
-    completed = [0]
-    lock = threading.Lock()
+def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 8, top_n: int = 20):
+    """
+    Scan the full US stock universe (~9000 stocks).
+
+    Tuning for COMPLETENESS + reasonable speed:
+    ─────────────────────────────────────────────────────────────────────
+    • 8 parallel workers  — aggressive enough to be fast, gentle enough
+      not to trigger Yahoo Finance mass-blocking.
+    • 3 retries per ticker with exponential backoff on 401/429 errors
+      (3 s → 6 s → 9 s).  Without retries, rate-limits silently drop
+      90 % of tickers (causing the "only 825/9000" problem).
+    • 1.2 s pause between batches of 100 tickers.
+    • info-only: 1 API call per ticker (no cashflow / balance_sheet).
+    ─────────────────────────────────────────────────────────────────────
+    Expected: ~25-35 min for 9,000 tickers.
+    """
+    import concurrent.futures
+    import time
+
+    universe    = _get_screener_universe()
+    total       = len(universe)
+    rows        = []
+    completed   = 0
+    BATCH_SIZE  = 100
+    BATCH_PAUSE = 1.2   # seconds between batches
 
     def _fetch_one(sym):
-        try:
-            info = yf.Ticker(sym).info
-            price = info.get("regularMarketPrice") or info.get("currentPrice")
-            if info and price:
-                return score_single_stock(sym, info)
-        except Exception:
-            pass
+        """Fetch a single ticker with up to 3 retries on rate-limit errors."""
+        for attempt in range(3):
+            try:
+                info = yf.Ticker(sym).info
+                if not info or not isinstance(info, dict):
+                    return None
+                price = (info.get("regularMarketPrice") or
+                         info.get("currentPrice") or
+                         info.get("previousClose"))
+                if price and float(price) > 0:
+                    return score_single_stock(sym, info, None, None)
+                return None
+            except Exception as e:
+                err = str(e).lower()
+                if "rate" in err or "429" in err or "401" in err or "crumb" in err:
+                    time.sleep((attempt + 1) * 3.0)  # 3s → 6s → 9s
+                    continue   # retry
+                return None    # non-rate-limit error — skip immediately
         return None
 
-    def _task(sym):
-        result = _fetch_one(sym)
-        with lock:
-            completed[0] += 1
-            pct = completed[0] / total
-            if progress_bar is not None:
-                try:
-                    progress_bar.progress(min(pct, 1.0))
-                except Exception:
-                    pass
-            if status_text is not None:
-                try:
-                    status_text.markdown(
-                        f'<span style="color:#848e9c;font-size:13px;">'
-                        f'Scanning <b>{sym}</b>&nbsp;({completed[0]}/{total})'
-                        f'</span>',
-                        unsafe_allow_html=True
-                    )
-                except Exception:
-                    pass
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_task, sym): sym for sym in universe}
-        for fut in concurrent.futures.as_completed(futures):
+    def _update_ui(sym):
+        pct = completed / total if total else 0
+        if progress_bar is not None:
             try:
-                res = fut.result()
-                if res is not None:
-                    rows.append(res)
+                progress_bar.progress(min(pct, 1.0))
             except Exception:
                 pass
+        if status_text is not None:
+            try:
+                status_text.markdown(
+                    f'<span style="color:#848e9c;font-size:13px;">'
+                    f'Scanning <b>{sym}</b>&nbsp;({completed}/{total})'
+                    f'</span>',
+                    unsafe_allow_html=True
+                )
+            except Exception:
+                pass
+
+    # ── Process universe in batches ────────────────────────────────────────
+    batches = [universe[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+
+    for batch_idx, batch in enumerate(batches):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_one, sym): sym for sym in batch}
+            for fut in concurrent.futures.as_completed(futures):
+                completed += 1
+                sym = futures[fut]
+                _update_ui(sym)
+                try:
+                    res = fut.result()
+                    if res is not None:
+                        rows.append(res)
+                except Exception:
+                    pass
+
+        # Pause between batches (skip after last)
+        if batch_idx < len(batches) - 1:
+            time.sleep(BATCH_PAUSE)
 
     rows = _compute_all_scores(rows)
     rows.sort(key=lambda x: x["composite_score"], reverse=True)
     top = rows[:top_n]
 
+    # ── Top 10 per sector (all sectors found in the scan) ──────────────────
+    from collections import defaultdict
+    _sector_map = defaultdict(list)
+    for row in rows:
+        sec = (row.get("sector") or "").strip()
+        if sec and sec not in ("N/A", ""):
+            _sector_map[sec].append(row)   # already sorted by composite_score
+
+    by_sector = {
+        sec: stocks[:10]
+        for sec, stocks in sorted(_sector_map.items())
+        if stocks
+    }
+
     cache_data = {
         "timestamp":     pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
         "universe_size": len(rows),
         "top_20":        top,
+        "by_sector":     by_sector,
     }
     try:
         with open(SCREENER_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -2979,6 +3359,8 @@ def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 20
         pass
 
     return cache_data
+
+
 
 
 def load_screener_cache():
@@ -3042,11 +3424,16 @@ if st.session_state.page_selector == "Dashboard":
                     shares_out = 1
                 history['Market Cap (T)'] = (history['Close'] * shares_out) / 1e12
 
-                trailing_eps = info.get('trailingEps', 0)
-                avg_pe = 15.0  # Default fallback
-                if trailing_eps > 0:
+                trailing_eps = info.get('trailingEps', 0) or 0
+                avg_pe    = 15.0  # Default fallback
+                median_pe = 15.0  # Default fallback
+                if trailing_eps != 0:
+                    # Compute P/E for ALL history (includes negative when EPS < 0)
                     history['Estimated P/E'] = history['Close'] / trailing_eps
-                    avg_pe = history['Estimated P/E'].mean() if not history['Estimated P/E'].dropna().empty else 15.0
+                    _pe_series = history['Estimated P/E'].dropna()
+                    if not _pe_series.empty:
+                        avg_pe    = round(float(_pe_series.mean()),   2)
+                        median_pe = round(float(_pe_series.median()), 2)
 
                 current_price = info.get('currentPrice', history['Close'].iloc[-1] if not history.empty else 0)
 
@@ -3091,7 +3478,81 @@ if st.session_state.page_selector == "Dashboard":
                 </div>
                 """, unsafe_allow_html=True)
 
+                # --- Economic Moat Card ---
+                moat = compute_moat_score(info)
+                moat_score = moat["score"]
+                moat_color = moat["color"]
+                moat_icon  = moat["icon"]
+                moat_lbl   = moat["label_he"] if st.session_state.language == "he" else moat["label"]
+                bd         = moat["breakdown"]
+                rm         = moat["raw_metrics"]
+                is_rtl     = st.session_state.language == "he"
+                moat_title = "חפיר כלכלי" if is_rtl else "Economic Moat"
+                moat_what  = "מה זה חפיר כלכלי?" if is_rtl else "What is an Economic Moat?"
+                moat_desc  = ("חפיר כלכלי הוא יתרון תחרותי ייחודי המגן על הרווחיות לאורך זמן (מושג של וורן באפט)."
+                              if is_rtl else
+                              "An economic moat is a durable competitive advantage protecting long-term profitability (Warren Buffett concept).")
+
+                # ── Score dots (filled vs empty) — built as a single line ──────
+                filled = int(moat_score)
+                dots_html = (
+                    f'<span style="color:{moat_color};font-size:18px;">{"●" * filled}</span>'
+                    f'<span style="color:#2a2e39;font-size:18px;">{"●" * (10 - filled)}</span>'
+                )
+
+                # ── Breakdown rows — each row is one line, no leading whitespace ─
+                moat_keys = [
+                    ("pricing_power",   ("🏷️ כוח תמחור / מותג"  if is_rtl else "🏷️ Pricing Power / Brand"),    rm.get("gross_margin")),
+                    ("scale",           ("📦 יתרון לגודל"        if is_rtl else "📦 Scale Advantage"),            rm.get("op_margin")),
+                    ("switching_costs", ("🔒 עלויות החלפה / ROE" if is_rtl else "🔒 Switching Costs / ROE"),     rm.get("roe")),
+                    ("fcf_generation",  ("💵 ייצור FCF"           if is_rtl else "💵 FCF Generation"),             rm.get("fcf_margin")),
+                    ("network_growth",  ("📶 צמיחה / אפקט רשת"   if is_rtl else "📶 Growth / Network Effect"),    rm.get("rev_growth")),
+                ]
+                rows_html = ""
+                for key, label, metric_val in moat_keys:
+                    pts = bd[key]
+                    bar_pct = int((pts / 2.0) * 100)
+                    bc = "#089981" if pts >= 1.5 else ("#f0b90b" if pts >= 1.0 else "#f23645")
+                    ms = f"{metric_val:.1f}%" if metric_val is not None else "N/A"
+                    rows_html += (
+                        f'<div style="display:flex;align-items:center;gap:10px;margin:7px 0;">'
+                        f'<div style="flex:1;font-size:12px;color:#d1d4dc;font-family:Outfit,Rubik,sans-serif;">{label}</div>'
+                        f'<div style="width:100px;background:#1e222d;border-radius:4px;height:7px;overflow:hidden;">'
+                        f'<div style="width:{bar_pct}%;height:100%;background:{bc};border-radius:4px;"></div></div>'
+                        f'<div style="width:36px;text-align:right;font-size:11px;color:{bc};font-weight:700;">{pts}/2</div>'
+                        f'<div style="width:52px;text-align:right;font-size:11px;color:#848e9c;">{ms}</div>'
+                        f'</div>'
+                    )
+
+                # ── Assemble full card as a single string, NO leading whitespace ─
+                _moat_html = (
+                    f'<div style="background:#1c2030;border:1px solid #2a2e39;border-left:4px solid {moat_color};'
+                    f'padding:18px 20px 14px 20px;border-radius:10px;margin-bottom:18px;">'
+                    f'<div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;">'
+                    f'<div>'
+                    f'<span style="font-size:11px;color:#848e9c;text-transform:uppercase;font-weight:600;'
+                    f'font-family:Outfit,Rubik,sans-serif;">🏰 {moat_title}</span>'
+                    f'<div style="display:flex;align-items:center;gap:12px;margin-top:6px;">'
+                    f'<span style="font-size:42px;font-weight:900;color:{moat_color};'
+                    f'font-family:Outfit,Rubik,sans-serif;line-height:1;">{moat_score}</span>'
+                    f'<div>'
+                    f'<div style="font-size:14px;font-weight:700;color:{moat_color};'
+                    f'font-family:Outfit,Rubik,sans-serif;">{moat_icon} {moat_lbl}</div>'
+                    f'<div style="margin-top:5px;">{dots_html}</div>'
+                    f'</div></div></div>'
+                    f'<div style="font-size:11px;color:#848e9c;max-width:260px;'
+                    f'font-family:Outfit,Rubik,sans-serif;line-height:1.6;">'
+                    f'<strong style="color:#d1d4dc;">{moat_what}</strong><br>{moat_desc}</div>'
+                    f'</div>'
+                    f'<hr style="border:none;border-top:1px solid #2a2e39;margin:12px 0;">'
+                    f'{rows_html}'
+                    f'</div>'
+                )
+                st.markdown(_moat_html, unsafe_allow_html=True)
+
+
                 # --- Quick Actions Expander ---
+
                 quick_actions_title = "⚡ פעולות מהירות (הוספה למעקב / תיק השקעות)" if st.session_state.language == "he" else "⚡ Quick Actions (Add to Watchlist / Portfolio)"
                 with st.expander(quick_actions_title, expanded=False):
                     col_qa_wl, col_qa_port = st.columns(2)
@@ -3248,19 +3709,44 @@ if st.session_state.page_selector == "Dashboard":
                     if fig_mcap:
                         col_p1.plotly_chart(fig_mcap, use_container_width=True)
 
-                    if trailing_eps > 0 and 'Estimated P/E' in history_slice.columns:
-                        fig_pe = create_line_chart(history_slice['Estimated P/E'], tr("est_pe_ratio_history"),
-                                                   tr("pe_ratio"))
+                    if trailing_eps != 0 and 'Estimated P/E' in history_slice.columns:
+                        _is_he = st.session_state.language == "he"
+                        _use_median = col_p2.checkbox(
+                            "חציון (Median) במקום ממוצע" if _is_he else "Use Median instead of Average",
+                            value=False,
+                            key="pe_use_median",
+                            help=("החציון עמיד יותר מפני תנועות מחיר קיצוניות (outliers)."
+                                  if _is_he else
+                                  "Median is more robust than mean when the stock had extreme price moves."),
+                        )
+                        fig_pe = create_line_chart(
+                            history_slice['Estimated P/E'],
+                            tr("est_pe_ratio_history"),
+                            tr("pe_ratio")
+                        )
                         if fig_pe:
-                            slice_avg_pe = history_slice['Estimated P/E'].mean()
+                            if _use_median:
+                                _slice_ref_pe = round(float(history_slice['Estimated P/E'].median()), 2)
+                                _ref_label    = ("חציון תקופה: {avg:.1f}x" if _is_he else "Period Median: {avg:.1f}x").format(avg=_slice_ref_pe)
+                                _ref_color    = "#f0b90b"
+                            else:
+                                _slice_ref_pe = round(float(history_slice['Estimated P/E'].mean()), 2)
+                                _ref_label    = tr("period_average").format(avg=_slice_ref_pe)
+                                _ref_color    = "red"
                             fig_pe.add_hline(
-                                y=slice_avg_pe,
+                                y=_slice_ref_pe,
                                 line_dash="dash",
-                                line_color="red",
-                                annotation_text=tr("period_average").format(avg=slice_avg_pe),
+                                line_color=_ref_color,
+                                annotation_text=_ref_label,
                                 annotation_position="top left"
                             )
                             col_p2.plotly_chart(fig_pe, use_container_width=True)
+                            # Info note when EPS is negative
+                            if trailing_eps < 0:
+                                col_p2.caption(
+                                    "⚠️ רווחים שליליים — מכפיל P/E שלילי מוצג" if _is_he
+                                    else "⚠️ Negative earnings — displaying negative P/E ratio"
+                                )
                     else:
                         col_p2.info(tr("pe_ratio_unavailable"))
 
@@ -5930,7 +6416,7 @@ elif st.session_state.page_selector == "Portfolio":
 
 
 # ==========================================
-# PAGE 5: SCREENER — TOP 20 FINANCIAL PERFORMERS
+# PAGE 5: SCREENER — TOP PERFORMERS BY SECTOR
 # ==========================================
 elif st.session_state.page_selector == "Screener":
     st.title(tr("screener_page_title"))
@@ -5960,46 +6446,33 @@ elif st.session_state.page_selector == "Screener":
 
     # ── Run scan if triggered ──────────────────────────────────────────────────
     if do_scan or not cache:
-        if do_scan or (not cache):
-            scan_container = st.container()
-            with scan_container:
-                st.markdown("---")
-                st.markdown(f"**{tr('screener_scanning')}**")
-                prog_bar  = st.progress(0)
-                stat_text = st.empty()
-                cache = run_screener_scan(progress_bar=prog_bar, status_text=stat_text)
-                st.session_state.screener_cache = cache
-                prog_bar.empty()
-                stat_text.empty()
-                st.success(f"✅ Scan complete — {cache['universe_size']} stocks analyzed, Top 20 saved!")
-                st.rerun()
+        scan_container = st.container()
+        with scan_container:
+            st.markdown("---")
+            st.markdown(f"**{tr('screener_scanning')}**")
+            prog_bar  = st.progress(0)
+            stat_text = st.empty()
+            cache = run_screener_scan(progress_bar=prog_bar, status_text=stat_text)
+            st.session_state.screener_cache = cache
+            prog_bar.empty()
+            stat_text.empty()
+            st.success(f"✅ Scan complete — {cache['universe_size']} stocks analyzed!")
+            st.rerun()
 
     if not cache:
         st.markdown("---")
         st.info(tr("screener_no_cache"))
         st.stop()
 
-    top_20 = cache.get("top_20", [])
+    top_20    = cache.get("top_20", [])
+    by_sector = cache.get("by_sector", {})
     if not top_20:
         st.warning("No results in cache. Please re-scan.")
         st.stop()
 
     st.markdown("---")
 
-    # ── Sector filter ──────────────────────────────────────────────────────────
-    all_sectors = sorted(set(s.get("sector", "N/A") for s in top_20 if s.get("sector") and s.get("sector") != "N/A"))
-    filter_col, _ = st.columns([2, 5])
-    with filter_col:
-        sector_choice = st.selectbox(
-            tr("screener_sector_filter"),
-            [tr("screener_all_sectors")] + all_sectors,
-            key="screener_sector_filter"
-        )
-    filtered = top_20 if sector_choice == tr("screener_all_sectors") else [
-        s for s in top_20 if s.get("sector") == sector_choice
-    ]
-
-    # ── Helper: format metric cell ─────────────────────────────────────────────
+    # ── Shared helpers ─────────────────────────────────────────────────────────
     def _cell(val, suffix="%", good_above=0):
         if val is None:
             return '<span style="color:#4a5568;">—</span>'
@@ -6018,86 +6491,119 @@ elif st.session_state.page_selector == "Screener":
                 f'padding:3px 10px;border-radius:6px;">{score:.1f}</span>')
 
     medals = ["🥇", "🥈", "🥉"]
-
-    # ── TOP 5 SPOTLIGHT CARDS ──────────────────────────────────────────────────
-    st.markdown(f"### {tr('screener_spotlight')}")
-    spot_cols = st.columns(min(5, len(filtered)))
-    for i, stock in enumerate(filtered[:5]):
-        medal   = medals[i] if i < 3 else f"#{i+1}"
-        score   = stock.get("composite_score", 0)
-        ticker  = stock.get("ticker", "")
-        name    = stock.get("name", ticker)
-        sector  = stock.get("sector", "N/A")
-        price   = stock.get("current_price", 0)
-        mcap    = stock.get("market_cap", 0)
-        mcap_str = f"${mcap/1e12:.2f}T" if mcap >= 1e12 else (f"${mcap/1e9:.1f}B" if mcap >= 1e9 else "N/A")
-        if score >= 75:
-            border_c, score_c = "#10b981", "#10b981"
-        elif score >= 55:
-            border_c, score_c = "#2962ff", "#60a5fa"
-        else:
-            border_c, score_c = "#ef4444", "#ef4444"
-
-        spot_cols[i].markdown(f"""
-        <div style="background:#1c2030;border:1px solid {border_c};border-top:3px solid {border_c};
-                    border-radius:10px;padding:16px 14px;text-align:center;min-height:180px;">
-            <div style="font-size:24px;margin-bottom:4px;">{medal}</div>
-            <div style="color:#ffffff;font-weight:800;font-size:18px;font-family:'Outfit','Rubik',sans-serif;">{ticker}</div>
-            <div style="color:#848e9c;font-size:10px;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:22]}</div>
-            <div style="color:{score_c};font-weight:800;font-size:26px;line-height:1;">{score:.1f}</div>
-            <div style="color:#848e9c;font-size:9px;margin-bottom:8px;">SCORE</div>
-            <div style="color:#d1d4dc;font-size:11px;">${price:,.2f} &nbsp;|&nbsp; {mcap_str}</div>
-            <div style="color:#848e9c;font-size:9px;margin-top:4px;">{sector}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── FULL LEADERBOARD ───────────────────────────────────────────────────────
-    st.markdown(f"### {tr('screener_leaderboard')}")
-
-    # Table header
-    col_widths = [0.4, 0.7, 2.0, 0.7, 0.8, 0.8, 0.9, 0.9, 0.8, 0.8, 0.8, 0.9]
-    hdr = st.columns(col_widths)
-    hdr_labels = [
+    _col_widths = [0.4, 0.7, 2.0, 0.7, 0.8, 0.8, 0.9, 0.9, 0.8, 0.8, 0.8, 0.9]
+    _hdr_labels = [
         tr("screener_rank"), "Ticker", "Company",
         tr("screener_score"),
         tr("screener_rev_growth"), tr("screener_ni_growth"),
         tr("screener_gross_margin"), tr("screener_op_margin"), tr("screener_net_margin"),
         tr("screener_roe"), tr("screener_fcf_margin"), ""
     ]
-    for h, label in zip(hdr, hdr_labels):
-        h.markdown(f'<span style="color:#848e9c;font-size:10px;font-weight:700;text-transform:uppercase;">{label}</span>', unsafe_allow_html=True)
 
-    st.markdown('<hr style="border-color:#2a2e39;margin:4px 0 6px 0;">', unsafe_allow_html=True)
+    def _render_stock_table(stock_list, max_rows=20):
+        """Render spotlight cards + leaderboard table for a given list of stocks."""
+        # ── SPOTLIGHT CARDS ────────────────────────────────────────────────────
+        n_spots = min(5, len(stock_list))
+        if n_spots:
+            spot_cols = st.columns(n_spots)
+            for i, stock in enumerate(stock_list[:5]):
+                medal   = medals[i] if i < 3 else f"#{i+1}"
+                score   = stock.get("composite_score", 0)
+                ticker  = stock.get("ticker", "")
+                name    = stock.get("name", ticker)
+                sector  = stock.get("sector", "N/A")
+                price   = stock.get("current_price", 0)
+                mcap    = stock.get("market_cap", 0)
+                mcap_str = f"${mcap/1e12:.2f}T" if mcap >= 1e12 else (f"${mcap/1e9:.1f}B" if mcap >= 1e9 else "N/A")
+                border_c = "#10b981" if score >= 75 else ("#2962ff" if score >= 55 else "#ef4444")
+                score_c  = border_c
+                spot_cols[i].markdown(
+                    f'<div style="background:#1c2030;border:1px solid {border_c};border-top:3px solid {border_c};'
+                    f'border-radius:10px;padding:16px 14px;text-align:center;min-height:180px;">'
+                    f'<div style="font-size:24px;margin-bottom:4px;">{medal}</div>'
+                    f'<div style="color:#fff;font-weight:800;font-size:18px;font-family:Outfit,Rubik,sans-serif;">{ticker}</div>'
+                    f'<div style="color:#848e9c;font-size:10px;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:22]}</div>'
+                    f'<div style="color:{score_c};font-weight:800;font-size:26px;line-height:1;">{score:.1f}</div>'
+                    f'<div style="color:#848e9c;font-size:9px;margin-bottom:8px;">SCORE</div>'
+                    f'<div style="color:#d1d4dc;font-size:11px;">${price:,.2f} &nbsp;|&nbsp; {mcap_str}</div>'
+                    f'<div style="color:#848e9c;font-size:9px;margin-top:4px;">{sector}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
 
-    for rank_idx, stock in enumerate(filtered[:20], start=1):
-        ticker  = stock.get("ticker", "")
-        name    = stock.get("name", ticker)
-        score   = stock.get("composite_score", 0)
-        medal   = medals[rank_idx - 1] if rank_idx <= 3 else f"**#{rank_idx}**"
+        st.markdown("<br>", unsafe_allow_html=True)
 
-        row_bg = "#1c2030" if rank_idx % 2 == 0 else "#161b2d"
+        # ── LEADERBOARD TABLE ─────────────────────────────────────────────────
+        hdr = st.columns(_col_widths)
+        for h, label in zip(hdr, _hdr_labels):
+            h.markdown(f'<span style="color:#848e9c;font-size:10px;font-weight:700;text-transform:uppercase;">{label}</span>', unsafe_allow_html=True)
+        st.markdown('<hr style="border-color:#2a2e39;margin:4px 0 6px 0;">', unsafe_allow_html=True)
 
-        cols = st.columns(col_widths)
-        cols[0].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{medal}</div>', unsafe_allow_html=True)
-        cols[1].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;font-weight:700;color:#ffffff;font-size:13px;">{ticker}</div>', unsafe_allow_html=True)
-        cols[2].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;color:#848e9c;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:28]}</div>', unsafe_allow_html=True)
-        cols[3].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;">{_score_badge(score)}</div>', unsafe_allow_html=True)
-        cols[4].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("revenue_growth"))}</div>', unsafe_allow_html=True)
-        cols[5].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("earnings_growth"))}</div>', unsafe_allow_html=True)
-        cols[6].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("gross_margin"), good_above=30)}</div>', unsafe_allow_html=True)
-        cols[7].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("operating_margin"), good_above=10)}</div>', unsafe_allow_html=True)
-        cols[8].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("net_margin"), good_above=5)}</div>', unsafe_allow_html=True)
-        cols[9].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("roe"), good_above=10)}</div>', unsafe_allow_html=True)
-        cols[10].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("fcf_margin"), good_above=5)}</div>', unsafe_allow_html=True)
-        with cols[11]:
-            if st.button(tr("screener_open_dashboard"), key=f"open_dash_{ticker}_{rank_idx}", use_container_width=True):
-                st.session_state.selected_ticker  = ticker
-                st.session_state.page_selector    = "Dashboard"
-                st.rerun()
+        for rank_idx, stock in enumerate(stock_list[:max_rows], start=1):
+            ticker  = stock.get("ticker", "")
+            name    = stock.get("name", ticker)
+            score   = stock.get("composite_score", 0)
+            medal   = medals[rank_idx - 1] if rank_idx <= 3 else f"**#{rank_idx}**"
+            row_bg  = "#1c2030" if rank_idx % 2 == 0 else "#161b2d"
+            cols    = st.columns(_col_widths)
+            cols[0].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{medal}</div>', unsafe_allow_html=True)
+            cols[1].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;font-weight:700;color:#fff;font-size:13px;">{ticker}</div>', unsafe_allow_html=True)
+            cols[2].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;color:#848e9c;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:28]}</div>', unsafe_allow_html=True)
+            cols[3].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;">{_score_badge(score)}</div>', unsafe_allow_html=True)
+            cols[4].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("revenue_growth"))}</div>', unsafe_allow_html=True)
+            cols[5].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("earnings_growth"))}</div>', unsafe_allow_html=True)
+            cols[6].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("gross_margin"), good_above=30)}</div>', unsafe_allow_html=True)
+            cols[7].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("operating_margin"), good_above=10)}</div>', unsafe_allow_html=True)
+            cols[8].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("net_margin"), good_above=5)}</div>', unsafe_allow_html=True)
+            cols[9].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("roe"), good_above=10)}</div>', unsafe_allow_html=True)
+            cols[10].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("fcf_margin"), good_above=5)}</div>', unsafe_allow_html=True)
+            with cols[11]:
+                if st.button(tr("screener_open_dashboard"), key=f"open_{ticker}_{rank_idx}", use_container_width=True):
+                    st.session_state.selected_ticker = ticker
+                    st.session_state.page_selector   = "Dashboard"
+                    st.rerun()
+            st.markdown('<div style="border-bottom:1px solid #2a2e3930;"></div>', unsafe_allow_html=True)
 
-        st.markdown('<div style="border-bottom:1px solid #2a2e3930;"></div>', unsafe_allow_html=True)
+    # ── Build tab labels ───────────────────────────────────────────────────────
+    _is_he = st.session_state.language == "he"
+    _overall_label = "🏆 Top 20 כללי" if _is_he else "🏆 Overall Top 20"
+
+    # Sector emoji map
+    _sector_emoji = {
+        "Technology": "💻", "Financial Services": "🏦", "Healthcare": "🏥",
+        "Consumer Cyclical": "🛍️", "Consumer Defensive": "🛒", "Industrials": "🏭",
+        "Communication Services": "📡", "Energy": "⛽", "Real Estate": "🏢",
+        "Basic Materials": "⚙️", "Utilities": "💡",
+    }
+    _sector_names = sorted(by_sector.keys())
+    _tab_labels   = [_overall_label] + [
+        f"{_sector_emoji.get(s, '📊')} {s}"
+        for s in _sector_names
+    ]
+
+    # ── Render tabs ────────────────────────────────────────────────────────────
+    tabs = st.tabs(_tab_labels)
+
+    # Tab 0 — Overall Top 20
+    with tabs[0]:
+        st.markdown(f"### {tr('screener_spotlight')}")
+        _render_stock_table(top_20, max_rows=20)
+
+    # Tab 1..N — Sector Top 10
+    for tab_obj, sec_name in zip(tabs[1:], _sector_names):
+        with tab_obj:
+            sec_stocks = by_sector.get(sec_name, [])
+            _top_label = "Top 10 בסקטור" if _is_he else "Top 10 in Sector"
+            st.markdown(
+                f'<div style="font-size:13px;color:#848e9c;margin-bottom:12px;">'
+                f'{_top_label}: <strong style="color:#d1d4dc;">{sec_name}</strong> '
+                f'&nbsp;|&nbsp; {len(sec_stocks)} companies shown</div>',
+                unsafe_allow_html=True
+            )
+            if sec_stocks:
+                _render_stock_table(sec_stocks, max_rows=10)
+            else:
+                st.info("No data for this sector in current scan.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 

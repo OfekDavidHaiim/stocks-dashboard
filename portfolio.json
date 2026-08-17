@@ -22,10 +22,10 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 502.2200012207031,
+            "currentPrice": 499.94000244140625,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 496.2200012207031
+            "prevClosePrice": 522.6099853515625
         },
         {
             "id": "4_1780495791.149946_0.8269889893430076",
@@ -41,10 +41,10 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 171.6199951171875,
+            "currentPrice": 184.02000427246094,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 175.35000610351562
+            "prevClosePrice": 180.7100067138672
         },
         {
             "id": "7_1780495791.150008_0.3309760724123072",
@@ -56,10 +56,10 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 203.52000427246094,
+            "currentPrice": 129.8699951171875,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 205.80999755859375
+            "prevClosePrice": 127.55999755859375
         },
         {
             "id": "6_1780495791.149987_0.07498589789711085",
@@ -71,25 +71,10 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 233.63999938964844,
+            "currentPrice": 250.41000366210938,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 237.8800048828125
-        },
-        {
-            "id": "1780497803.142143_0.08337689043678842",
-            "symbol": "CELH",
-            "currency": "USD",
-            "buys": [
-                {
-                    "p": 32.16,
-                    "q": 60.0
-                }
-            ],
-            "sells": [],
-            "currentPrice": 28.639999389648438,
-            "locked": false,
-            "prevClosePrice": 28.190000534057617
+            "prevClosePrice": 247.89999389648438
         },
         {
             "id": "1780497659.098571_0.3715223988840236",
@@ -102,9 +87,24 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 54.45000076293945,
+            "currentPrice": 62.75,
             "locked": false,
-            "prevClosePrice": 53.779998779296875
+            "prevClosePrice": 63.06999969482422
+        },
+        {
+            "id": "1780497803.142143_0.08337689043678842",
+            "symbol": "CELH",
+            "currency": "USD",
+            "buys": [
+                {
+                    "p": 32.16,
+                    "q": 60.0
+                }
+            ],
+            "sells": [],
+            "currentPrice": 29.209999084472656,
+            "locked": false,
+            "prevClosePrice": 29.350000381469727
         },
         {
             "id": "1780497442.65047_0.2688869708819652",
@@ -117,7 +117,7 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 15.95009994506836,
+            "currentPrice": 16.309999465942383,
             "locked": false,
             "prevClosePrice": 16.469999313354492
         },
@@ -132,9 +132,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 323.9150085449219,
+            "currentPrice": 366.1300048828125,
             "locked": false,
-            "prevClosePrice": 325.04998779296875
+            "prevClosePrice": 366.2699890136719
         },
         {
             "id": "1780497650.022737_0.17443380526300734",
@@ -147,9 +147,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 399.94000244140625,
+            "currentPrice": 464.7200012207031,
             "locked": false,
-            "prevClosePrice": 403.4100036621094
+            "prevClosePrice": 451.1000061035156
         },
         {
             "id": "1780497653.364499_0.6386975416727173",
@@ -162,9 +162,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 115.86000061035156,
+            "currentPrice": 122.25,
             "locked": false,
-            "prevClosePrice": 119.69999694824219
+            "prevClosePrice": 116.31999969482422
         },
         {
             "id": "1780498105.969742_0.8808906734608393",
@@ -177,9 +177,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 44.029998779296875,
+            "currentPrice": 41.709999084472656,
             "locked": false,
-            "prevClosePrice": 44.650001525878906
+            "prevClosePrice": 42.290000915527344
         },
         {
             "id": "1780762007.441868_0.5633577453901008",
@@ -192,8 +192,8 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 15.664999961853027,
-            "prevClosePrice": 16.200000762939453,
+            "currentPrice": 17.280000686645508,
+            "prevClosePrice": 18.079999923706055,
             "locked": false
         },
         {
