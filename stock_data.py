@@ -3094,6 +3094,127 @@ def create_valuation_chart(valuations, current_price, years=5):
     return fig
 
 
+def create_future_valuation_chart(valuations, current_price, years=5):
+    """
+    Creates a separate horizontal bar chart showing the projected 5-Year Future Stock Price
+    for each of the 9 valuation models + the 10th summary bar (Site 5-Year Average Target),
+    compared against the current stock price.
+    """
+    if not valuations:
+        return None
+
+    models = {k: v for k, v in valuations.items() if k != '_meta'}
+    if not models:
+        return None
+
+    names = list(models.keys())
+    future_values = [v.get('future_price_5y', v.get('future_price', 0)) for v in models.values()]
+    avg_future = sum(future_values) / len(future_values)
+    sym = cs()
+    is_he = (st.session_state.get("language", "en") == "he")
+
+    # Color-code each of the 9 bars based on 5-year target vs current price:
+    bar_colors = []
+    for fv in future_values:
+        if fv >= current_price * 1.25:
+            bar_colors.append('#10B981')  # Strong emerald green (>25% 5Y upside)
+        elif fv >= current_price:
+            bar_colors.append('#3B82F6')  # Royal blue (0% to 25% 5Y upside)
+        elif fv >= current_price * 0.70:
+            bar_colors.append('#E5B822')  # Warm amber
+        else:
+            bar_colors.append('#D9483B')  # Coral red
+
+    avg_label = f"מחיר יעד ממוצע לעוד {years} שנים (האתר)" if is_he else f"Site {years}Y Target™ (Average)"
+    all_names = names + [f"<b>{avg_label}</b>"]
+    all_values = future_values + [avg_future]
+    avg_bar_color = '#34D399' if avg_future >= current_price else '#F59E0B'
+    bar_colors.append(avg_bar_color)
+
+    value_texts = []
+    for v in all_values:
+        up_pct = ((v - current_price) / current_price * 100.0) if current_price > 0 else 0.0
+        value_texts.append(f"  <b>{sym}{v:,.2f}</b> ({up_pct:+.1f}%)")
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        y=all_names,
+        x=all_values,
+        orientation='h',
+        marker=dict(
+            color=bar_colors,
+            line=dict(width=0),
+            cornerradius=4
+        ),
+        text=value_texts,
+        textposition='outside',
+        textfont=dict(size=12, color='#FFFFFF', family="Outfit, Rubik, Arial"),
+        cliponaxis=False,
+        hovertemplate='<b>%{y}</b><br>' + (f'מחיר יעד ({years} שנים): ' if is_he else f'{years}-Year Target Price: ') + sym + '%{x:,.2f}<extra></extra>'
+    ))
+
+    # Vertical dashed line 1: Current Stock Price
+    stock_price_lbl = f"מחיר מניה היום: {sym}{current_price:,.2f}" if is_he else f"Current Price: {sym}{current_price:,.2f}"
+    fig.add_vline(
+        x=current_price,
+        line_dash="dash",
+        line_color="#94A3B8",
+        line_width=2,
+        annotation_text=f"<b>{stock_price_lbl}</b>",
+        annotation_position="bottom",
+        annotation_font=dict(color="#E2E8F0", size=12, family="Outfit, Rubik, Arial")
+    )
+
+    # Vertical dashed line 2: Site 5-Year Average Target Price
+    avg_line_lbl = f"יעד ממוצע לעוד {years} שנים: {sym}{avg_future:,.2f}" if is_he else f"Avg {years}Y Target: {sym}{avg_future:,.2f}"
+    fig.add_vline(
+        x=avg_future,
+        line_dash="dash",
+        line_color="#10B981" if avg_future >= current_price else "#F59E0B",
+        line_width=2,
+        annotation_text=f"<b>{avg_line_lbl}</b>",
+        annotation_position="top",
+        annotation_font=dict(color="#34D399" if avg_future >= current_price else "#F59E0B", size=12, family="Outfit, Rubik, Arial")
+    )
+
+    max_x = max(max(all_values), current_price) * 1.28
+    chart_title = (
+        f"תחזית הערכת שווי לעוד {years} שנים מהיום (לפי 9 המודלים)"
+        if is_he
+        else f"{years}-Year Projected Target Price Chart — 9-Model Forecast"
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{chart_title}</b>",
+            font=dict(size=18, color="#FFFFFF", family="Outfit, Rubik, sans-serif"),
+            x=0.0
+        ),
+        xaxis=dict(
+            range=[0, max_x],
+            showgrid=True,
+            gridcolor="#2a2e39",
+            zeroline=True,
+            zerolinecolor="#475569",
+            title=""
+        ),
+        yaxis=dict(
+            autorange="reversed",
+            showgrid=False,
+            tickfont=dict(size=12, color="#D1D4DC", family="Outfit, Rubik, sans-serif")
+        ),
+        plot_bgcolor="#131722",
+        paper_bgcolor="#1c2030",
+        margin=dict(t=65, b=55, l=260, r=125),
+        height=540,
+        showlegend=False,
+        bargap=0.38
+    )
+
+    return fig
+
+
 
 def create_stock_price_chart(df: pd.DataFrame, ticker_symbol: str, show_bollinger: bool = False):
     if df.empty:
@@ -4296,18 +4417,35 @@ if st.session_state.page_selector == "Dashboard":
                 with tab2:
                     st.subheader(tr("income_statement_metrics"))
 
-                    # --- NEW: TIMEFRAME SELECTOR ---
-                    timeframe_choice = st.radio(
-                        tr("select_data_timeframe"),
-                        (tr("timeframe_annual"), tr("timeframe_quarterly")),
-                        horizontal=True,
-                        key="timeframe_choice_tab2"
-                    )
+                    # --- TIMEFRAME SELECTOR + 2-TO-10 YEARS DRAGGABLE SLIDER ---
+                    col_tf1, col_tf2 = st.columns([1, 2])
+                    with col_tf1:
+                        timeframe_choice = st.radio(
+                            tr("select_data_timeframe"),
+                            (tr("timeframe_annual"), tr("timeframe_quarterly")),
+                            horizontal=True,
+                            key="timeframe_choice_tab2"
+                        )
+                    with col_tf2:
+                        _slider_lbl = (
+                            "📅 בחר טווח שנים להצגה (גרור לבחירה בין 2 ל-10 שנים אחורה)"
+                            if st.session_state.language == "he"
+                            else "📅 Select Years to Display (Drag between 2 and 10 years)"
+                        )
+                        selected_years_tab2 = st.slider(
+                            _slider_lbl,
+                            min_value=2,
+                            max_value=10,
+                            value=10,
+                            step=1,
+                            key="tab2_years_slider"
+                        )
 
                     is_quarterly = (timeframe_choice == tr("timeframe_quarterly"))
-                    df_fin = df_fin_q if is_quarterly else df_fin_a
-                    df_bs = df_bs_q if is_quarterly else df_bs_a
-                    df_cf = df_cf_q if is_quarterly else df_cf_a
+                    max_slice = selected_years_tab2 * 4 if is_quarterly else selected_years_tab2
+                    df_fin = (df_fin_q.tail(max_slice) if df_fin_q is not None and not df_fin_q.empty else df_fin_q) if is_quarterly else (df_fin_a.tail(max_slice) if df_fin_a is not None and not df_fin_a.empty else df_fin_a)
+                    df_bs = (df_bs_q.tail(max_slice) if df_bs_q is not None and not df_bs_q.empty else df_bs_q) if is_quarterly else (df_bs_a.tail(max_slice) if df_bs_a is not None and not df_bs_a.empty else df_bs_a)
+                    df_cf = (df_cf_q.tail(max_slice) if df_cf_q is not None and not df_cf_q.empty else df_cf_q) if is_quarterly else (df_cf_a.tail(max_slice) if df_cf_a is not None and not df_cf_a.empty else df_cf_a)
                     change_label = tr("qoq_change") if is_quarterly else tr("yoy_change")
                     x_label = tr("quarter") if is_quarterly else tr("year")
                     time_prefix = tr("timeframe_quarterly").split()[0] if is_quarterly else tr("timeframe_annual").split()[0]
@@ -4318,15 +4456,15 @@ if st.session_state.page_selector == "Dashboard":
                         _yr_min, _yr_max = str(df_fin.index[0]), str(df_fin.index[-1])
                         if is_quarterly:
                             coverage_note = (
-                                f"{n_periods} quarters ({_yr_min} – {_yr_max})"
+                                f"Showing {n_periods} quarters ({_yr_min} – {_yr_max} | {selected_years_tab2} Years Selected)"
                                 if st.session_state.language == "en"
-                                else f"{n_periods} רבעונים ({_yr_min} – {_yr_max})"
+                                else f"מציג {n_periods} רבעונים ({_yr_min} – {_yr_max} | נבחרו {selected_years_tab2} שנים אחורה)"
                             )
                         else:
                             coverage_note = (
-                                f"{n_periods} years ({_yr_min} – {_yr_max} | 10-Year Historical Coverage)"
+                                f"Showing {n_periods} years ({_yr_min} – {_yr_max} | {selected_years_tab2} Years Selected)"
                                 if st.session_state.language == "en"
-                                else f"{n_periods} שנים ({_yr_min} – {_yr_max} | היסטוריה מלאה של 10 שנים אחורה)"
+                                else f"מציג {n_periods} שנים ({_yr_min} – {_yr_max} | נבחרו {selected_years_tab2} שנים אחורה)"
                             )
                         st.markdown(
                             f'<div style="background:#1a2035;border:1px solid #2a2e39;border-left:3px solid #2962ff;'
@@ -4924,17 +5062,20 @@ if st.session_state.page_selector == "Dashboard":
                             )
 
                         # Main consensus metrics
-                        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                        site_val_lbl = "💎 הערכת שווי של האתר (ממוצע)" if is_he_tab4 else "💎 Site Valuation™ (9-Model Avg)"
+                        upside_5y_pct = ((simple_fp - current_price) / current_price) * 100 if current_price > 0 else 0.0
+                        mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+                        site_val_lbl = "💎 הערכת שווי היום (ממוצע)" if is_he_tab4 else "💎 Site Valuation™ (Today)"
                         mc1.metric(site_val_lbl, f"{cs()}{simple_iv:,.2f}", f"{upside_pct:+.1f}%")
-                        mc2.metric(tr("current_market_price"), f"{cs()}{current_price:,.2f}")
+                        target_5y_lbl = f"🚀 יעד לעוד {val_years} שנים (ממוצע)" if is_he_tab4 else f"🚀 {val_years}-Year Target (Avg)"
+                        mc2.metric(target_5y_lbl, f"{cs()}{simple_fp:,.2f}", f"{upside_5y_pct:+.1f}%")
+                        mc3.metric(tr("current_market_price"), f"{cs()}{current_price:,.2f}")
                         if simple_iv > current_price:
-                            mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▲ " + tr("undervalued"))
+                            mc4.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▲ " + tr("undervalued"))
                         else:
-                            mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▼ " + tr("overvalued_sign"), delta_color="inverse")
+                            mc4.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▼ " + tr("overvalued_sign"), delta_color="inverse")
                         bull_lbl = "📊 מודלים חיוביים" if is_he_tab4 else "📊 Bullish Models"
-                        mc4.metric(bull_lbl, f"{bullish_count} / {len(val_models)}")
-                        mc5.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
+                        mc5.metric(bull_lbl, f"{bullish_count} / {len(val_models)}")
+                        mc6.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
 
                         st.markdown("---")
                         chart_col, details_col = st.columns([3, 2])
@@ -4942,6 +5083,10 @@ if st.session_state.page_selector == "Dashboard":
                             fig_val = create_valuation_chart(valuations, current_price, years=val_years)
                             if fig_val:
                                 st.plotly_chart(fig_val, use_container_width=True)
+
+                            fig_val_future = create_future_valuation_chart(valuations, current_price, years=val_years)
+                            if fig_val_future:
+                                st.plotly_chart(fig_val_future, use_container_width=True)
 
                             # --- DCF Sensitivity Table ---
                             with st.expander("🔢 DCF Sensitivity Analysis (Intrinsic Value)"):
