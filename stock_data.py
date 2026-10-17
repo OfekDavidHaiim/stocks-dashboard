@@ -11,6 +11,7 @@ logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import urllib.parse
 import requests
@@ -2176,7 +2177,7 @@ def _merge_sec_with_yf(yf_df: pd.DataFrame, sec_df: pd.DataFrame, max_periods: i
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str, _cache_v: int = 3):
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 5):
 
     stock = yf.Ticker(ticker_symbol)
 
@@ -2341,10 +2342,13 @@ def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: st
     abs_previous = chart_df[column_name].shift(1).abs()
     chart_df['Change (%)'] = (diff / abs_previous) * 100
 
+    x_cats = [str(idx) for idx in chart_df.index]
+    pct_texts = [f"{v:.2f}%" if pd.notna(v) else "" for v in chart_df['Change (%)']]
+
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
-        x=chart_df.index,
+        x=x_cats,
         y=chart_df['Scaled_Value'],
         name=value_label,
         marker_color=color,
@@ -2352,12 +2356,12 @@ def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: st
     ))
 
     fig.add_trace(go.Scatter(
-        x=chart_df.index,
+        x=x_cats,
         y=chart_df['Change (%)'],
         name=change_label,
         yaxis='y2',
         mode='lines+markers+text',
-        text=chart_df['Change (%)'].round(2).astype(str) + '%',
+        text=pct_texts,
         textposition='top center',
         line=dict(color='#ff7f0e', width=3),
         marker=dict(size=8, color='#ff7f0e')
@@ -2365,7 +2369,7 @@ def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: st
 
     fig.update_layout(
         title=title,
-        xaxis=dict(title=x_label, type='category'),
+        xaxis=dict(title=x_label, type='category', categoryorder='array', categoryarray=x_cats),
         yaxis=dict(title=y_title, side='left'),
         yaxis2=dict(title=change_label, overlaying='y', side='right', showgrid=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -4405,9 +4409,10 @@ if st.session_state.page_selector == "Dashboard":
                             gm_df = gm_df[gm_df[rev_col] != 0]
                             if not gm_df.empty:
                                 gm_df['Gross Margin (%)'] = (gm_df[gross_col] / gm_df[rev_col]) * 100
+                                gm_x = [str(idx) for idx in gm_df.index]
                                 fig_gm = go.Figure()
                                 fig_gm.add_trace(go.Scatter(
-                                    x=gm_df.index,
+                                    x=gm_x,
                                     y=gm_df['Gross Margin (%)'],
                                     mode='lines+markers+text',
                                     name='Gross Margin %',
@@ -4422,7 +4427,7 @@ if st.session_state.page_selector == "Dashboard":
                                 x_pad = 0.5
                                 fig_gm.update_layout(
                                     title=f"<b>{'Gross Margin %' if st.session_state.language == 'en' else 'מרווח גולמי %'} ({time_prefix})</b>",
-                                    xaxis=dict(title=x_label, type='category', range=[-x_pad, len(gm_df) - 1 + x_pad]),
+                                    xaxis=dict(title=x_label, type='category', categoryorder='array', categoryarray=gm_x, range=[-x_pad, len(gm_df) - 1 + x_pad]),
                                     yaxis=dict(title='%', ticksuffix='%'),
                                     hovermode="x unified", margin=dict(t=40, b=20)
                                 )
@@ -4435,9 +4440,10 @@ if st.session_state.page_selector == "Dashboard":
                             margin_df = margin_df[margin_df[rev_col] != 0]
                             if not margin_df.empty:
                                 margin_df['Margin (%)'] = (margin_df[earn_target_col] / margin_df[rev_col]) * 100
+                                mg_x = [str(idx) for idx in margin_df.index]
                                 fig_margin = go.Figure()
                                 fig_margin.add_trace(go.Scatter(
-                                    x=margin_df.index,
+                                    x=mg_x,
                                     y=margin_df['Margin (%)'],
                                     mode='lines+markers+text',
                                     name=tr("profit_margin"),
@@ -4453,7 +4459,7 @@ if st.session_state.page_selector == "Dashboard":
                                 x_max_index = len(margin_df) - 1
                                 fig_margin.update_layout(
                                     title=f"<b>{tr('profit_margin')} ({time_prefix})</b> ({earnings_choice_translated} / {tr('revenue')})",
-                                    xaxis=dict(title=x_label, type='category', range=[-x_padding, x_max_index + x_padding]),
+                                    xaxis=dict(title=x_label, type='category', categoryorder='array', categoryarray=mg_x, range=[-x_padding, x_max_index + x_padding]),
                                     yaxis=dict(title=tr("percentage"), ticksuffix='%'),
                                     hovermode="x unified", margin=dict(t=40, b=20)
                                 )
@@ -4586,13 +4592,14 @@ if st.session_state.page_selector == "Dashboard":
 
                         if assets_col in df_bs.columns:
                             lev_df = pd.DataFrame(index=df_bs.index)
+                            lev_x = [str(idx) for idx in lev_df.index]
                             has_lev_data = False
                             fig_lev = go.Figure()
 
                             if liab_col in df_bs.columns:
                                 lev_df['Liabilities to Assets (%)'] = (df_bs[liab_col] / df_bs[assets_col]) * 100
                                 fig_lev.add_trace(go.Scatter(
-                                    x=lev_df.index,
+                                    x=lev_x,
                                     y=lev_df['Liabilities to Assets (%)'],
                                     mode='lines+markers+text',
                                     name=tr("total_liab_assets"),
@@ -4607,7 +4614,7 @@ if st.session_state.page_selector == "Dashboard":
                             if debt_col in df_bs.columns:
                                 lev_df['Debt to Assets (%)'] = (df_bs[debt_col] / df_bs[assets_col]) * 100
                                 fig_lev.add_trace(go.Scatter(
-                                    x=lev_df.index,
+                                    x=lev_x,
                                     y=lev_df['Debt to Assets (%)'],
                                     mode='lines+markers+text',
                                     name=tr("total_debt_assets"),
@@ -4628,6 +4635,8 @@ if st.session_state.page_selector == "Dashboard":
                                     xaxis=dict(
                                         title=x_label,
                                         type='category',
+                                        categoryorder='array',
+                                        categoryarray=lev_x,
                                         range=[-x_padding, x_max_index + x_padding]
                                     ),
                                     yaxis=dict(title=tr("percentage"), ticksuffix='%'),
