@@ -1802,6 +1802,379 @@ def compute_moat_score(info: dict, cashflow_df=None, balance_sheet_df=None) -> d
     }
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_sec_cik_map() -> dict:
+    """Fetch and cache the official SEC ticker-to-10-digit-CIK mapping."""
+    try:
+        headers = {'User-Agent': 'StocksDashboardApp/1.0 (contact@stocksdashboard.app)'}
+        resp = requests.get("https://www.sec.gov/files/company_tickers.json", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            cik_map = {}
+            for v in data.values():
+                t = str(v.get('ticker', '')).upper().strip()
+                c = str(v.get('cik_str', '')).zfill(10)
+                if t and c:
+                    cik_map[t] = c
+                    cik_map[t.replace('-', '.')] = c
+                    cik_map[t.replace('.', '-')] = c
+            return cik_map
+    except Exception:
+        pass
+    return {}
+
+
+def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = None):
+    """
+    Fetch 10+ years of Annual (10-K/20-F/40-F) and Quarterly (10-Q) financial statements
+    from the official SEC EDGAR XBRL API, automatically adjusting historical EPS and
+    share counts for subsequent stock splits.
+    """
+    empty = pd.DataFrame()
+    try:
+        sym = ticker_symbol.upper().strip()
+        if sym.endswith(".TA"):
+            return empty, empty, empty, empty, empty, empty
+        cik_map = _get_sec_cik_map()
+        cik = cik_map.get(sym)
+        if not cik:
+            return empty, empty, empty, empty, empty, empty
+
+        headers = {'User-Agent': 'StocksDashboardApp/1.0 (contact@stocksdashboard.app)'}
+        resp = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", headers=headers, timeout=12)
+        if resp.status_code != 200:
+            return empty, empty, empty, empty, empty, empty
+        facts_json = resp.json().get('facts', {})
+        gaap = {}
+        # Merge ifrs-full first, then us-gaap on top so us-gaap takes precedence when both exist
+        for ns in ['ifrs-full', 'us-gaap']:
+            if ns in facts_json and isinstance(facts_json[ns], dict):
+                gaap.update(facts_json[ns])
+        if not gaap:
+            return empty, empty, empty, empty, empty, empty
+
+        # Prepare timezone-naive splits series for split adjustment
+        splits_clean = pd.Series(dtype=float)
+        if splits_series is not None and not splits_series.empty:
+            s_pos = splits_series[splits_series > 0].copy()
+            if not s_pos.empty:
+                s_pos.index = pd.to_datetime(s_pos.index).tz_localize(None)
+                splits_clean = s_pos
+
+        FIN_CONCEPTS = {
+            'Total Revenue': [
+                'RevenueFromContractWithCustomerExcludingAssessedTax',
+                'RevenueFromContractWithCustomerIncludingAssessedTax',
+                'Revenues', 'SalesRevenueNet', 'SalesRevenueGoodsNet',
+                'TotalRevenuesAndOtherIncome', 'RevenuesNetOfInterestExpense',
+                'InterestAndDividendIncomeOperating', 'Revenue'
+            ],
+            'Gross Profit': ['GrossProfit'],
+            'Cost Of Revenue': [
+                'CostOfGoodsAndServicesSold', 'CostOfRevenue',
+                'CostOfGoodsSold', 'CostOfServices'
+            ],
+            'Operating Income': [
+                'OperatingIncomeLoss', 'ProfitLossFromOperatingActivities',
+                'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest'
+            ],
+            'Net Income': [
+                'NetIncomeLoss', 'ProfitLossAttributableToOwnersOfParent',
+                'NetIncomeLossAvailableToCommonStockholdersBasic', 'ProfitLoss'
+            ],
+            'Diluted EPS': ['EarningsPerShareDiluted', 'DilutedEarningsLossPerShare'],
+            'Basic EPS': ['EarningsPerShareBasic', 'BasicEarningsLossPerShare'],
+            'Diluted Average Shares': [
+                'WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageShares'
+            ],
+            'Basic Average Shares': ['WeightedAverageNumberOfSharesOutstandingBasic'],
+        }
+
+        CF_CONCEPTS = {
+            'Operating Cash Flow': [
+                'NetCashProvidedByUsedInOperatingActivities',
+                'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+                'CashFlowsFromUsedInOperatingActivities'
+            ],
+            'Capital Expenditure': [
+                'PaymentsToAcquirePropertyPlantAndEquipment',
+                'PaymentsToAcquireProductiveAssets',
+                'CapitalExpendituresIncurredButNotYetPaid',
+                'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities'
+            ],
+            'Stock Based Compensation': [
+                'ShareBasedCompensation', 'AllocatedShareBasedCompensationExpense'
+            ],
+        }
+
+        BS_CONCEPTS = {
+            'Total Assets': ['Assets'],
+            'Total Liabilities Net Minority Interest': ['Liabilities'],
+            'Stockholders Equity': [
+                'StockholdersEquity',
+                'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest',
+                'EquityAttributableToOwnersOfParent', 'Equity'
+            ],
+            'Cash And Cash Equivalents': [
+                'CashAndCashEquivalentsAtCarryingValue',
+                'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+                'CashAndCashEquivalents'
+            ],
+            'Total Current Assets': ['AssetsCurrent', 'CurrentAssets'],
+            'Total Current Liabilities': ['LiabilitiesCurrent', 'CurrentLiabilities'],
+            'Long Term Debt': [
+                'LongTermDebtNoncurrent', 'LongTermDebtAndCapitalLeaseObligations', 'LongTermDebt'
+            ],
+            'Current Debt': ['LongTermDebtCurrent', 'ShortTermBorrowings', 'DebtCurrent'],
+            'Total Debt': [
+                'DebtInstrumentCarryingAmount',
+                'LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities'
+            ],
+        }
+
+        annual_forms = {'10-K', '10-K/A', '20-F', '20-F/A', '40-F', '40-F/A'}
+
+        def _extract_flow_group(concept_dict):
+            ann_cols = {}
+            q_cols = {}
+            ann_q_map = {}  # col -> Series indexed by quarter string of the annual period end
+            for col_name, tags in concept_dict.items():
+                is_eps = 'EPS' in col_name
+                is_shares = 'Shares' in col_name
+                s_ann_combined = pd.Series(dtype=float)
+                s_q_combined = pd.Series(dtype=float)
+                s_ann_q_combined = pd.Series(dtype=float)
+
+                for tag in tags:
+                    if tag not in gaap:
+                        continue
+                    units_dict = gaap[tag].get('units', {})
+                    if not units_dict:
+                        continue
+                    if is_eps:
+                        items = units_dict.get('USD/shares') or next(iter(units_dict.values()), [])
+                    elif is_shares:
+                        items = units_dict.get('shares') or next(iter(units_dict.values()), [])
+                    else:
+                        items = units_dict.get('USD') or next(iter(units_dict.values()), [])
+
+                    a_rows, q_rows = [], []
+                    for it in items:
+                        if 'start' not in it or 'end' not in it or it.get('val') is None:
+                            continue
+                        s_dt = pd.to_datetime(it['start'])
+                        e_dt = pd.to_datetime(it['end'])
+                        days = (e_dt - s_dt).days
+                        f_dt = pd.to_datetime(it.get('filed', it['end']))
+                        val = float(it['val'])
+                        if (is_eps or is_shares) and not splits_clean.empty:
+                            later_splits = splits_clean[splits_clean.index > f_dt]
+                            factor = float(later_splits.prod()) if not later_splits.empty else 1.0
+                            val = (val / factor) if is_eps else (val * factor)
+
+                        form = it.get('form', '')
+                        fp = it.get('fp', '')
+                        if 330 <= days <= 380 and (form in annual_forms or fp == 'FY'):
+                            yr = (e_dt - pd.Timedelta(days=6)).year if (e_dt.month == 1 and e_dt.day <= 6) else e_dt.year
+                            qp = e_dt.to_period('Q').strftime('%YQ%q')
+                            a_rows.append({'year': yr, 'q_period': qp, 'filed': f_dt, 'val': val})
+                        elif 75 <= days <= 105:
+                            qp = e_dt.to_period('Q').strftime('%YQ%q')
+                            q_rows.append({'q_period': qp, 'filed': f_dt, 'val': val})
+
+                    if a_rows:
+                        df_a_tag = pd.DataFrame(a_rows).sort_values('filed')
+                        s_a = df_a_tag.groupby('year').last()['val']
+                        s_aq = df_a_tag.groupby('q_period').last()['val']
+                        s_ann_combined = s_a if s_ann_combined.empty else s_ann_combined.combine_first(s_a)
+                        s_ann_q_combined = s_aq if s_ann_q_combined.empty else s_ann_q_combined.combine_first(s_aq)
+                    if q_rows:
+                        df_q_tag = pd.DataFrame(q_rows).sort_values('filed')
+                        s_q = df_q_tag.groupby('q_period').last()['val']
+                        s_q_combined = s_q if s_q_combined.empty else s_q_combined.combine_first(s_q)
+
+                if not s_ann_combined.empty:
+                    ann_cols[col_name] = s_ann_combined
+                if not s_ann_q_combined.empty:
+                    ann_q_map[col_name] = s_ann_q_combined
+                if not s_q_combined.empty:
+                    q_cols[col_name] = s_q_combined
+
+            df_ann_out = pd.DataFrame(ann_cols).sort_index() if ann_cols else pd.DataFrame()
+            df_q_out = pd.DataFrame(q_cols).sort_index() if q_cols else pd.DataFrame()
+
+            # Fill missing fiscal Q4 in df_q_out using Annual - (Q1 + Q2 + Q3)
+            if not df_q_out.empty and ann_q_map:
+                for col_name, s_aq in ann_q_map.items():
+                    if col_name not in df_q_out.columns:
+                        continue
+                    is_shares = 'Shares' in col_name
+                    for qp_str, ann_val in s_aq.items():
+                        if pd.isna(ann_val):
+                            continue
+                        if qp_str not in df_q_out.index or pd.isna(df_q_out.loc[qp_str, col_name]):
+                            try:
+                                p_obj = pd.Period(qp_str, freq='Q')
+                                prev_qs = [(p_obj - i).strftime('%YQ%q') for i in (1, 2, 3)]
+                                if is_shares:
+                                    df_q_out.loc[qp_str, col_name] = ann_val
+                                elif all(pq in df_q_out.index and not pd.isna(df_q_out.loc[pq, col_name]) for pq in prev_qs):
+                                    q4_val = ann_val - sum(float(df_q_out.loc[pq, col_name]) for pq in prev_qs)
+                                    df_q_out.loc[qp_str, col_name] = q4_val
+                            except Exception:
+                                pass
+                df_q_out = df_q_out.sort_index()
+
+            return df_ann_out, df_q_out
+
+        def _extract_bs_group(concept_dict):
+            ann_cols = {}
+            q_cols = {}
+            for col_name, tags in concept_dict.items():
+                s_ann_combined = pd.Series(dtype=float)
+                s_q_combined = pd.Series(dtype=float)
+                for tag in tags:
+                    if tag not in gaap:
+                        continue
+                    units_dict = gaap[tag].get('units', {})
+                    if not units_dict:
+                        continue
+                    items = units_dict.get('USD') or next(iter(units_dict.values()), [])
+                    a_rows, q_rows = [], []
+                    for it in items:
+                        if 'end' not in it or 'start' in it or it.get('val') is None:
+                            continue
+                        e_dt = pd.to_datetime(it['end'])
+                        f_dt = pd.to_datetime(it.get('filed', it['end']))
+                        val = float(it['val'])
+                        form = it.get('form', '')
+                        fp = it.get('fp', '')
+                        qp = e_dt.to_period('Q').strftime('%YQ%q')
+                        q_rows.append({'q_period': qp, 'filed': f_dt, 'val': val})
+                        if form in annual_forms or fp == 'FY':
+                            yr = (e_dt - pd.Timedelta(days=6)).year if (e_dt.month == 1 and e_dt.day <= 6) else e_dt.year
+                            a_rows.append({'year': yr, 'filed': f_dt, 'val': val})
+                    if a_rows:
+                        s_a = pd.DataFrame(a_rows).sort_values('filed').groupby('year').last()['val']
+                        s_ann_combined = s_a if s_ann_combined.empty else s_ann_combined.combine_first(s_a)
+                    if q_rows:
+                        s_q = pd.DataFrame(q_rows).sort_values('filed').groupby('q_period').last()['val']
+                        s_q_combined = s_q if s_q_combined.empty else s_q_combined.combine_first(s_q)
+                if not s_ann_combined.empty:
+                    ann_cols[col_name] = s_ann_combined
+                if not s_q_combined.empty:
+                    q_cols[col_name] = s_q_combined
+            df_ann_out = pd.DataFrame(ann_cols).sort_index() if ann_cols else pd.DataFrame()
+            df_q_out = pd.DataFrame(q_cols).sort_index() if q_cols else pd.DataFrame()
+            return df_ann_out, df_q_out
+
+        df_fin_sec_a, df_fin_sec_q = _extract_flow_group(FIN_CONCEPTS)
+        df_cf_sec_a, df_cf_sec_q   = _extract_flow_group(CF_CONCEPTS)
+        df_bs_sec_a, df_bs_sec_q   = _extract_bs_group(BS_CONCEPTS)
+
+        # Post-process Income Statement derived columns
+        for df_f in (df_fin_sec_a, df_fin_sec_q):
+            if df_f.empty:
+                continue
+            if 'Total Revenue' in df_f.columns and 'Cost Of Revenue' in df_f.columns:
+                if 'Gross Profit' not in df_f.columns:
+                    df_f['Gross Profit'] = df_f['Total Revenue'] - df_f['Cost Of Revenue']
+                else:
+                    df_f['Gross Profit'] = df_f['Gross Profit'].combine_first(df_f['Total Revenue'] - df_f['Cost Of Revenue'])
+            if 'Total Revenue' in df_f.columns and 'Gross Profit' in df_f.columns:
+                if 'Cost Of Revenue' not in df_f.columns:
+                    df_f['Cost Of Revenue'] = df_f['Total Revenue'] - df_f['Gross Profit']
+                else:
+                    df_f['Cost Of Revenue'] = df_f['Cost Of Revenue'].combine_first(df_f['Total Revenue'] - df_f['Gross Profit'])
+            if 'Operating Income' in df_f.columns and 'EBIT' not in df_f.columns:
+                df_f['EBIT'] = df_f['Operating Income']
+            if 'Net Income' in df_f.columns and 'Normalized Income' not in df_f.columns:
+                df_f['Normalized Income'] = df_f['Net Income']
+            if 'Net Income' in df_f.columns and 'Diluted EPS' in df_f.columns:
+                valid_eps = df_f['Diluted EPS'].replace(0, np.nan)
+                implied_sh = (df_f['Net Income'] / valid_eps).where(lambda s: s > 0)
+                if 'Diluted Average Shares' not in df_f.columns:
+                    df_f['Diluted Average Shares'] = implied_sh
+                else:
+                    df_f['Diluted Average Shares'] = df_f['Diluted Average Shares'].combine_first(implied_sh)
+            if 'Net Income' in df_f.columns and 'Basic EPS' in df_f.columns:
+                valid_beps = df_f['Basic EPS'].replace(0, np.nan)
+                implied_bsh = (df_f['Net Income'] / valid_beps).where(lambda s: s > 0)
+                if 'Basic Average Shares' not in df_f.columns:
+                    df_f['Basic Average Shares'] = implied_bsh
+                else:
+                    df_f['Basic Average Shares'] = df_f['Basic Average Shares'].combine_first(implied_bsh)
+            if 'Net Income' in df_f.columns and 'Diluted Average Shares' in df_f.columns:
+                valid_sh = df_f['Diluted Average Shares'].replace(0, np.nan)
+                if 'Diluted EPS' not in df_f.columns:
+                    df_f['Diluted EPS'] = df_f['Net Income'] / valid_sh
+                else:
+                    df_f['Diluted EPS'] = df_f['Diluted EPS'].combine_first(df_f['Net Income'] / valid_sh)
+
+        # Post-process Cash Flow derived columns
+        for df_c in (df_cf_sec_a, df_cf_sec_q):
+            if df_c.empty:
+                continue
+            if 'Capital Expenditure' in df_c.columns:
+                capex_abs = df_c['Capital Expenditure'].abs()
+                df_c['Capital Expenditure'] = -capex_abs
+                if 'Operating Cash Flow' in df_c.columns:
+                    df_c['Free Cash Flow'] = df_c['Operating Cash Flow'] - capex_abs.fillna(0)
+            elif 'Operating Cash Flow' in df_c.columns:
+                df_c['Free Cash Flow'] = df_c['Operating Cash Flow']
+
+        # Post-process Balance Sheet derived columns
+        for df_b in (df_bs_sec_a, df_bs_sec_q):
+            if df_b.empty:
+                continue
+            if 'Long Term Debt' in df_b.columns or 'Current Debt' in df_b.columns:
+                lt_d = df_b['Long Term Debt'] if 'Long Term Debt' in df_b.columns else pd.Series(0.0, index=df_b.index)
+                cur_d = df_b['Current Debt'] if 'Current Debt' in df_b.columns else pd.Series(0.0, index=df_b.index)
+                both_na = lt_d.isna() & cur_d.isna()
+                sum_debt = (lt_d.fillna(0) + cur_d.fillna(0)).mask(both_na)
+                if 'Total Debt' not in df_b.columns:
+                    df_b['Total Debt'] = sum_debt
+                else:
+                    df_b['Total Debt'] = df_b['Total Debt'].combine_first(sum_debt)
+            if 'Total Assets' in df_b.columns and 'Stockholders Equity' in df_b.columns:
+                implied_liab = df_b['Total Assets'] - df_b['Stockholders Equity']
+                if 'Total Liabilities Net Minority Interest' not in df_b.columns:
+                    df_b['Total Liabilities Net Minority Interest'] = implied_liab
+                else:
+                    df_b['Total Liabilities Net Minority Interest'] = df_b['Total Liabilities Net Minority Interest'].combine_first(implied_liab)
+            if 'Total Current Assets' in df_b.columns and 'Current Assets' not in df_b.columns:
+                df_b['Current Assets'] = df_b['Total Current Assets']
+            if 'Total Current Liabilities' in df_b.columns and 'Current Liabilities' not in df_b.columns:
+                df_b['Current Liabilities'] = df_b['Total Current Liabilities']
+
+        return df_fin_sec_a, df_bs_sec_a, df_cf_sec_a, df_fin_sec_q, df_bs_sec_q, df_cf_sec_q
+    except Exception:
+        return empty, empty, empty, empty, empty, empty
+
+
+def _merge_sec_with_yf(yf_df: pd.DataFrame, sec_df: pd.DataFrame, max_periods: int = 10) -> pd.DataFrame:
+    """Merge yfinance DataFrame with SEC EDGAR DataFrame, keeping up to max_periods."""
+    if (yf_df is None or yf_df.empty) and (sec_df is None or sec_df.empty):
+        return pd.DataFrame()
+    if sec_df is None or sec_df.empty:
+        return yf_df.tail(max_periods)
+    if yf_df is None or yf_df.empty:
+        return sec_df.tail(max_periods)
+    try:
+        yf_clean = yf_df.apply(pd.to_numeric, errors='coerce')
+        sec_clean = sec_df.apply(pd.to_numeric, errors='coerce')
+        merged = yf_clean.combine_first(sec_clean).sort_index()
+        # Drop completely empty rows (e.g., stub years with all NaNs)
+        merged = merged.dropna(how='all')
+        # For income statements, ensure primary revenue/income metrics aren't all NaN on stub rows
+        core_cols = [c for c in ['Total Revenue', 'Operating Revenue', 'Net Income', 'Total Assets', 'Operating Cash Flow'] if c in merged.columns]
+        if core_cols:
+            merged = merged.dropna(subset=core_cols, how='all')
+        return merged.tail(max_periods)
+    except Exception:
+        return yf_df.tail(max_periods)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financial_data(ticker_symbol: str):
 
@@ -1816,11 +2189,11 @@ def fetch_financial_data(ticker_symbol: str):
     quarterly_balance_sheet = _fetch_statement(stock, "get_balance_sheet","quarterly", "quarterly_balance_sheet")
     quarterly_cashflow      = _fetch_statement(stock, "get_cash_flow",     "quarterly", "quarterly_cashflow")
 
-    # ── History with robust fallback periods ──────────────────────────────
+    # ── History with robust fallback periods (split-adjusted, without dividend distortion) ──
     history = None
     for p in ["10y", "max", "5y", "1y", "6m"]:
         try:
-            h = stock.history(period=p)
+            h = stock.history(period=p, auto_adjust=False)
             if h is not None and not h.empty:
                 history = h
                 break
@@ -1909,6 +2282,19 @@ def fetch_financial_data(ticker_symbol: str):
         if not df_cf_q.empty:
             df_cf_q.index = pd.to_datetime(df_cf_q.index).to_period('Q').astype(str)
             df_cf_q = df_cf_q[~df_cf_q.index.duplicated(keep='last')]
+    except Exception:
+        pass
+
+    # ── Enrich with 10-Year SEC EDGAR Financial Statements ────────────────
+    try:
+        splits_s = history['Stock Splits'] if (history is not None and not history.empty and 'Stock Splits' in history.columns) else pd.Series(dtype=float)
+        sec_fin_a, sec_bs_a, sec_cf_a, sec_fin_q, sec_bs_q, sec_cf_q = _fetch_sec_edgar_statements(ticker_symbol, splits_s)
+        df_fin_a = _merge_sec_with_yf(df_fin_a, sec_fin_a, max_periods=10)
+        df_bs_a  = _merge_sec_with_yf(df_bs_a,  sec_bs_a,  max_periods=10)
+        df_cf_a  = _merge_sec_with_yf(df_cf_a,  sec_cf_a,  max_periods=10)
+        df_fin_q = _merge_sec_with_yf(df_fin_q, sec_fin_q, max_periods=40)
+        df_bs_q  = _merge_sec_with_yf(df_bs_q,  sec_bs_q,  max_periods=40)
+        df_cf_q  = _merge_sec_with_yf(df_cf_q,  sec_cf_q,  max_periods=40)
     except Exception:
         pass
 
@@ -3484,22 +3870,103 @@ if st.session_state.page_selector == "Dashboard":
                 st.session_state.currency_symbol = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
 
             if history is not None and not history.empty:
-                # --- Precompute Valuation & Financial Metrics ---
+                # --- Precompute Valuation & Financial Metrics (True 10-Year Historical Series) ---
                 shares_out = info.get('sharesOutstanding', 1)
-                if not shares_out or shares_out <= 0:
+                if not shares_out or pd.isna(shares_out) or shares_out <= 0:
                     shares_out = 1
-                history['Market Cap (T)'] = (history['Close'] * shares_out) / 1e12
 
+                h_idx_naive = pd.to_datetime(history.index).tz_localize(None)
+
+                # 1. Historical Split-Adjusted Share Count for 10Y Market Cap
+                hist_shares_series = pd.Series(float(shares_out), index=history.index)
+                try:
+                    sh_pts = pd.Series(dtype=float)
+                    if df_fin_q is not None and not df_fin_q.empty:
+                        sh_col_q = 'Diluted Average Shares' if 'Diluted Average Shares' in df_fin_q.columns else (
+                            'Basic Average Shares' if 'Basic Average Shares' in df_fin_q.columns else None)
+                        if sh_col_q:
+                            sq = pd.to_numeric(df_fin_q[sh_col_q], errors='coerce').dropna()
+                            sq = sq[sq > 0]
+                            if not sq.empty:
+                                q_dates = pd.PeriodIndex(sq.index, freq='Q').end_time.tz_localize(None)
+                                sh_pts = pd.Series(sq.values, index=q_dates)
+                    if sh_pts.empty and df_fin_a is not None and not df_fin_a.empty:
+                        sh_col_a = 'Diluted Average Shares' if 'Diluted Average Shares' in df_fin_a.columns else (
+                            'Basic Average Shares' if 'Basic Average Shares' in df_fin_a.columns else None)
+                        if sh_col_a:
+                            sa = pd.to_numeric(df_fin_a[sh_col_a], errors='coerce').dropna()
+                            sa = sa[sa > 0]
+                            if not sa.empty:
+                                a_dates = pd.to_datetime([f"{int(y)}-12-31" for y in sa.index])
+                                sh_pts = pd.Series(sa.values, index=a_dates)
+                    if not sh_pts.empty:
+                        sh_pts = sh_pts[~sh_pts.index.duplicated(keep='last')].sort_index()
+                        sh_daily = sh_pts.reindex(h_idx_naive.union(sh_pts.index)).sort_index().ffill().bfill().reindex(h_idx_naive)
+                        if shares_out > 1:
+                            sh_daily.loc[h_idx_naive > sh_pts.index[-1]] = float(shares_out)
+                        sh_daily.index = history.index
+                        hist_shares_series = sh_daily
+                except Exception:
+                    pass
+
+                history['Market Cap (T)'] = (history['Close'] * hist_shares_series) / 1e12
+
+                # 2. Historical Time-Varying TTM EPS for Accurate 10Y P/E Ratio
                 trailing_eps = info.get('trailingEps', 0) or 0
                 avg_pe    = 15.0  # Default fallback
                 median_pe = 15.0  # Default fallback
-                if trailing_eps != 0:
-                    # Compute P/E for ALL history (includes negative when EPS < 0)
-                    history['Estimated P/E'] = history['Close'] / trailing_eps
-                    _pe_series = history['Estimated P/E'].dropna()
-                    if not _pe_series.empty:
-                        avg_pe    = round(float(_pe_series.mean()),   2)
-                        median_pe = round(float(_pe_series.median()), 2)
+                try:
+                    ttm_pts = pd.Series(dtype=float)
+                    if df_fin_q is not None and not df_fin_q.empty:
+                        eps_col_q = 'Diluted EPS' if 'Diluted EPS' in df_fin_q.columns else (
+                            'Basic EPS' if 'Basic EPS' in df_fin_q.columns else None)
+                        if eps_col_q:
+                            sq_eps = pd.to_numeric(df_fin_q[eps_col_q], errors='coerce').dropna()
+                            if len(sq_eps) >= 4:
+                                ttm_q = sq_eps.rolling(4, min_periods=4).sum().dropna()
+                                if not ttm_q.empty:
+                                    q_dates = pd.PeriodIndex(ttm_q.index, freq='Q').end_time.tz_localize(None)
+                                    ttm_pts = pd.Series(ttm_q.values, index=q_dates)
+
+                    ann_pts = pd.Series(dtype=float)
+                    if df_fin_a is not None and not df_fin_a.empty:
+                        eps_col_a = 'Diluted EPS' if 'Diluted EPS' in df_fin_a.columns else (
+                            'Basic EPS' if 'Basic EPS' in df_fin_a.columns else None)
+                        if eps_col_a:
+                            sa_eps = pd.to_numeric(df_fin_a[eps_col_a], errors='coerce').dropna()
+                            if not sa_eps.empty:
+                                a_dates = pd.to_datetime([f"{int(y)}-12-31" for y in sa_eps.index])
+                                ann_pts = pd.Series(sa_eps.values, index=a_dates)
+
+                    combined_eps_pts = ttm_pts.combine_first(ann_pts).sort_index() if not ttm_pts.empty else ann_pts.sort_index()
+                    combined_eps_pts = combined_eps_pts[~combined_eps_pts.index.duplicated(keep='last')]
+
+                    if not combined_eps_pts.empty:
+                        eps_daily = combined_eps_pts.reindex(h_idx_naive.union(combined_eps_pts.index)).sort_index().ffill().bfill().reindex(h_idx_naive)
+                        if trailing_eps and not pd.isna(trailing_eps) and trailing_eps != 0:
+                            eps_daily.loc[h_idx_naive > combined_eps_pts.index[-1]] = float(trailing_eps)
+                        eps_daily.index = history.index
+                    elif trailing_eps and not pd.isna(trailing_eps) and trailing_eps != 0:
+                        eps_daily = pd.Series(float(trailing_eps), index=history.index)
+                    else:
+                        eps_daily = pd.Series(dtype=float)
+
+                    if not eps_daily.empty:
+                        valid_eps_daily = eps_daily.where(eps_daily.abs() >= 0.05)
+                        history['Estimated P/E'] = (history['Close'] / valid_eps_daily).clip(-250.0, 250.0)
+                        _pe_series = history['Estimated P/E'].dropna()
+                        if not _pe_series.empty:
+                            _pe_pos = _pe_series[(_pe_series > 0) & (_pe_series <= 200)]
+                            _pe_ref = _pe_pos if not _pe_pos.empty else _pe_series
+                            avg_pe    = round(float(_pe_ref.mean()),   2)
+                            median_pe = round(float(_pe_ref.median()), 2)
+                except Exception:
+                    if trailing_eps != 0:
+                        history['Estimated P/E'] = history['Close'] / trailing_eps
+                        _pe_series = history['Estimated P/E'].dropna()
+                        if not _pe_series.empty:
+                            avg_pe    = round(float(_pe_series.mean()),   2)
+                            median_pe = round(float(_pe_series.median()), 2)
 
                 current_price = info.get('currentPrice', history['Close'].iloc[-1] if not history.empty else 0)
 
@@ -3775,7 +4242,7 @@ if st.session_state.page_selector == "Dashboard":
                     if fig_mcap:
                         col_p1.plotly_chart(fig_mcap, use_container_width=True)
 
-                    if trailing_eps != 0 and 'Estimated P/E' in history_slice.columns:
+                    if 'Estimated P/E' in history_slice.columns and not history_slice['Estimated P/E'].dropna().empty:
                         _is_he = st.session_state.language == "he"
                         _use_median = col_p2.checkbox(
                             "חציון (Median) במקום ממוצע" if _is_he else "Use Median instead of Average",
@@ -3785,6 +4252,9 @@ if st.session_state.page_selector == "Dashboard":
                                   if _is_he else
                                   "Median is more robust than mean when the stock had extreme price moves."),
                         )
+                        _pe_slice_s = history_slice['Estimated P/E'].dropna()
+                        _pe_slice_pos = _pe_slice_s[(_pe_slice_s > 0) & (_pe_slice_s <= 200)]
+                        _pe_slice_ref_s = _pe_slice_pos if not _pe_slice_pos.empty else _pe_slice_s
                         fig_pe = create_line_chart(
                             history_slice['Estimated P/E'],
                             tr("est_pe_ratio_history"),
@@ -3792,11 +4262,11 @@ if st.session_state.page_selector == "Dashboard":
                         )
                         if fig_pe:
                             if _use_median:
-                                _slice_ref_pe = round(float(history_slice['Estimated P/E'].median()), 2)
+                                _slice_ref_pe = round(float(_pe_slice_ref_s.median()), 2)
                                 _ref_label    = ("חציון תקופה: {avg:.1f}x" if _is_he else "Period Median: {avg:.1f}x").format(avg=_slice_ref_pe)
                                 _ref_color    = "#f0b90b"
                             else:
-                                _slice_ref_pe = round(float(history_slice['Estimated P/E'].mean()), 2)
+                                _slice_ref_pe = round(float(_pe_slice_ref_s.mean()), 2)
                                 _ref_label    = tr("period_average").format(avg=_slice_ref_pe)
                                 _ref_color    = "red"
                             fig_pe.add_hline(
@@ -3841,15 +4311,24 @@ if st.session_state.page_selector == "Dashboard":
                     # ── Data coverage info banner ─────────────────────────────────
                     if df_fin is not None and not df_fin.empty:
                         n_periods = len(df_fin)
+                        _yr_min, _yr_max = str(df_fin.index[0]), str(df_fin.index[-1])
                         if is_quarterly:
-                            coverage_note = f"{n_periods} quarters" if st.session_state.language == "en" else f"{n_periods} רבעונים"
+                            coverage_note = (
+                                f"{n_periods} quarters ({_yr_min} – {_yr_max})"
+                                if st.session_state.language == "en"
+                                else f"{n_periods} רבעונים ({_yr_min} – {_yr_max})"
+                            )
                         else:
-                            coverage_note = f"{n_periods} years (Yahoo Finance provides up to 5 annual years)" if st.session_state.language == "en" else f"{n_periods} שנים (Yahoo Finance מספק עד 5 שנים שנתיות)"
+                            coverage_note = (
+                                f"{n_periods} years ({_yr_min} – {_yr_max} | 10-Year Historical Coverage)"
+                                if st.session_state.language == "en"
+                                else f"{n_periods} שנים ({_yr_min} – {_yr_max} | היסטוריה מלאה של 10 שנים אחורה)"
+                            )
                         st.markdown(
                             f'<div style="background:#1a2035;border:1px solid #2a2e39;border-left:3px solid #2962ff;'
                             f'border-radius:6px;padding:8px 14px;margin-bottom:12px;font-size:12px;color:#848e9c;">'
                             f'📅 <strong style="color:#d1d4dc;">{coverage_note}</strong> &#x2014; '
-                            f'{"Source: Yahoo Finance via yfinance" if st.session_state.language == "en" else "מקור: Yahoo Finance"}'
+                            f'{"Source: SEC EDGAR (10-K / 10-Q) & Yahoo Finance" if st.session_state.language == "en" else "מקור: דוחות SEC EDGAR (10-K / 10-Q) ו-Yahoo Finance"}'
                             f'</div>',
                             unsafe_allow_html=True
                         )
