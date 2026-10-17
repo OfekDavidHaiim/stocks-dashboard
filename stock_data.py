@@ -2176,7 +2176,7 @@ def _merge_sec_with_yf(yf_df: pd.DataFrame, sec_df: pd.DataFrame, max_periods: i
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str):
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 3):
 
     stock = yf.Ticker(ticker_symbol)
 
