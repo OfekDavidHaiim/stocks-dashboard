@@ -2066,73 +2066,116 @@ def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discoun
     return round(wacc, 2), round(beta, 2), round(cost_of_equity, 2)
 
 
-def _derive_growth_rates(info, df_fin, base_growth):
+def _derive_growth_rates(info, df_fin, base_growth, df_cf=None):
     """
-    Derive separate growth rates for EPS, Revenue, and FCF from available data.
-    Returns dict: {eps_g, rev_g, fcf_g} each as a percentage (e.g. 12.5 for 12.5%).
+    Derive separate growth rates for EPS (without NRI), Revenue, OCF, and FCF from available data.
+    Returns dict: {eps_g, rev_g, ocf_g, fcf_g} each as a percentage (e.g. 12.5 for 12.5%).
     """
     def clamp(v, lo=-20.0, hi=50.0):
         return min(max(v, lo), hi)
 
-    # --- EPS growth ---
+    shares_fallback = info.get('sharesOutstanding', 1) or 1
+    sh_series = None
+    if df_fin is not None and not df_fin.empty:
+        sh_col = 'Diluted Average Shares' if 'Diluted Average Shares' in df_fin.columns else (
+            'Basic Average Shares' if 'Basic Average Shares' in df_fin.columns else None)
+        if sh_col:
+            sh_series = df_fin[sh_col].dropna()
+            sh_series = sh_series[sh_series > 0]
+
+    def _per_share_cagr(series_raw):
+        if series_raw is None or series_raw.empty:
+            return None
+        s = series_raw.dropna()
+        if sh_series is not None and not sh_series.empty:
+            common_idx = s.index.intersection(sh_series.index)
+            if len(common_idx) >= 2:
+                s = s.loc[common_idx] / sh_series.loc[common_idx]
+        s = s[s > 0]
+        if len(s) >= 2 and s.iloc[0] > 0:
+            n = len(s) - 1
+            return ((s.iloc[-1] / s.iloc[0]) ** (1.0 / n) - 1.0) * 100.0
+        return None
+
+    # --- EPS growth (prefer Normalized Income / EPS Without NRI) ---
     eps_g = base_growth
+    hist_eps_cagr = None
+    if df_fin is not None and not df_fin.empty:
+        ni_col = 'Normalized Income' if 'Normalized Income' in df_fin.columns else (
+            'Net Income' if 'Net Income' in df_fin.columns else None)
+        if ni_col:
+            hist_eps_cagr = _per_share_cagr(df_fin[ni_col])
+        if hist_eps_cagr is None:
+            eps_col = 'Diluted EPS' if 'Diluted EPS' in df_fin.columns else (
+                'Basic EPS' if 'Basic EPS' in df_fin.columns else None)
+            if eps_col:
+                hist_eps_cagr = _per_share_cagr(df_fin[eps_col])
+
     earn_growth = info.get('earningsGrowth')
-    if earn_growth is not None and not pd.isna(earn_growth) and earn_growth > -0.5:
-        eps_g = clamp(earn_growth * 100)
-    elif df_fin is not None and not df_fin.empty:
-        eps_col = 'Diluted EPS' if 'Diluted EPS' in df_fin.columns else (
-            'Basic EPS' if 'Basic EPS' in df_fin.columns else None)
-        if eps_col:
-            eps_series = df_fin[eps_col].dropna()
-            eps_series = eps_series[eps_series > 0]
-            if len(eps_series) >= 2:
-                start_eps = eps_series.iloc[0]
-                end_eps = eps_series.iloc[-1]
-                n = len(eps_series) - 1
-                if start_eps > 0:
-                    cagr = ((end_eps / start_eps) ** (1 / n) - 1) * 100
-                    eps_g = clamp(cagr)
+    if hist_eps_cagr is not None and earn_growth is not None and not pd.isna(earn_growth) and earn_growth > -0.5:
+        eps_g = clamp(0.6 * hist_eps_cagr + 0.4 * (earn_growth * 100.0))
+    elif hist_eps_cagr is not None:
+        eps_g = clamp(hist_eps_cagr)
+    elif earn_growth is not None and not pd.isna(earn_growth) and earn_growth > -0.5:
+        eps_g = clamp(earn_growth * 100.0)
 
     # --- Revenue growth ---
     rev_g = base_growth
-    rev_growth = info.get('revenueGrowth')
-    if rev_growth is not None and not pd.isna(rev_growth) and rev_growth > -0.5:
-        rev_g = clamp(rev_growth * 100)
-    elif df_fin is not None and not df_fin.empty:
+    hist_rev_cagr = None
+    if df_fin is not None and not df_fin.empty:
         rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
             'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
         if rev_col:
-            rev_series = df_fin[rev_col].dropna()
-            rev_series = rev_series[rev_series > 0]
-            if len(rev_series) >= 2:
-                start_rev = rev_series.iloc[0]
-                end_rev = rev_series.iloc[-1]
-                n = len(rev_series) - 1
-                if start_rev > 0:
-                    cagr = ((end_rev / start_rev) ** (1 / n) - 1) * 100
-                    rev_g = clamp(cagr)
+            hist_rev_cagr = _per_share_cagr(df_fin[rev_col])
 
-    # --- FCF growth ---
-    fcf_g = eps_g  # default to earnings growth as proxy
-    # Try to estimate from operating CF trend if available
-    if df_fin is not None and not df_fin.empty:
-        ocf_col = 'Operating Cash Flow' if 'Operating Cash Flow' in df_fin.columns else None
+    rev_growth = info.get('revenueGrowth')
+    if hist_rev_cagr is not None and rev_growth is not None and not pd.isna(rev_growth) and rev_growth > -0.5:
+        rev_g = clamp(0.6 * hist_rev_cagr + 0.4 * (rev_growth * 100.0))
+    elif hist_rev_cagr is not None:
+        rev_g = clamp(hist_rev_cagr)
+    elif rev_growth is not None and not pd.isna(rev_growth) and rev_growth > -0.5:
+        rev_g = clamp(rev_growth * 100.0)
+
+    # --- Operating Cash Flow (OCF) & Free Cash Flow (FCF) growth ---
+    cf_source = df_cf if (df_cf is not None and not df_cf.empty) else df_fin
+    ocf_g = eps_g
+    fcf_g = eps_g
+    if cf_source is not None and not cf_source.empty:
+        ocf_col = 'Operating Cash Flow' if 'Operating Cash Flow' in cf_source.columns else (
+            'Cash Flow From Continuing Operating Activities' if 'Cash Flow From Continuing Operating Activities' in cf_source.columns else None)
         if ocf_col:
-            ocf_series = df_fin[ocf_col].dropna()
-            ocf_series = ocf_series[ocf_series > 0]
-            if len(ocf_series) >= 2:
-                n = len(ocf_series) - 1
-                start_ocf = ocf_series.iloc[0]
-                end_ocf = ocf_series.iloc[-1]
-                if start_ocf > 0:
-                    cagr = ((end_ocf / start_ocf) ** (1 / n) - 1) * 100
-                    fcf_g = clamp(cagr)
+            cagr_ocf = _per_share_cagr(cf_source[ocf_col])
+            if cagr_ocf is not None:
+                # Blend with EPS/Rev growth to smooth single-year working capital swings
+                ocf_g = clamp(0.6 * cagr_ocf + 0.4 * max(eps_g, rev_g))
 
-    return {'eps_g': eps_g, 'rev_g': rev_g, 'fcf_g': fcf_g}
+        fcf_col = 'Free Cash Flow' if 'Free Cash Flow' in cf_source.columns else None
+        if fcf_col:
+            cagr_fcf = _per_share_cagr(cf_source[fcf_col])
+            if cagr_fcf is not None:
+                # Blend with OCF/EPS growth to smooth temporary CapEx cycle spikes
+                fcf_g = clamp(0.5 * cagr_fcf + 0.5 * max(ocf_g, eps_g))
+        else:
+            fcf_g = ocf_g
+
+    return {'eps_g': eps_g, 'rev_g': rev_g, 'ocf_g': ocf_g, 'fcf_g': fcf_g}
 
 
 def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, years=5,
-                         terminal_growth=2.5, use_wacc=True):
+                         terminal_growth=2.5, use_wacc=True, df_bs=None, df_cf=None, history=None):
+    """
+    Calculates the 9 core Intrinsic Value models:
+      1. Discounted Cash Flow 20-year (DCF-20)
+      2. Discounted Free Cash Flow 20-year (DFCF-20)
+      3. Discounted Net Income 20-year (DNI-20)
+      4. Discounted Free Cash Flow Terminal (DFCF-Terminal)
+      5. Mean Price to Sales (PS) Ratio
+      6. Mean Price to Earnings (PE) Ratio Without NRI
+      7. Mean Price to Book (PB) Ratio
+      8. Price to Sales Growth (PSG) Ratio
+      9. Price to Earnings Growth (PEG) Ratio Without NRI
+    All 9 models carry equal weight (1/9) so the consensus valuation is the exact average.
+    """
     valuations = {}
     shares_out = info.get('sharesOutstanding', 1)
     if not shares_out or pd.isna(shares_out) or shares_out <= 0:
@@ -2150,7 +2193,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     sym = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
 
     # --- WACC: Auto compute or use provided discount_rate ---
-    rf_rate = 4.5  # will be overridden by session cache if available
+    rf_rate = 4.5
     if use_wacc and info:
         try:
             wacc_val, beta_val, coe_val = _compute_wacc(info, risk_free_rate=rf_rate)
@@ -2168,352 +2211,370 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
 
     # --- Differentiated per-model growth rates ---
     base_growth_val = growth_rate if (growth_rate is not None and not pd.isna(growth_rate)) else 10.0
-    derived = _derive_growth_rates(info, df_fin, base_growth_val)
+    derived = _derive_growth_rates(info, df_fin, base_growth_val, df_cf=df_cf)
     eps_g = derived['eps_g']
     rev_g = derived['rev_g']
+    ocf_g_raw = derived.get('ocf_g', eps_g)
     fcf_g_raw = derived['fcf_g']
 
-    # Safety clamps per model type
     def clamp_g(v, lo=-20.0, hi=50.0):
         return min(max(v, lo), hi)
 
     pe_g  = clamp_g(eps_g, -10.0, 40.0)
     rev_g = clamp_g(rev_g, -10.0, 40.0)
+    ocf_g = clamp_g(ocf_g_raw, -10.0, 40.0)
     fcf_g = clamp_g(fcf_g_raw, -10.0, 40.0)
     tg    = clamp_g(terminal_growth, 0.0, 5.0)
+    tg_20 = 4.0  # standard 4% terminal growth for 20-year DCF models (years 11-20)
 
     # --- Shared base data ---
     total_revenue = info.get('totalRevenue')
     if (total_revenue is None or pd.isna(total_revenue)) and df_fin is not None and not df_fin.empty:
         rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
             'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
-        if rev_col:
-            total_revenue = df_fin[rev_col].iloc[-1]
+        if rev_col and not df_fin[rev_col].dropna().empty:
+            total_revenue = df_fin[rev_col].dropna().iloc[-1]
     if total_revenue is None or pd.isna(total_revenue) or total_revenue <= 0:
         total_revenue = (current_price * shares_out) / 3.0
+    current_rev_per_share = total_revenue / shares_out
 
-    # EPS with smart fallback
-    is_eps_normalized = False
-    eps = trailing_eps
-    if eps is None or pd.isna(eps) or eps <= 0:
-        # Try Net Income / shares
-        net_income = info.get('netIncomeToCommon') or info.get('netIncome')
-        if net_income and net_income > 0:
-            eps = net_income / shares_out
+    # --- EPS Without NRI (Normalized Income per share) ---
+    eps_no_nri = None
+    if df_fin is not None and not df_fin.empty and 'Normalized Income' in df_fin.columns:
+        norm_s = df_fin['Normalized Income'].dropna()
+        if not norm_s.empty and norm_s.iloc[-1] > 0:
+            latest_norm_eps = norm_s.iloc[-1] / shares_out
+            # If trailing_eps is available and higher (due to newer TTM quarters), blend/take max
+            if trailing_eps and not pd.isna(trailing_eps) and trailing_eps > 0:
+                eps_no_nri = max(latest_norm_eps, trailing_eps)
+            else:
+                eps_no_nri = latest_norm_eps
+
+    if eps_no_nri is None or pd.isna(eps_no_nri) or eps_no_nri <= 0:
+        if trailing_eps and not pd.isna(trailing_eps) and trailing_eps > 0:
+            eps_no_nri = trailing_eps
         else:
-            eps = current_price / 15.0
-            is_eps_normalized = True
-
-    # FCF with improved fallback chain
-    is_fcf_normalized = False
-    fcf = info.get('freeCashflow')
-    if fcf is None or pd.isna(fcf) or fcf <= 0:
-        # Try: Operating CF - CapEx from df_fin
-        ocf = info.get('operatingCashflow')
-        capex = info.get('capitalExpenditures')
-        if ocf and ocf > 0:
-            capex_val = abs(capex) if capex else 0
-            fcf = ocf - capex_val
-            if fcf <= 0:
-                fcf = None
-        if not fcf or fcf <= 0:
-            # Fall back to Net Income × 0.70 (much better than Revenue × 0.10)
             net_income = info.get('netIncomeToCommon') or info.get('netIncome')
             if net_income and net_income > 0:
-                fcf = net_income * 0.70
-                is_fcf_normalized = True
+                eps_no_nri = net_income / shares_out
             else:
-                fcf = total_revenue * 0.08
-                is_fcf_normalized = True
+                eps_no_nri = current_price / 15.0
 
+    # --- Operating Cash Flow (OCF) & Free Cash Flow (FCF) ---
+    # Prefer actual statement Free Cash Flow / Operating Cash Flow over Yahoo's levered info.freeCashflow
+    ocf = None
+    if df_cf is not None and not df_cf.empty:
+        for c_name in ['Operating Cash Flow', 'Cash Flow From Continuing Operating Activities']:
+            if c_name in df_cf.columns and not df_cf[c_name].dropna().empty:
+                val_ocf = df_cf[c_name].dropna().iloc[-1]
+                if val_ocf > 0:
+                    ocf = val_ocf
+                    break
+    if ocf is None or pd.isna(ocf) or ocf <= 0:
+        ocf_info = info.get('operatingCashflow')
+        if ocf_info and not pd.isna(ocf_info) and ocf_info > 0:
+            ocf = ocf_info
+
+    fcf = None
+    if df_cf is not None and not df_cf.empty and 'Free Cash Flow' in df_cf.columns:
+        fcf_s = df_cf['Free Cash Flow'].dropna()
+        if not fcf_s.empty and fcf_s.iloc[-1] > 0:
+            fcf = fcf_s.iloc[-1]
+    if fcf is None or pd.isna(fcf) or fcf <= 0:
+        fcf_info = info.get('freeCashflow')
+        if fcf_info and not pd.isna(fcf_info) and fcf_info > 0:
+            fcf = fcf_info
+        elif ocf and ocf > 0:
+            capex = info.get('capitalExpenditures')
+            capex_val = abs(capex) if (capex and not pd.isna(capex)) else (ocf * 0.20)
+            if ocf - capex_val > 0:
+                fcf = ocf - capex_val
+    if fcf is None or pd.isna(fcf) or fcf <= 0:
+        fcf = max(eps_no_nri * shares_out * 0.80, total_revenue * 0.08)
+
+    if ocf is None or pd.isna(ocf) or ocf <= 0:
+        ocf = max(fcf * 1.25, eps_no_nri * shares_out * 1.15)
+
+    ocf_per_share = ocf / shares_out
     fcf_per_share = fcf / shares_out
 
-    # Net Debt
+    # --- Book Value Per Share ---
+    bv = book_value if (book_value and not pd.isna(book_value) and book_value > 0) else None
+    if (bv is None or bv <= 0) and df_bs is not None and not df_bs.empty:
+        for eq_col in ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest']:
+            if eq_col in df_bs.columns and not df_bs[eq_col].dropna().empty:
+                eq_val = df_bs[eq_col].dropna().iloc[-1]
+                if eq_val > 0:
+                    bv = eq_val / shares_out
+                    break
+    if bv is None or pd.isna(bv) or bv <= 0:
+        bv = current_price / 3.0
+
+    # --- Net Cash / Debt Per Share ---
     total_debt = info.get('totalDebt', 0) or 0
     total_cash = info.get('totalCash', 0) or 0
     if pd.isna(total_debt): total_debt = 0
     if pd.isna(total_cash): total_cash = 0
-    net_debt = max(total_debt - total_cash, 0)
-    net_debt_per_share = (total_debt - total_cash) / shares_out
+    net_cash_per_share = (total_cash - total_debt) / shares_out
 
-    # Dynamic Graham bond yield (use session-cached or derive)
-    graham_bond_yield = rf_rate + 0.5  # approx corp bond = rf + 0.5%
-    graham_bond_yield = min(max(graham_bond_yield, 3.5), 8.0)
+    equal_weight = 1.0 / 9.0
 
-    conservative_pe = min(max(avg_pe, 10.0), 30.0) if (avg_pe and not pd.isna(avg_pe)) else 15.0
+    # Helper for 20-year 2-stage DCF (10y Growth Stage + 10y Terminal Stage + Net Cash Adjustment)
+    def _calc_20y_discounted(base_ps, growth_pct, disc_pct, term_pct=4.0):
+        g_10 = min(max(growth_pct, 5.0), 22.0) / 100.0
+        d = max(disc_pct, 6.0) / 100.0
+        gt = min(max(term_pct, 2.0), 5.0) / 100.0
+        x = (1.0 + g_10) / (1.0 + d)
+        y = (1.0 + gt) / (1.0 + d)
+        pv_10_growth = sum(x ** k for k in range(1, 11))
+        pv_10_term = (x ** 10) * sum(y ** k for k in range(1, 11))
+        pv_total = base_ps * (pv_10_growth + pv_10_term)
+        return max(pv_total + net_cash_per_share, pv_total * 0.5, current_price * 0.05)
 
     # =========================================================
-    # MODEL 1: P/E Earnings Projection
+    # MODEL 1: Discounted Cash Flow 20-year (DCF-20)
     # =========================================================
-    eps_desc = f"Projects trailing EPS ({sym}{eps:.2f}) [Normalized]" if is_eps_normalized else f"Projects trailing EPS ({sym}{eps:.2f})"
-    future_eps_pe = eps * ((1 + pe_g / 100) ** years)
-    future_price_pe = future_eps_pe * conservative_pe
-    intrinsic_pe = future_price_pe / ((1 + dr / 100) ** years)
-
-    valuations['P/E Earnings Projection'] = {
-        'intrinsic_value': intrinsic_pe,
-        'future_price_5y': future_price_pe,
-        'future_price': future_price_pe,
-        'growth_used': pe_g,
+    ocf_g_20 = min(max(ocf_g, 5.0), 22.0)
+    intrinsic_dcf20 = _calc_20y_discounted(ocf_per_share, ocf_g_20, dr, tg_20)
+    future_dcf20 = intrinsic_dcf20 * ((1 + dr / 100.0) ** years)
+    valuations['Discounted Cash Flow 20-year (DCF-20)'] = {
+        'intrinsic_value': intrinsic_dcf20,
+        'future_price_5y': future_dcf20,
+        'future_price': future_dcf20,
+        'growth_used': ocf_g_20,
         'discount_used': dr,
-        'weight': 0.15,
-        'description': f"{eps_desc} → {years}yr at EPS growth {pe_g:.1f}%, exit P/E {conservative_pe:.1f}x, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"20-year discounted Operating Cash Flow/Share ({sym}{ocf_per_share:.2f}): Years 1–10 at {ocf_g_20:.1f}%, Years 11–20 at {tg_20:.1f}%, WACC {dr:.1f}%, net cash adj ({sym}{net_cash_per_share:+.2f}/sh)."
     }
 
     # =========================================================
-    # MODEL 2: P/S Revenue Projection
+    # MODEL 2: Discounted Free Cash Flow 20-year (DFCF-20)
     # =========================================================
-    current_rev_per_share = total_revenue / shares_out
-    is_rev_normalized = (total_revenue == (current_price * shares_out) / 3.0)
-    future_rev_per_share = current_rev_per_share * ((1 + rev_g / 100) ** years)
-
-    target_ps = info.get('priceToSalesTrailing12Months')
-    if target_ps is None or pd.isna(target_ps) or target_ps <= 0:
-        target_ps = current_price / current_rev_per_share if current_rev_per_share > 0 else 3.0
-    target_ps = min(max(target_ps, 0.3), 12.0)
-
-    future_price_ps = future_rev_per_share * target_ps
-    intrinsic_ps = future_price_ps / ((1 + dr / 100) ** years)
-
-    rev_desc = f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f}) [Normalized]" if is_rev_normalized else f"Projects Revenue Per Share ({sym}{current_rev_per_share:.2f})"
-    valuations['P/S Revenue Projection'] = {
-        'intrinsic_value': intrinsic_ps,
-        'future_price_5y': future_price_ps,
-        'future_price': future_price_ps,
-        'growth_used': rev_g,
+    fcf_g_20 = min(max(fcf_g, 5.0), 22.0)
+    intrinsic_dfcf20 = _calc_20y_discounted(fcf_per_share, fcf_g_20, dr, tg_20)
+    future_dfcf20 = intrinsic_dfcf20 * ((1 + dr / 100.0) ** years)
+    valuations['Discounted Free Cash Flow 20-year (DFCF-20)'] = {
+        'intrinsic_value': intrinsic_dfcf20,
+        'future_price_5y': future_dfcf20,
+        'future_price': future_dfcf20,
+        'growth_used': fcf_g_20,
         'discount_used': dr,
-        'weight': 0.10,
-        'description': f"{rev_desc} → {years}yr at revenue growth {rev_g:.1f}%, exit P/S {target_ps:.1f}x, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"20-year discounted Free Cash Flow/Share ({sym}{fcf_per_share:.2f}): Years 1–10 at {fcf_g_20:.1f}%, Years 11–20 at {tg_20:.1f}%, WACC {dr:.1f}%, net cash adj ({sym}{net_cash_per_share:+.2f}/sh)."
     }
 
     # =========================================================
-    # MODEL 3: FCF Projection
+    # MODEL 3: Discounted Net Income 20-year (DNI-20)
     # =========================================================
-    future_fcf_per_share = fcf_per_share * ((1 + fcf_g / 100) ** years)
-
-    target_fcf_multiple = info.get('priceToFreeCashflow')
-    if target_fcf_multiple is None or pd.isna(target_fcf_multiple) or target_fcf_multiple <= 0:
-        target_fcf_multiple = conservative_pe * 1.1  # FCF multiples tend to track PE
-    target_fcf_multiple = min(max(target_fcf_multiple, 10.0), 35.0)
-
-    future_price_fcf = future_fcf_per_share * target_fcf_multiple
-    intrinsic_fcf = future_price_fcf / ((1 + dr / 100) ** years)
-
-    fcf_desc = f"Projects FCF Per Share ({sym}{fcf_per_share:.2f}) [Normalized]" if is_fcf_normalized else f"Projects FCF Per Share ({sym}{fcf_per_share:.2f})"
-    valuations['FCF Projection'] = {
-        'intrinsic_value': intrinsic_fcf,
-        'future_price_5y': future_price_fcf,
-        'future_price': future_price_fcf,
-        'growth_used': fcf_g,
+    ni_g_20 = min(max(pe_g, 5.0), 22.0)
+    intrinsic_dni20 = _calc_20y_discounted(eps_no_nri, ni_g_20, dr, tg_20)
+    future_dni20 = intrinsic_dni20 * ((1 + dr / 100.0) ** years)
+    valuations['Discounted Net Income 20-year (DNI-20)'] = {
+        'intrinsic_value': intrinsic_dni20,
+        'future_price_5y': future_dni20,
+        'future_price': future_dni20,
+        'growth_used': ni_g_20,
         'discount_used': dr,
-        'weight': 0.20,
-        'description': f"{fcf_desc} → {years}yr at FCF growth {fcf_g:.1f}%, exit P/FCF {target_fcf_multiple:.1f}x, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"20-year discounted Net Income/Share ({sym}{eps_no_nri:.2f}): Years 1–10 at {ni_g_20:.1f}%, Years 11–20 at {tg_20:.1f}%, WACC {dr:.1f}%, net cash adj ({sym}{net_cash_per_share:+.2f}/sh)."
     }
 
     # =========================================================
-    # MODEL 4: EV/EBITDA Projection
+    # MODEL 4: Discounted Free Cash Flow Terminal (DFCF-Terminal)
     # =========================================================
-    ebitda = info.get('ebitda')
-    is_ebitda_normalized = False
-    if ebitda is None or pd.isna(ebitda) or ebitda <= 0:
-        # Use operating income as proxy before margin estimate
-        op_income = info.get('operatingIncome')
-        if op_income and op_income > 0:
-            ebitda = op_income * 1.15  # rough D&A add-back
-        else:
-            ebitda = total_revenue * 0.15
-        is_ebitda_normalized = True
-
-    ebitda_per_share = ebitda / shares_out
-    # Use FCF growth rate for EBITDA projection (operating metric)
-    future_ebitda_per_share = ebitda_per_share * ((1 + fcf_g / 100) ** years)
-
-    target_ev_ebitda = info.get('enterpriseToEbitda')
-    if target_ev_ebitda is None or pd.isna(target_ev_ebitda) or target_ev_ebitda <= 0:
-        target_ev_ebitda = 12.0
-    # Wider range — many growth companies trade 20-40x
-    target_ev_ebitda = min(max(target_ev_ebitda, 5.0), 30.0)
-
-    future_ev_per_share = future_ebitda_per_share * target_ev_ebitda
-    # Net debt adjustment: subtract net debt per share from EV to get equity value
-    future_price_ev = max(future_ev_per_share - net_debt_per_share, current_price * 0.1)
-    intrinsic_ev = future_price_ev / ((1 + dr / 100) ** years)
-
-    ebitda_desc = f"Projects EBITDA/Share ({sym}{ebitda_per_share:.2f}) [Normalized]" if is_ebitda_normalized else f"Projects EBITDA/Share ({sym}{ebitda_per_share:.2f})"
-    valuations['EV/EBITDA Projection'] = {
-        'intrinsic_value': intrinsic_ev,
-        'future_price_5y': future_price_ev,
-        'future_price': future_price_ev,
-        'growth_used': fcf_g,
-        'discount_used': dr,
-        'weight': 0.15,
-        'description': f"{ebitda_desc} → {years}yr at {fcf_g:.1f}% growth, exit EV/EBITDA {target_ev_ebitda:.1f}x, net-debt adj, WACC {dr:.1f}%."
-    }
-
-    # =========================================================
-    # MODEL 5: P/B Book Value Projection
-    # =========================================================
-    bv = book_value if (book_value and not pd.isna(book_value) and book_value > 0) else info.get('bookValue')
-    is_bv_normalized = False
-    if bv is None or pd.isna(bv) or bv <= 0:
-        bv = current_price / 3.0
-        is_bv_normalized = True
-
-    roe = info.get('returnOnEquity')
-    book_g = roe * 100 if (roe and not pd.isna(roe) and roe > 0) else 10.0
-    book_g = min(max(book_g, 3.0), 20.0)
-
-    future_bv = bv * ((1 + book_g / 100) ** years)
-    target_pb = info.get('priceToBook')
-    if target_pb is None or pd.isna(target_pb) or target_pb <= 0:
-        target_pb = 2.0
-    target_pb = min(max(target_pb, 0.8), 8.0)
-
-    future_price_pb = future_bv * target_pb
-    intrinsic_pb = future_price_pb / ((1 + dr / 100) ** years)
-
-    bv_desc = f"Projects BV/Share ({sym}{bv:.2f}) [Normalized]" if is_bv_normalized else f"Projects BV/Share ({sym}{bv:.2f})"
-    valuations['P/B Book Value Projection'] = {
-        'intrinsic_value': intrinsic_pb,
-        'future_price_5y': future_price_pb,
-        'future_price': future_price_pb,
-        'growth_used': book_g,
-        'discount_used': dr,
-        'weight': 0.10,
-        'description': f"{bv_desc} → {years}yr at ROE-based growth {book_g:.1f}%, exit P/B {target_pb:.1f}x, WACC {dr:.1f}%."
-    }
-
-    # =========================================================
-    # MODEL 6: 2-Stage DCF (Standard)
-    # =========================================================
+    fcf_g_term = min(max(fcf_g, 5.0), 25.0)
     pv_stage1 = 0.0
     for i in range(1, years + 1):
-        fcf_i = fcf_per_share * ((1 + fcf_g / 100) ** i)
-        pv_stage1 += fcf_i / ((1 + dr / 100) ** i)
+        fcf_i = fcf_per_share * ((1.0 + fcf_g_term / 100.0) ** i)
+        pv_stage1 += fcf_i / ((1.0 + dr / 100.0) ** i)
 
-    future_fcf_N = fcf_per_share * ((1 + fcf_g / 100) ** years)
-    if dr > tg:
-        terminal_value = future_fcf_N * (1 + tg / 100) / ((dr - tg) / 100)
+    future_fcf_N = fcf_per_share * ((1.0 + fcf_g_term / 100.0) ** years)
+    eff_dr = max(dr, tg + 1.5)
+    terminal_value = future_fcf_N * (1.0 + tg / 100.0) / ((eff_dr - tg) / 100.0)
+    pv_terminal = terminal_value / ((1.0 + dr / 100.0) ** years)
+
+    intrinsic_dfcf_term = max(pv_stage1 + pv_terminal + net_cash_per_share, (pv_stage1 + pv_terminal) * 0.5)
+    future_dfcf_term = intrinsic_dfcf_term * ((1.0 + dr / 100.0) ** years)
+    valuations['Discounted Free Cash Flow Terminal (DFCF-Terminal)'] = {
+        'intrinsic_value': intrinsic_dfcf_term,
+        'future_price_5y': future_dfcf_term,
+        'future_price': future_dfcf_term,
+        'growth_used': fcf_g_term,
+        'discount_used': dr,
+        'weight': equal_weight,
+        'description': f"Gordon Growth Terminal DCF on FCF/Share ({sym}{fcf_per_share:.2f}): {years}yr growth at {fcf_g_term:.1f}%, perpetual terminal growth {tg:.1f}%, WACC {dr:.1f}%."
+    }
+
+    # =========================================================
+    # Historical Multiples Calculation (Mean PS, Mean PE Without NRI, Mean PB)
+    # =========================================================
+    ps_hist_list = []
+    pe_hist_list = []
+    pb_hist_list = []
+
+    if df_fin is not None and not df_fin.empty and history is not None and not history.empty:
+        rev_col_h = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
+            'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
+        for yr in df_fin.index:
+            try:
+                yr_int = int(yr)
+                yr_prices = history[history.index.year == yr_int]['Close'].dropna()
+                if yr_prices.empty:
+                    continue
+                avg_p_yr = float(yr_prices.mean())
+                if avg_p_yr <= 0:
+                    continue
+
+                row_fin = df_fin.loc[yr]
+                sh_yr = row_fin.get('Diluted Average Shares', row_fin.get('Basic Average Shares', shares_out))
+                if pd.isna(sh_yr) or sh_yr <= 0:
+                    sh_yr = shares_out
+
+                # Historical P/S
+                if rev_col_h:
+                    r_yr = row_fin.get(rev_col_h, 0)
+                    if r_yr and not pd.isna(r_yr) and r_yr > 0:
+                        ps_yr = avg_p_yr / (r_yr / sh_yr)
+                        if 0.1 <= ps_yr <= 60.0:
+                            ps_hist_list.append(ps_yr)
+
+                # Historical P/E Without NRI
+                ni_yr = row_fin.get('Normalized Income', row_fin.get('Net Income', 0))
+                if ni_yr and not pd.isna(ni_yr) and ni_yr > 0:
+                    eps_yr = ni_yr / sh_yr
+                    if eps_yr > 0:
+                        pe_yr = avg_p_yr / eps_yr
+                        if 3.0 <= pe_yr <= 85.0:
+                            pe_hist_list.append(pe_yr)
+
+                # Historical P/B
+                if df_bs is not None and not df_bs.empty and yr in df_bs.index:
+                    row_bs = df_bs.loc[yr]
+                    eq_yr = None
+                    for eq_c in ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest']:
+                        if eq_c in row_bs and not pd.isna(row_bs[eq_c]) and row_bs[eq_c] > 0:
+                            eq_yr = row_bs[eq_c]
+                            break
+                    if eq_yr and eq_yr > 0:
+                        bv_yr = eq_yr / sh_yr
+                        if bv_yr > 0:
+                            pb_yr = avg_p_yr / bv_yr
+                            if 0.2 <= pb_yr <= 120.0:
+                                pb_hist_list.append(pb_yr)
+            except Exception:
+                continue
+
+    # =========================================================
+    # MODEL 5: Mean Price to Sales (PS) Ratio
+    # =========================================================
+    curr_ps = info.get('priceToSalesTrailing12Months')
+    if curr_ps is None or pd.isna(curr_ps) or curr_ps <= 0:
+        curr_ps = (current_price / current_rev_per_share) if current_rev_per_share > 0 else 3.0
+    if ps_hist_list:
+        mean_ps = sum(ps_hist_list) / len(ps_hist_list)
     else:
-        terminal_value = future_fcf_N * (1 + tg / 100) / ((max(dr, tg + 0.5)) / 100)
-    pv_terminal = terminal_value / ((1 + dr / 100) ** years)
+        mean_ps = min(max(curr_ps, 0.5), 20.0)
 
-    intrinsic_dcf = pv_stage1 + pv_terminal
-    future_price_dcf = intrinsic_dcf * ((1 + dr / 100) ** years)
-
-    valuations['2-Stage DCF'] = {
-        'intrinsic_value': intrinsic_dcf,
-        'future_price_5y': future_price_dcf,
-        'future_price': future_price_dcf,
-        'growth_used': fcf_g,
+    intrinsic_mean_ps = current_rev_per_share * mean_ps
+    future_mean_ps = intrinsic_mean_ps * ((1.0 + rev_g / 100.0) ** years)
+    valuations['Mean Price to Sales (PS) Ratio'] = {
+        'intrinsic_value': intrinsic_mean_ps,
+        'future_price_5y': future_mean_ps,
+        'future_price': future_mean_ps,
+        'growth_used': rev_g,
         'discount_used': dr,
-        'weight': 0.20,
-        'description': f"Discounts FCF {years}yr at {fcf_g:.1f}% growth, terminal at {tg:.1f}%, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"Multiplies Revenue/Share ({sym}{current_rev_per_share:.2f}) by historical Mean P/S ratio ({mean_ps:.2f}x)."
     }
 
     # =========================================================
-    # MODEL 7: 3-Stage DCF (High Growth → Fade → Terminal)
+    # MODEL 6: Mean Price to Earnings (PE) Ratio Without NRI
     # =========================================================
-    stage1_yrs = min(years, 3)
-    stage2_yrs = max(years - stage1_yrs, 2)
-    stage2_g = max(fcf_g * 0.5, tg + 1.0)  # fade to half
-    pv_3s1 = 0.0
-    last_fcf = fcf_per_share
-    for i in range(1, stage1_yrs + 1):
-        cf = last_fcf * (1 + fcf_g / 100)
-        pv_3s1 += cf / ((1 + dr / 100) ** i)
-        last_fcf = cf
-
-    pv_3s2 = 0.0
-    for j in range(1, stage2_yrs + 1):
-        cf = last_fcf * (1 + stage2_g / 100)
-        pv_3s2 += cf / ((1 + dr / 100) ** (stage1_yrs + j))
-        last_fcf = cf
-
-    if dr > tg:
-        tv_3s = last_fcf * (1 + tg / 100) / ((dr - tg) / 100)
+    if pe_hist_list:
+        mean_pe_no_nri = sum(pe_hist_list) / len(pe_hist_list)
+    elif avg_pe and not pd.isna(avg_pe) and avg_pe > 0:
+        mean_pe_no_nri = min(max(avg_pe, 8.0), 45.0)
     else:
-        tv_3s = last_fcf * (1 + tg / 100) / (max(dr, tg + 0.5) / 100)
-    pv_tv_3s = tv_3s / ((1 + dr / 100) ** (stage1_yrs + stage2_yrs))
+        t_pe = info.get('trailingPE') or 18.0
+        mean_pe_no_nri = min(max(t_pe, 8.0), 45.0)
 
-    intrinsic_3stage = pv_3s1 + pv_3s2 + pv_tv_3s
-    future_price_3stage = intrinsic_3stage * ((1 + dr / 100) ** years)
-
-    valuations['3-Stage DCF'] = {
-        'intrinsic_value': intrinsic_3stage,
-        'future_price_5y': future_price_3stage,
-        'future_price': future_price_3stage,
-        'growth_used': fcf_g,
+    intrinsic_mean_pe = eps_no_nri * mean_pe_no_nri
+    future_mean_pe = intrinsic_mean_pe * ((1.0 + pe_g / 100.0) ** years)
+    valuations['Mean Price to Earnings (PE) Ratio Without NRI'] = {
+        'intrinsic_value': intrinsic_mean_pe,
+        'future_price_5y': future_mean_pe,
+        'future_price': future_mean_pe,
+        'growth_used': pe_g,
         'discount_used': dr,
-        'weight': 0.15,
-        'description': f"3-Stage: {stage1_yrs}yr at {fcf_g:.1f}%, {stage2_yrs}yr fade to {stage2_g:.1f}%, terminal {tg:.1f}%, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"Multiplies EPS Without NRI ({sym}{eps_no_nri:.2f}) by historical Mean P/E Without NRI ({mean_pe_no_nri:.2f}x)."
     }
 
     # =========================================================
-    # MODEL 8: Earnings Power Value (EPV) — Damodaran-style
+    # MODEL 7: Mean Price to Book (PB) Ratio
     # =========================================================
-    # EPV = Normalized EBIT(1-t) / cost_of_capital  (no-growth perpetuity)
-    ebit = info.get('ebit') or (ebitda * 0.85 if ebitda > 0 else eps * shares_out)
-    if ebit <= 0:
-        ebit = ebitda * 0.80 if ebitda > 0 else total_revenue * 0.10
-    tax_rate_epv = 0.21
-    nopat = ebit * (1 - tax_rate_epv) / shares_out  # NOPAT per share
-    if nopat <= 0:
-        nopat = eps * 0.85
-    # EPV uses cost of equity (CAPM) not WACC for equity value
-    cost_eq = max(coe_val, 6.0)
-    intrinsic_epv = nopat / (cost_eq / 100)
-    # EPV grows only at inflation (no structural growth assumed)
-    inflation_rate = 2.5
-    future_price_epv = intrinsic_epv * ((1 + inflation_rate / 100) ** years)
+    curr_pb = info.get('priceToBook')
+    if curr_pb is None or pd.isna(curr_pb) or curr_pb <= 0:
+        curr_pb = (current_price / bv) if bv > 0 else 3.0
+    if pb_hist_list:
+        mean_pb = sum(pb_hist_list) / len(pb_hist_list)
+    else:
+        mean_pb = min(max(curr_pb, 0.5), 40.0)
 
-    valuations['Earnings Power Value (EPV)'] = {
-        'intrinsic_value': intrinsic_epv,
-        'future_price_5y': future_price_epv,
-        'future_price': future_price_epv,
-        'growth_used': inflation_rate,
-        'discount_used': cost_eq,
-        'weight': 0.05,
-        'description': f"No-growth perpetuity: NOPAT/Share ({sym}{nopat:.2f}) ÷ cost of equity {cost_eq:.1f}%, inflated at {inflation_rate:.1f}%/yr."
-    }
+    roe = info.get('returnOnEquity')
+    book_g = (roe * 100.0) if (roe and not pd.isna(roe) and roe > 0) else pe_g
+    book_g = min(max(book_g, 3.0), 25.0)
 
-    # =========================================================
-    # MODEL 9: Revised Benjamin Graham Formula
-    # =========================================================
-    g_capped = min(pe_g, 15.0)
-    intrinsic_graham = eps * (8.5 + 2 * g_capped) * 4.4 / graham_bond_yield
-    future_price_graham = intrinsic_graham * ((1 + g_capped / 100) ** years)
-
-    valuations['Revised Benjamin Graham'] = {
-        'intrinsic_value': intrinsic_graham,
-        'future_price_5y': future_price_graham,
-        'future_price': future_price_graham,
-        'growth_used': g_capped,
-        'discount_used': graham_bond_yield,
-        'weight': 0.05,
-        'description': f"Graham: EPS({sym}{eps:.2f}) × (8.5 + 2×{g_capped:.1f}%) × 4.4 ÷ {graham_bond_yield:.1f}% (corp bond yield)."
-    }
-
-    # =========================================================
-    # MODEL 10: Buffett Owner Earnings Model
-    # =========================================================
-    # Owner Earnings = Net Income + D&A - Maintenance CapEx
-    # Proxy: FCF is already a reasonable owner earnings proxy
-    oe_per_share = fcf_per_share
-    future_oe_ps = oe_per_share * ((1 + fcf_g / 100) ** years)
-    # Buffett uses ~15x earnings as baseline; adjust slightly for growth
-    target_oe_multiple = min(max(conservative_pe * 1.05, 13.0), 28.0)
-    future_price_oe = future_oe_ps * target_oe_multiple
-    intrinsic_oe = future_price_oe / ((1 + dr / 100) ** years)
-
-    valuations['Buffett Owner Earnings'] = {
-        'intrinsic_value': intrinsic_oe,
-        'future_price_5y': future_price_oe,
-        'future_price': future_price_oe,
-        'growth_used': fcf_g,
+    intrinsic_mean_pb = bv * mean_pb
+    future_mean_pb = intrinsic_mean_pb * ((1.0 + book_g / 100.0) ** years)
+    valuations['Mean Price to Book (PB) Ratio'] = {
+        'intrinsic_value': intrinsic_mean_pb,
+        'future_price_5y': future_mean_pb,
+        'future_price': future_mean_pb,
+        'growth_used': book_g,
         'discount_used': dr,
-        'weight': 0.15,
-        'description': f"Owner earnings ({sym}{oe_per_share:.2f}/share) → {years}yr at {fcf_g:.1f}% growth, exit {target_oe_multiple:.1f}x, WACC {dr:.1f}%."
+        'weight': equal_weight,
+        'description': f"Multiplies Book Value/Share ({sym}{bv:.2f}) by historical Mean P/B ratio ({mean_pb:.2f}x)."
+    }
+
+    # =========================================================
+    # MODEL 8: Price to Sales Growth (PSG) Ratio
+    # =========================================================
+    net_margin_ratio = (eps_no_nri * shares_out) / total_revenue if total_revenue > 0 else 0.15
+    net_margin_ratio = min(max(net_margin_ratio, 0.05), 0.50)
+    fair_psg_benchmark = min(max(net_margin_ratio * 1.35, 0.15), 0.55)
+    rev_g_psg = min(max(rev_g, 5.0), 30.0)
+    fair_ps_from_psg = fair_psg_benchmark * rev_g_psg
+
+    intrinsic_psg = current_rev_per_share * fair_ps_from_psg
+    future_psg = intrinsic_psg * ((1.0 + rev_g_psg / 100.0) ** years)
+    valuations['Price to Sales Growth (PSG) Ratio'] = {
+        'intrinsic_value': intrinsic_psg,
+        'future_price_5y': future_psg,
+        'future_price': future_psg,
+        'growth_used': rev_g_psg,
+        'discount_used': dr,
+        'weight': equal_weight,
+        'description': f"Revenue/Share ({sym}{current_rev_per_share:.2f}) × Fair P/S ({fair_ps_from_psg:.2f}x) derived from {rev_g_psg:.1f}% sales growth and {fair_psg_benchmark:.2f} fair PSG."
+    }
+
+    # =========================================================
+    # MODEL 9: Price to Earnings Growth (PEG) Ratio Without NRI
+    # =========================================================
+    eps_g_peg = min(max(pe_g, 6.0), 35.0)
+    fair_peg = 1.0  # Standard Peter Lynch / OracleValue fair PEG = 1.0
+    fair_pe_from_peg = fair_peg * eps_g_peg
+
+    intrinsic_peg = eps_no_nri * fair_pe_from_peg
+    future_peg = intrinsic_peg * ((1.0 + eps_g_peg / 100.0) ** years)
+    valuations['Price to Earnings Growth (PEG) Ratio Without NRI'] = {
+        'intrinsic_value': intrinsic_peg,
+        'future_price_5y': future_peg,
+        'future_price': future_peg,
+        'growth_used': eps_g_peg,
+        'discount_used': dr,
+        'weight': equal_weight,
+        'description': f"EPS Without NRI ({sym}{eps_no_nri:.2f}) × Fair P/E ({fair_pe_from_peg:.1f}x at Fair PEG = 1.0 and {eps_g_peg:.1f}% EPS growth)."
     }
 
     # Store metadata for UI use
@@ -2526,8 +2587,8 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         'eps_growth': pe_g,
         'rev_growth': rev_g,
         'fcf_growth': fcf_g,
+        'ocf_growth': ocf_g,
         'years': years,
-        'graham_bond_yield': graham_bond_yield,
     }
 
     return valuations
@@ -2544,99 +2605,104 @@ def create_valuation_chart(valuations, current_price, years=5):
 
     names = list(models.keys())
     intrinsic_values = [v['intrinsic_value'] for v in models.values()]
-    future_prices = [v.get('future_price', v['future_price_5y']) for v in models.values()]
-    weights = [v.get('weight', 1.0 / len(models)) for v in models.values()]
-
-    total_weight = sum(weights)
-    avg_intrinsic = sum(iv * w for iv, w in zip(intrinsic_values, weights)) / total_weight if total_weight > 0 else sum(intrinsic_values) / len(intrinsic_values)
-    avg_future = sum(fp * w for fp, w in zip(future_prices, weights)) / total_weight if total_weight > 0 else sum(future_prices) / len(future_prices)
+    avg_intrinsic = sum(intrinsic_values) / len(intrinsic_values)
     sym = cs()
+    is_he = (st.session_state.get("language", "en") == "he")
 
-    # Color-code each bar: green if intrinsic > current price (undervalued), red if overvalued
-    bar_colors_iv = ['#10B981' if iv >= current_price else '#F87171' for iv in intrinsic_values]
-    bar_colors_fp = ['#3B82F6' if fp >= current_price else '#F59E0B' for fp in future_prices]
-
-    # Margin of safety text per bar
-    mos_texts = []
+    # Color-code each of the 9 bars like the reference Valuation Chart:
+    # Green if >= current_price, Yellow/Amber if moderately below, Red if significantly below (< 60% of price)
+    bar_colors = []
     for iv in intrinsic_values:
-        if iv > 0 and current_price > 0:
-            mos = ((iv - current_price) / current_price) * 100
-            mos_texts.append(f"{sym}{iv:.1f}<br>{'▲' if mos >= 0 else '▼'}{abs(mos):.0f}%")
+        if iv >= current_price:
+            bar_colors.append('#2EA043')  # Rich green
+        elif iv >= current_price * 0.60:
+            bar_colors.append('#E5B822')  # Warm yellow/gold
         else:
-            mos_texts.append(f"{sym}{iv:.1f}")
+            bar_colors.append('#D9483B')  # Coral red
 
-    fp_texts = [f"{sym}{fp:.1f}" for fp in future_prices]
+    # Append the 10th summary bar at the bottom: Average Intrinsic Value (Site Valuation)
+    avg_label = "הערכת שווי של האתר (ממוצע)" if is_he else "Site Valuation™ (Average)"
+    all_names = names + [f"<b>{avg_label}</b>"]
+    all_values = intrinsic_values + [avg_intrinsic]
+    avg_bar_color = '#84BE82' if avg_intrinsic >= current_price else '#F59E0B'
+    bar_colors.append(avg_bar_color)
+
+    value_texts = [f"  <b>{sym}{v:,.2f}</b>" for v in all_values]
 
     fig = go.Figure()
 
     fig.add_trace(go.Bar(
-        x=names,
-        y=intrinsic_values,
-        name=tr("intrinsic_value_pv_column"),
-        marker_color=bar_colors_iv,
-        text=mos_texts,
+        y=all_names,
+        x=all_values,
+        orientation='h',
+        marker=dict(
+            color=bar_colors,
+            line=dict(width=0),
+            cornerradius=4
+        ),
+        text=value_texts,
         textposition='outside',
-        textfont=dict(size=9),
-        opacity=0.9,
-        hovertemplate='<b>%{x}</b><br>Intrinsic Value: ' + sym + '%{y:.2f}<extra></extra>'
+        textfont=dict(size=12, color='#FFFFFF', family="Outfit, Rubik, Arial"),
+        cliponaxis=False,
+        hovertemplate='<b>%{y}</b><br>Intrinsic Value: ' + sym + '%{x:,.2f}<extra></extra>'
     ))
 
-    fig.add_trace(go.Bar(
-        x=names,
-        y=future_prices,
-        name=tr("target_price_fv_column").replace("{years}", str(years)),
-        marker_color=bar_colors_fp,
-        text=fp_texts,
-        textposition='outside',
-        textfont=dict(size=9),
-        opacity=0.7,
-        hovertemplate='<b>%{x}</b><br>Target Price: ' + sym + '%{y:.2f}<extra></extra>'
-    ))
-
-    fig.add_hline(
-        y=current_price,
-        line_dash="solid",
-        line_color="#E2E8F0",
-        line_width=2.5,
-        annotation_text=f"  {tr('current_price')}: {sym}{current_price:.2f}",
-        annotation_position="bottom right",
-        annotation_font=dict(color="#E2E8F0", size=12, family="Arial")
-    )
-
-    fig.add_hline(
-        y=avg_intrinsic,
+    # Vertical dashed line 1: Current Stock Price
+    stock_price_lbl = f"מחיר מניה: {sym}{current_price:,.2f}" if is_he else f"Stock price: {sym}{current_price:,.2f}"
+    fig.add_vline(
+        x=current_price,
         line_dash="dash",
-        line_color="#10B981",
+        line_color="#94A3B8",
         line_width=2,
-        annotation_text=f"  Weighted IV: {sym}{avg_intrinsic:.2f}",
-        annotation_position="top left",
-        annotation_font=dict(color="#10B981", size=11, family="Arial")
+        annotation_text=f"<b>{stock_price_lbl}</b>",
+        annotation_position="bottom",
+        annotation_font=dict(color="#E2E8F0", size=12, family="Outfit, Rubik, Arial")
     )
 
-    fig.add_hline(
-        y=avg_future,
-        line_dash="dot",
-        line_color="#60A5FA",
+    # Vertical dashed line 2: Site Average Valuation
+    avg_line_lbl = f"הערכת שווי של האתר: {sym}{avg_intrinsic:,.2f}" if is_he else f"Site Valuation™: {sym}{avg_intrinsic:,.2f}"
+    fig.add_vline(
+        x=avg_intrinsic,
+        line_dash="dash",
+        line_color="#2EA043" if avg_intrinsic >= current_price else "#F59E0B",
         line_width=2,
-        annotation_text=f"  Weighted Target: {sym}{avg_future:.2f}",
-        annotation_position="top right",
-        annotation_font=dict(color="#60A5FA", size=11, family="Arial")
+        annotation_text=f"<b>{avg_line_lbl}</b>",
+        annotation_position="top",
+        annotation_font=dict(color="#84BE82" if avg_intrinsic >= current_price else "#F59E0B", size=12, family="Outfit, Rubik, Arial")
     )
 
-    years_str = tr("price_period_1y") if years == 1 else (tr("price_period_2y") if years == 2 else f"{years} {tr('price_period_5y')}")
-    wacc_str = f" | WACC: {meta.get('wacc', 10):.1f}%" if meta else ""
+    max_x = max(max(all_values), current_price) * 1.22
+    chart_title = "תרשים הערכת שווי (ממוצע 9 מודלים)" if is_he else "Valuation Chart — 9-Model Summary"
+
     fig.update_layout(
-        title=f"<b>{tr('multi_model_consensus')} ({years_str}){wacc_str}</b>",
-        yaxis_title=tr("usd_sign"),
-        barmode='group',
-        hovermode="x unified",
-        margin=dict(t=70, b=60, l=40, r=40),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-        xaxis=dict(tickangle=-35)
+        title=dict(
+            text=f"<b>{chart_title}</b>",
+            font=dict(size=18, color="#FFFFFF", family="Outfit, Rubik, sans-serif"),
+            x=0.0
+        ),
+        xaxis=dict(
+            range=[0, max_x],
+            showgrid=True,
+            gridcolor="#2a2e39",
+            zeroline=True,
+            zerolinecolor="#475569",
+            title=""
+        ),
+        yaxis=dict(
+            autorange="reversed",
+            showgrid=False,
+            tickfont=dict(size=12, color="#D1D4DC", family="Outfit, Rubik, sans-serif")
+        ),
+        plot_bgcolor="#131722",
+        paper_bgcolor="#1c2030",
+        margin=dict(t=65, b=55, l=260, r=90),
+        height=540,
+        showlegend=False,
+        bargap=0.38
     )
 
     return fig
+
 
 
 def create_stock_price_chart(df: pd.DataFrame, ticker_symbol: str, show_bollinger: bool = False):
@@ -3446,11 +3512,11 @@ if st.session_state.page_selector == "Dashboard":
                 growth_rate = implied_5y_growth if implied_5y_growth and implied_5y_growth > 0 else 10.0
                 discount_rate = 10.0
 
-                # Valuations are typically calculated using Annual TTM data
-                # WACC is auto-computed inside calculate_valuations using CAPM
+                # Valuations are calculated using the 9-model consensus (DCF-20, DFCF-20, DNI-20, DFCF-Terminal, Mean PS, Mean PE, Mean PB, PSG, PEG)
                 valuations = calculate_valuations(
                     info, df_fin_a, avg_pe, growth_rate, discount_rate,
-                    terminal_growth=2.5, use_wacc=True
+                    terminal_growth=2.5, use_wacc=True,
+                    df_bs=df_bs_a, df_cf=df_cf_a, history=history
                 )
 
 
@@ -4334,19 +4400,20 @@ if st.session_state.page_selector == "Dashboard":
                     val_models = {k: v for k, v in valuations.items() if k != '_meta'}
 
                     if current_price and current_price > 0 and len(val_models) >= 3:
-                        # --- Weighted & Simple Consensus ---
-                        weights = [v.get('weight', 1.0 / len(val_models)) for v in val_models.values()]
-                        total_w = sum(weights)
+                        # --- 9-Model Simple Average Consensus (Site Valuation) ---
                         iv_list = [v['intrinsic_value'] for v in val_models.values()]
                         fp_list = [v.get('future_price_5y', v.get('future_price', 0)) for v in val_models.values()]
 
-                        weighted_iv = sum(iv * w for iv, w in zip(iv_list, weights)) / total_w
                         simple_iv   = sum(iv_list) / len(iv_list)
-                        weighted_fp = sum(fp * w for fp, w in zip(fp_list, weights)) / total_w
+                        weighted_iv = simple_iv  # All 9 models carry equal weight (average of all 9 valuations)
                         simple_fp   = sum(fp_list) / len(fp_list)
-                        margin_of_safety = ((weighted_iv - current_price) / weighted_iv) * 100
+                        weighted_fp = simple_fp
+                        margin_of_safety = ((simple_iv - current_price) / simple_iv) * 100 if simple_iv > 0 else 0.0
+                        upside_pct = ((simple_iv - current_price) / current_price) * 100 if current_price > 0 else 0.0
                         val_years = val_meta.get('years', 5)
-                        consensus_cagr = (((weighted_fp / current_price) ** (1 / val_years) - 1) * 100) if (current_price > 0 and weighted_fp > 0) else 0.0
+                        consensus_cagr = (((simple_fp / current_price) ** (1 / val_years) - 1) * 100) if (current_price > 0 and simple_fp > 0) else 0.0
+                        bullish_count = sum(1 for iv in iv_list if iv >= current_price)
+                        is_he_tab4 = (st.session_state.get("language", "en") == "he")
 
                         # WACC / model assumptions info box
                         if val_meta:
@@ -4365,18 +4432,20 @@ if st.session_state.page_selector == "Dashboard":
                                 f"Rev Growth: **{rev_g_val:.1f}%** | "
                                 f"FCF Growth: **{fcf_g_val:.1f}%** | "
                                 f"Terminal Growth: **{tg_val:.1f}%** | "
-                                f"Horizon: **{val_years} years**"
+                                f"Models: **{len(val_models)}**"
                             )
 
                         # Main consensus metrics
                         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                        mc1.metric("⚖️ Weighted Intrinsic Value", f"{cs()}{weighted_iv:.2f}")
-                        mc2.metric("📊 Simple Average IV", f"{cs()}{simple_iv:.2f}")
-                        if weighted_iv > current_price:
+                        site_val_lbl = "💎 הערכת שווי של האתר (ממוצע)" if is_he_tab4 else "💎 Site Valuation™ (9-Model Avg)"
+                        mc1.metric(site_val_lbl, f"{cs()}{simple_iv:,.2f}", f"{upside_pct:+.1f}%")
+                        mc2.metric(tr("current_market_price"), f"{cs()}{current_price:,.2f}")
+                        if simple_iv > current_price:
                             mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▲ " + tr("undervalued"))
                         else:
                             mc3.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▼ " + tr("overvalued_sign"), delta_color="inverse")
-                        mc4.metric(tr("current_market_price"), f"{cs()}{current_price:.2f}")
+                        bull_lbl = "📊 מודלים חיוביים" if is_he_tab4 else "📊 Bullish Models"
+                        mc4.metric(bull_lbl, f"{bullish_count} / {len(val_models)}")
                         mc5.metric(tr("consensus_cagr"), f"{consensus_cagr:.2f}%")
 
                         st.markdown("---")
@@ -4393,11 +4462,17 @@ if st.session_state.page_selector == "Dashboard":
                                 base_fcf = val_meta.get('fcf_growth', growth_rate) if val_meta else growth_rate
                                 base_wacc = val_meta.get('wacc', discount_rate) if val_meta else discount_rate
                                 base_tg   = val_meta.get('terminal_growth', 2.5) if val_meta else 2.5
-                                base_fcf_ps = [v['intrinsic_value'] for k, v in val_models.items() if '2-Stage DCF' in k]
-                                base_fcf_ps = base_fcf_ps[0] if base_fcf_ps else weighted_iv
+                                base_fcf_ps = [v['intrinsic_value'] for k, v in val_models.items() if 'DFCF-Terminal' in k]
+                                base_fcf_ps = base_fcf_ps[0] if base_fcf_ps else simple_iv
 
                                 # Recompute DCF for each scenario
-                                fcf_real = info.get('freeCashflow') or 0
+                                fcf_real = None
+                                if df_cf_a is not None and not df_cf_a.empty and 'Free Cash Flow' in df_cf_a.columns:
+                                    fcf_s_sens = df_cf_a['Free Cash Flow'].dropna()
+                                    if not fcf_s_sens.empty and fcf_s_sens.iloc[-1] > 0:
+                                        fcf_real = fcf_s_sens.iloc[-1]
+                                if not fcf_real:
+                                    fcf_real = info.get('freeCashflow') or 0
                                 s_out = info.get('sharesOutstanding', 1) or 1
                                 fcf_ps_base = fcf_real / s_out if fcf_real > 0 else (simple_iv * 0.05)
 
@@ -4428,15 +4503,24 @@ if st.session_state.page_selector == "Dashboard":
                                 fv = val_data.get('future_price_5y', val_data.get('future_price', 0))
                                 iv = val_data['intrinsic_value']
                                 upside_iv = ((iv - current_price) / current_price * 100) if current_price > 0 else 0
-                                upside_fv = ((fv - current_price) / current_price * 100) if current_price > 0 else 0
                                 verdict = "✅" if iv >= current_price else "❌"
                                 model_rows.append({
                                     "Model": name,
-                                    "Intrinsic Value": f"{cs()}{iv:.2f}",
+                                    "Intrinsic Value": f"{cs()}{iv:,.2f}",
                                     "Upside IV": f"{'▲' if upside_iv >= 0 else '▼'}{abs(upside_iv):.1f}%",
-                                    f"{val_years}Y Target": f"{cs()}{fv:.2f}",
+                                    f"{val_years}Y Target": f"{cs()}{fv:,.2f}",
                                     "Verdict": verdict,
                                 })
+                            # Add Average (Site Valuation) summary row
+                            avg_upside_iv = ((simple_iv - current_price) / current_price * 100) if current_price > 0 else 0
+                            avg_row_name = "⭐ הערכת שווי של האתר (ממוצע)" if is_he_tab4 else "⭐ Site Valuation™ (Average)"
+                            model_rows.append({
+                                "Model": avg_row_name,
+                                "Intrinsic Value": f"{cs()}{simple_iv:,.2f}",
+                                "Upside IV": f"{'▲' if avg_upside_iv >= 0 else '▼'}{abs(avg_upside_iv):.1f}%",
+                                f"{val_years}Y Target": f"{cs()}{simple_fp:,.2f}",
+                                "Verdict": "✅" if simple_iv >= current_price else "❌",
+                            })
                             st.dataframe(pd.DataFrame(model_rows).set_index("Model"), use_container_width=True)
 
                             st.markdown("---")
@@ -4672,25 +4756,28 @@ if st.session_state.page_selector == "Dashboard":
                                             'enterpriseToEbitda': user_exit_pe,
                                         }
 
-                                    hist_fin_df = pd.DataFrame(hist_fin).T
+                                    hist_fin_df = df_fin_a[df_fin_a.index <= selected_year] if (df_fin_a is not None and not df_fin_a.empty) else pd.DataFrame(hist_fin).T
+                                    hist_bs_df = df_bs_a[df_bs_a.index <= selected_year] if (df_bs_a is not None and not df_bs_a.empty) else None
+                                    hist_cf_df = df_cf_a[df_cf_a.index <= selected_year] if (df_cf_a is not None and not df_cf_a.empty) else None
 
                                     # Execute the exact identical function utilized in Tab 4
                                     hist_valuations = calculate_valuations(hist_info, hist_fin_df, avg_pe=user_exit_pe,
                                                                            growth_rate=user_earn_growth,
                                                                            discount_rate=discount_rate,
                                                                            years=projection_years,
-                                                                           use_wacc=False)
+                                                                           use_wacc=False,
+                                                                           df_bs=hist_bs_df,
+                                                                           df_cf=hist_cf_df,
+                                                                           history=hist_price_slice)
 
                                     hist_models = {k: v for k, v in hist_valuations.items() if k != '_meta'}
 
                                     if hist_models and len(hist_models) >= 2:
-                                        h_weights = [v.get('weight', 1.0 / len(hist_models)) for v in hist_models.values()]
-                                        h_total_w = sum(h_weights)
                                         h_ivs = [v['intrinsic_value'] for v in hist_models.values()]
                                         h_fps = [v['future_price'] for v in hist_models.values()]
 
-                                        avg_intrinsic = sum(iv * w for iv, w in zip(h_ivs, h_weights)) / h_total_w
-                                        avg_target = sum(fp * w for fp, w in zip(h_fps, h_weights)) / h_total_w
+                                        avg_intrinsic = sum(h_ivs) / len(h_ivs)
+                                        avg_target = sum(h_fps) / len(h_fps)
 
                                         st.markdown("---")
                                         st.subheader(tr("backtest_results_header").format(years=projection_years))
@@ -4698,8 +4785,8 @@ if st.session_state.page_selector == "Dashboard":
                                         # --- Summary metrics ---
                                         bm1, bm2, bm3, bm4 = st.columns(4)
                                         bm1.metric("📍 Starting Price", f"{cs()}{hist_price:.2f}", f"{selected_year}")
-                                        bm2.metric("⚖️ Weighted Intrinsic Value", f"{cs()}{avg_intrinsic:.2f}")
-                                        bm3.metric(f"🎯 Weighted {projection_years}Y Target", f"{cs()}{avg_target:.2f}")
+                                        bm2.metric("💎 Average Intrinsic Value", f"{cs()}{avg_intrinsic:.2f}")
+                                        bm3.metric(f"🎯 Average {projection_years}Y Target", f"{cs()}{avg_target:.2f}")
                                         proj_cagr = ((avg_target / hist_price) ** (1 / projection_years) - 1) * 100 if hist_price > 0 and projection_years > 0 else 0
                                         bm4.metric("📈 Projected CAGR", f"{proj_cagr:.1f}%")
 
