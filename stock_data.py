@@ -3486,11 +3486,11 @@ def render_portfolio_card(label, value_str, status, description=""):
 
 
 # ============================================================
-# FINANCIAL SCREENER ENGINE
+# FINANCIAL SCREENER ENGINE — S&P 500 & NASDAQ (15 METRICS)
 # ============================================================
 SCREENER_CACHE_FILE = "screener_cache.json"
 
-# ── Fallback static list (used if dynamic fetch fails) ───────────────────────
+# ── Fallback static list (S&P 500 + NASDAQ-100 leaders) ──────────────────────
 _SP500_FALLBACK = [
     "AAPL","MSFT","NVDA","AVGO","ORCL","AMD","QCOM","AMAT","TXN","KLAC",
     "LRCX","ADI","MCHP","MPWR","ON","SNPS","CDNS","CRM","ADBE","NOW","INTU",
@@ -3501,112 +3501,239 @@ _SP500_FALLBACK = [
     "LIN","APD","SHW","AMT","PLD","EQIX","PANW","CRWD","FTNT","ZS","NET","DDOG",
     "SNOW","TEAM","WDAY","HUBS","VEEV","PYPL","SPGI","MCO","ICE","CME","BLK","SCHW",
     "TMO","ABT","DHR","BMY","AMGN","GILD","REGN","VRTX","ISRG","SYK","MDT","BSX",
-    "AXON","MSI","FAST","GWW","NUE","STLD","FCX","NEM","IBM",
+    "AXON","MSI","FAST","GWW","NUE","STLD","FCX","NEM","IBM","ANET","PLTR","APP",
+    "MELI","ASML","PDD","ARM","MRVL","MU","INTC","NXPI","ROP","ADSK","PAYX","CTAS",
+    "ODFL","CPRT","ROST","MNST","LULU","ORLY","AZO","CMG","MAR","HLT","URI","PWR",
+    "TT","PH","ITW","DE","MMM","GD","NOC","TDG","HWM","AXP","C","USB","PNC","TFC",
+    "COF","BX","KKR","APO","CB","PGR","TRV","ALL","AON","MMC","AJG","FI","FIS",
+    "ADP","BR","MSCI","NDAQ","CBOE","ELV","CI","HUM","HCA","MCK","COR","CAH","IDXX",
+    "IQV","A","EW","ZBH","BDX","GEHC","RMD","DXCM","ALGN","BIIB","MRNA","ILMN",
+    "SLB","EOG","MPC","PSX","VLO","OXY","HES","DVN","FANG","HAL","BKR","KMI","WMB",
+    "OKE","TRGP","PG","CL","KMB","EL","MDLZ","HSY","GIS","K","SJM","MKC","HRL",
+    "TSN","ADM","BG","STZ","BF-B","TAP","MO","TGT","LOW","TJX","DG","DLTR","BBY",
+    "EBAY","ETSY","EXPE","ABNB","UBER","DASH","LYFT","RCL","CCL","NCLH","DAL","UAL",
+    "LUV","GM","F","TSCO","DRI","YUM","DPZ","NKE","DECK","LEN","DHI","PHM","NVR",
+    "SHW","ECL","PPG","NUE","VMC","MLM","ALB","CF","MOS","CTVA","DOW","DD","LYB",
+    "WELL","O","SPG","PSA","DLR","CCI","SBAC","VICI","EXR","AVB","EQR","INVH","MAA",
+    "CEG","VST","NRG","PEG","ED","XEL","WEC","ES","EIX","PCG","AWK","AEP","EXC","SRE",
+    "TMUS","VZ","T","CMCSA","CHTR","DIS","WBD","EA","TTWO","OMC","IPG","LYV","MTCH",
 ]
 
+# Exact Yahoo Finance timeseries keys covering all 15 Financial Statements metrics
+_SCREENER_FIN_KEYS = [
+    # Income Statement (8 metrics)
+    "TotalRevenue", "GrossProfit", "CostOfRevenue", "ReconciledCostOfRevenue",
+    "OperatingIncome", "TotalOperatingIncomeAsReported", "EBIT",
+    "NetIncome", "NetIncomeCommonStockholders",
+    "DilutedEPS", "BasicEPS",
+    "DilutedAverageShares", "BasicAverageShares", "OrdinarySharesNumber", "ShareIssued",
+    # Cash Flow & Balance Sheet (7 metrics)
+    "FreeCashFlow", "OperatingCashFlow", "CapitalExpenditure",
+    "TotalAssets", "TotalLiabilitiesNetMinorityInterest",
+    "TotalDebt", "LongTermDebt", "NetDebt",
+    "CashAndCashEquivalents", "CashCashEquivalentsAndShortTermInvestments",
+    "StockholdersEquity", "CommonStockEquity",
+]
 
-@st.cache_data(ttl=86400)  # cache universe for 24 hours
-def get_full_us_universe() -> list:
+_SECTOR_NORM_MAP = {
+    "Information Technology": "Technology",
+    "Technology": "Technology",
+    "Financials": "Financial Services",
+    "Finance": "Financial Services",
+    "Financial Services": "Financial Services",
+    "Health Care": "Healthcare",
+    "Healthcare": "Healthcare",
+    "Consumer Discretionary": "Consumer Cyclical",
+    "Consumer Cyclical": "Consumer Cyclical",
+    "Consumer Staples": "Consumer Defensive",
+    "Consumer Defensive": "Consumer Defensive",
+    "Industrials": "Industrials",
+    "Communication Services": "Communication Services",
+    "Telecommunications": "Communication Services",
+    "Energy": "Energy",
+    "Real Estate": "Real Estate",
+    "Materials": "Basic Materials",
+    "Basic Materials": "Basic Materials",
+    "Utilities": "Utilities",
+}
+
+
+def _normalize_sector(sec_str: str) -> str:
+    if not sec_str:
+        return "N/A"
+    s = str(sec_str).strip()
+    return _SECTOR_NORM_MAP.get(s, s if s not in ("", "Miscellaneous", "N/A") else "N/A")
+
+
+@st.cache_data(ttl=86400)
+def get_sp500_and_nasdaq_universe() -> tuple:
     """
-    Dynamically fetch combined US Stock Universe (SEC EDGAR + S&P 500 + NASDAQ/NYSE).
-    Returns a deduplicated, alphabetically sorted list of clean ticker symbols.
-    Falls back to _SP500_FALLBACK if online sources fail.
+    Fetch all S&P 500 + NASDAQ stocks and bulk metadata (name, market_cap, price, sector, industry).
+    Returns (sorted_tickers_list, metadata_dict).
     """
     import requests
-    from io import StringIO
     from bs4 import BeautifulSoup
-    tickers = set()
 
-    # 1. SEC EDGAR Official US Tickers API (~10,000 stocks)
+    wiki_headers = {"User-Agent": "StocksDashboard/1.0 (https://github.com/stocks-dashboard; contact@example.com)"}
+    nasdaq_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+
+    tickers = set()
+    meta = {}
+
+    # 1. Bulk metadata from official Nasdaq Screener API (all exchanges: NASDAQ + NYSE)
     try:
-        sec_url = "https://www.sec.gov/files/company_tickers.json"
-        resp_sec = requests.get(sec_url, headers={"User-Agent": "StocksDashboard app@example.com"}, timeout=10)
-        if resp_sec.status_code == 200:
-            data = resp_sec.json()
-            for v in data.values():
-                sym = str(v.get("ticker", "")).strip().upper().replace(".", "-")
-                if sym and len(sym) <= 5 and sym.replace("-", "").isalpha():
+        r_all = requests.get(
+            "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25&download=true",
+            headers=nasdaq_headers,
+            timeout=15
+        )
+        if r_all.status_code == 200:
+            rows = r_all.json().get("data", {}).get("rows", [])
+            for x in rows:
+                sym = str(x.get("symbol", "")).strip().upper().replace("/", "-").replace(".", "-")
+                if not sym or len(sym) > 5 or not sym.replace("-", "").isalpha():
+                    continue
+                try:
+                    mcap = float(str(x.get("marketCap", "0")).replace(",", ""))
+                except Exception:
+                    mcap = 0.0
+                try:
+                    price = float(str(x.get("lastsale", "0")).replace("$", "").replace(",", ""))
+                except Exception:
+                    price = 0.0
+                meta[sym] = {
+                    "name": str(x.get("name") or sym).replace(" Common Stock", "").replace(" Class A", "").strip(),
+                    "market_cap": mcap,
+                    "current_price": price,
+                    "sector": _normalize_sector(x.get("sector")),
+                    "industry": str(x.get("industry") or "N/A").strip(),
+                }
+    except Exception:
+        pass
+
+    # 2. All S&P 500 constituents from Wikipedia (~503 stocks)
+    try:
+        r_sp = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=wiki_headers, timeout=12)
+        if r_sp.status_code == 200:
+            soup = BeautifulSoup(r_sp.text, "html.parser")
+            table = soup.find("table", {"id": "constituents"})
+            if table:
+                for tr_row in table.find_all("tr")[1:]:
+                    tds = tr_row.find_all("td")
+                    if len(tds) >= 4:
+                        sym = tds[0].text.strip().upper().replace(".", "-")
+                        name = tds[1].text.strip()
+                        gics_sec = _normalize_sector(tds[2].text.strip())
+                        gics_ind = tds[3].text.strip()
+                        if sym:
+                            tickers.add(sym)
+                            if sym not in meta:
+                                meta[sym] = {
+                                    "name": name,
+                                    "market_cap": 0.0,
+                                    "current_price": 0.0,
+                                    "sector": gics_sec,
+                                    "industry": gics_ind,
+                                }
+                            else:
+                                if gics_sec != "N/A":
+                                    meta[sym]["sector"] = gics_sec
+                                if gics_ind:
+                                    meta[sym]["industry"] = gics_ind
+                                if name and len(name) < len(meta[sym].get("name", "")):
+                                    meta[sym]["name"] = name
+    except Exception:
+        pass
+
+    # 3. Official NASDAQ-100 constituents (~101 stocks)
+    try:
+        r_ndx = requests.get("https://api.nasdaq.com/api/quote/list-type/nasdaq100", headers=nasdaq_headers, timeout=10)
+        if r_ndx.status_code == 200:
+            rows = r_ndx.json().get("data", {}).get("data", {}).get("rows", [])
+            for x in rows:
+                sym = str(x.get("symbol", "")).strip().upper().replace(".", "-")
+                if sym:
                     tickers.add(sym)
     except Exception:
         pass
 
-    # 2. S&P 500 from Wikipedia (~503 stocks)
+    # 4. Established US NASDAQ-listed stocks (Market Cap >= $5B, excluding foreign-currency ADRs)
     try:
-        wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(wiki_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200:
-            try:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                table = soup.find("table", {"id": "constituents"})
-                if table:
-                    for tr in table.find_all("tr")[1:]:
-                        tds = tr.find_all("td")
-                        if tds:
-                            sym = tds[0].text.strip().upper().replace(".", "-")
-                            if sym:
-                                tickers.add(sym)
-            except Exception:
-                tables = pd.read_html(StringIO(resp.text))
-                sp500_df = tables[0]
-                col = "Symbol" if "Symbol" in sp500_df.columns else sp500_df.columns[0]
-                for s in sp500_df[col].dropna().tolist():
-                    tickers.add(str(s).strip().replace(".", "-"))
+        r_nq = requests.get(
+            "https://api.nasdaq.com/api/screener/stocks?tableonly=true&exchange=NASDAQ&download=true",
+            headers=nasdaq_headers,
+            timeout=15
+        )
+        if r_nq.status_code == 200:
+            rows = r_nq.json().get("data", {}).get("rows", [])
+            for x in rows:
+                sym = str(x.get("symbol", "")).strip().upper().replace("/", "-").replace(".", "-")
+                if not sym or len(sym) > 5 or not sym.replace("-", "").isalpha():
+                    continue
+                if len(sym) == 5 and sym[-1] in {"W", "R", "U", "P", "Y", "F"}:
+                    continue
+                raw_name = str(x.get("name") or "")
+                if "Depositary" in raw_name or " ADR" in raw_name or " ADS" in raw_name:
+                    continue
+                country = str(x.get("country") or "").strip()
+                if country and country not in ("United States", "USA", ""):
+                    continue
+                try:
+                    mcap = float(str(x.get("marketCap", "0")).replace(",", ""))
+                except Exception:
+                    mcap = 0.0
+                if mcap >= 5_000_000_000:  # >= $5B market cap NASDAQ companies
+                    tickers.add(sym)
     except Exception:
         pass
 
-    # 3. Full NASDAQ listed FTP
-    try:
-        nasdaq_url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-        resp2 = requests.get(nasdaq_url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-        if resp2.status_code == 200:
-            for line in resp2.text.splitlines()[1:]:
-                parts = line.split("|")
-                if len(parts) >= 2:
-                    sym = parts[0].strip()
-                    if sym and sym != "Symbol" and len(sym) <= 5:
-                        tickers.add(sym)
-    except Exception:
-        pass
-
-    # Fallback if fetched < 50 items
-    if len(tickers) < 50:
+    # Ensure fallback S&P 500 + NASDAQ leaders are always included
+    if len(tickers) < 200:
         tickers.update(_SP500_FALLBACK)
+    else:
+        for s in _SP500_FALLBACK:
+            tickers.add(s)
 
-    _bad = {"TEST", "ZZZZ", "ZVZZT", "ZAZZT", "ZBZZT", "ZCZZT"}
-    clean_universe = []
-    for t in tickers:
-        if not t or len(t) > 5 or t in _bad:
-            continue
-        if not t.replace("-", "").isalpha():
-            continue
-        # Exclude 5-letter tickers ending in W (warrants), R (rights), U (units), P (preferreds)
-        if len(t) == 5 and t[-1] in {"W", "R", "U", "P"}:
-            continue
-        clean_universe.append(t)
-    return sorted(clean_universe)
+    _bad = {"TEST", "ZZZZ", "ZVZZT", "ZAZZT", "ZBZZT", "ZCZZT", "GOOG", "FOX", "NWS"}
+    clean_universe = [
+        t for t in sorted(tickers)
+        if t and len(t) <= 5 and t not in _bad and t.replace("-", "").isalpha()
+    ]
+    return clean_universe, meta
 
 
 def _get_screener_universe() -> list:
-    """Return full universe, falling back to static list on error."""
     try:
-        u = get_full_us_universe()
-        if u and len(u) >= 100:
+        u, _ = get_sp500_and_nasdaq_universe()
+        if u:
             return u
     except Exception:
         pass
-    return _SP500_FALLBACK
+    return sorted(list(set(_SP500_FALLBACK)))
 
 
-# ── New Screener Scoring Weights (must sum to 1.0) ────────────────────────────
-# Each criterion is evaluated via percentile rank across the universe,
+# ── 15-Metric Financial Statements Weights (Sum = 1.00) ───────────────────────
+# Covers every metric in Tab 2 (📊 Financial Statements):
+# Group A: Income Statement Metrics (55% total)
+# Group B: Cash Flow & Balance Sheet Metrics (45% total)
 METRIC_WEIGHTS = {
-    "revenue_growth":       0.20,  # YoY revenue growth (strongest = best)
-    "earnings_growth":      0.20,  # YoY net income / EPS growth
-    "profit_margins":       0.15,  # Combined: gross + operating + net margin
-    "fcf_growth_score":     0.15,  # FCF growing over time (trend score)
-    "buyback_score":        0.10,  # Share count shrinking = positive
-    "low_leverage_score":   0.10,  # Low debt-to-assets = positive
-    "balance_strength":     0.10,  # Assets >> Liabilities ratio
+    # ── Income Statement Metrics (55%) ──────────────────────────────────────
+    "rev_score_raw":        0.09,  # 1. Total Revenue (Scale + YoY growth + 3Y CAGR + consistency)
+    "gp_score_raw":         0.07,  # 2. Gross Profit (Scale + YoY growth + multi-year expansion)
+    "ni_op_score_raw":      0.10,  # 3. Net Income & Operating Income (Scale + growth & consistency)
+    "cost_to_revenue_pct":  0.05,  # 4. Cost of Revenue (% of Revenue — inverted: lower is better)
+    "gross_margin":         0.07,  # 5. Gross Margin %
+    "profit_margins":       0.08,  # 6. Profit Margin % (Operating Margin % + Net Margin %)
+    "eps_score_raw":        0.05,  # 7. Diluted EPS (Level + YoY growth + multi-year trend)
+    "buyback_score":        0.04,  # 8. Shares Outstanding (Buybacks / shrinking share count)
+    # ── Cash Flow & Balance Sheet Metrics (45%) ─────────────────────────────
+    "fcf_score_raw":        0.10,  # 9. Free Cash Flow (Scale + FCF Margin % + FCF Growth)
+    "ocf_score_raw":        0.08,  # 10. Operating Cash Flow (Scale + OCF Margin % + OCF Growth)
+    "assets_return_raw":    0.06,  # 11. Total Assets (Scale + ROA % + ROE % + Asset growth)
+    "balance_ratio":        0.05,  # 12. Total Liabilities coverage (Assets / Liabilities)
+    "debt_payoff_raw":      0.05,  # 13. Total Debt vs FCF / Net Debt strength
+    "cash_strength_raw":    0.05,  # 14. Cash on Hand (Scale + Cash / Debt & Cash % of Assets)
+    "leverage_composite":   0.06,  # 15. Leverage Ratios (Debt/Assets % + Liab/Assets % — inverted)
 }
 
 
@@ -3632,238 +3759,542 @@ def _safe_metric(info, key, multiplier=100.0):
     return round(v * multiplier, 2)
 
 
-def _compute_fcf_growth_score(cashflow_df):
+def _extract_ts_series(df: pd.DataFrame, candidates: list) -> list:
     """
-    Return a trend score for FCF growth.
-    Uses the annual cashflow DataFrame (rows=metrics, cols=dates).
-    Score: % of consecutive year-pairs where FCF increased.
-    Returns None if insufficient data.
+    Extract chronological list of float values [oldest, ..., newest]
+    from a Yahoo Finance timeseries DataFrame for the first matching row.
     """
+    if df is None or df.empty:
+        return []
+    for name in candidates:
+        if name in df.index:
+            s = df.loc[name].dropna().sort_index()
+            vals = [_safe_float(v) for v in s.values]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                return vals
+    return []
+
+
+def _calc_yoy_growth(vals: list, clip_min=-90.0, clip_max=250.0):
+    """Compute YoY growth % from chronological series [..., prev, latest]."""
+    if not vals or len(vals) < 2:
+        return None
+    prev, curr = vals[-2], vals[-1]
+    if prev == 0:
+        return None
+    if prev < 0 and curr < 0:
+        return -40.0
+    if prev < 0 and curr > 0:
+        return 60.0
+    if prev > 0 and curr < 0:
+        return -75.0
+    pct = ((curr - prev) / abs(prev)) * 100.0
+    return round(pct, 2)
+
+
+def _calc_cagr_and_consistency(vals: list):
+    """
+    Compute multi-year CAGR % and consistency (0-100 % of years with growth)
+    from chronological series [oldest, ..., newest].
+    """
+    if not vals or len(vals) < 2:
+        return None, None
+    n = len(vals) - 1
+    up_years = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i - 1] and vals[i] > 0)
+    consistency = round((up_years / n) * 100.0, 1)
+    first, last = vals[0], vals[-1]
+    cagr = None
+    if first > 0 and last > 0 and n >= 1:
+        try:
+            cagr = round(((last / first) ** (1.0 / n) - 1.0) * 100.0, 2)
+        except Exception:
+            cagr = None
+    return cagr, consistency
+
+
+def _clip(val, low, high):
+    if val is None:
+        return None
+    return max(low, min(high, val))
+
+
+def _log_scale_score(dollar_val: float, min_exp=8.5, max_exp=11.5) -> float:
+    """Map a positive dollar figure ($300M..$300B+) onto a 0..100 log10 scale."""
     import math
-    try:
-        if cashflow_df is None or cashflow_df.empty:
-            return None
-        cf_cols = [c for c in cashflow_df.columns if 'free cash flow' in str(c).lower()]
-        if not cf_cols:
-            # Try row-based (transposed)
-            if 'Free Cash Flow' not in cashflow_df.index:
-                return None
-            fcf_series = cashflow_df.loc['Free Cash Flow'].dropna().sort_index()
-        else:
-            fcf_series = cashflow_df[cf_cols[0]].dropna().sort_index()
+    if not dollar_val or dollar_val <= 0:
+        return 0.0
+    lg = math.log10(max(1.0, dollar_val))
+    return max(0.0, min(100.0, ((lg - min_exp) / (max_exp - min_exp)) * 100.0))
 
-        vals = [_safe_float(v) for v in fcf_series.values]
-        vals = [v for v in vals if v is not None and v != 0]
-        if len(vals) < 2:
-            return None
-        improvements = sum(1 for i in range(1, len(vals)) if vals[i] > vals[i - 1])
-        return round((improvements / (len(vals) - 1)) * 100, 1)
-    except Exception:
+
+def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = None, yf_info: dict = None):
+    """
+    Extract all 15 Financial Statements metrics (Income Statement + Cash Flow + Balance Sheet)
+    from the multi-year timeseries DataFrame (with fallback to yf_info).
+    """
+    meta_info = meta_info or {}
+    yf_info = yf_info or {}
+
+    raw_name = str(meta_info.get("name") or yf_info.get("longName") or "")
+    if "Depositary" in raw_name or " ADR" in raw_name or " ADS" in raw_name:
         return None
 
+    # ── 1. Total Revenue ────────────────────────────────────────────────────
+    rev_vals = _extract_ts_series(ts_df, ["TotalRevenue"])
+    total_revenue = rev_vals[-1] if rev_vals else _safe_float(yf_info.get("totalRevenue"))
+    revenue_growth = _calc_yoy_growth(rev_vals)
+    if revenue_growth is None:
+        revenue_growth = _safe_metric(yf_info, "revenueGrowth")
+    revenue_cagr, rev_consistency = _calc_cagr_and_consistency(rev_vals)
 
-def _compute_buyback_score(balance_sheet_df):
-    """
-    Return a buyback score based on whether shares outstanding are shrinking.
-    Uses annual balance sheet. Score: % of consecutive year-pairs where shares decreased.
-    Returns None if insufficient data. Higher is better (more buybacks).
-    """
-    try:
-        if balance_sheet_df is None or balance_sheet_df.empty:
-            return None
-        share_row = None
-        for candidate in ['Ordinary Shares Number', 'Share Issued', 'Common Stock Equity']:
-            if candidate in balance_sheet_df.index:
-                share_row = candidate
-                break
-        if share_row is None:
-            return None
-        series = balance_sheet_df.loc[share_row].dropna().sort_index()
-        vals = [_safe_float(v) for v in series.values]
-        vals = [v for v in vals if v is not None and v > 0]
-        if len(vals) < 2:
-            return None
-        reductions = sum(1 for i in range(1, len(vals)) if vals[i] < vals[i - 1])
-        return round((reductions / (len(vals) - 1)) * 100, 1)
-    except Exception:
+    # Require meaningful revenue (>= $500M) for S&P 500 & NASDAQ institutional quality
+    if not total_revenue or total_revenue < 500_000_000:
         return None
 
+    # ── 2. Cost of Revenue & 3. Gross Profit ────────────────────────────────
+    cost_vals = _extract_ts_series(ts_df, ["CostOfRevenue", "ReconciledCostOfRevenue"])
+    gp_vals = _extract_ts_series(ts_df, ["GrossProfit"])
 
-def score_single_stock(sym, info, cashflow_df=None, balance_sheet_df=None):
-    """Extract and compute raw financial metrics for a stock."""
-    revenue     = _safe_float(info.get("totalRevenue"))
-    fcf         = _safe_float(info.get("freeCashflow"))
+    cost_of_revenue = cost_vals[-1] if cost_vals else None
+    gross_profit = gp_vals[-1] if gp_vals else _safe_float(yf_info.get("grossProfits"))
 
-    # ── Extract balance sheet figures (from info or annual balance sheet) ──
-    total_debt   = _safe_float(info.get("totalDebt"))
-    total_assets = _safe_float(info.get("totalAssets"))
-    total_liab   = _safe_float(info.get("totalLiab")) or _safe_float(info.get("totalLiabilities"))
+    if gross_profit is None and total_revenue is not None and cost_of_revenue is not None:
+        gross_profit = total_revenue - cost_of_revenue
+    if cost_of_revenue is None and total_revenue is not None and gross_profit is not None:
+        cost_of_revenue = max(0.0, total_revenue - gross_profit)
 
-    # Fallback: extract from the balance sheet DataFrame (most reliable source)
-    if balance_sheet_df is not None and not balance_sheet_df.empty:
-        bs = balance_sheet_df
-        def _bs_val(candidates):
-            for c in candidates:
-                if c in bs.index:
-                    vals = [_safe_float(v) for v in bs.loc[c].dropna().values]
-                    vals = [v for v in vals if v is not None and v > 0]
-                    if vals:
-                        return vals[0]  # most recent year
-            return None
-        if total_assets is None:
-            total_assets = _bs_val(["Total Assets", "TotalAssets"])
-        if total_liab is None:
-            total_liab = _bs_val([
-                "Total Liabilities Net Minority Interest",
-                "Total Liabilities",
-                "TotalLiabilitiesNetMinorityInterest",
-            ])
-        if total_debt is None:
-            total_debt = _bs_val(["Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt"])
+    gross_profit_growth = _calc_yoy_growth(gp_vals)
+    if gross_profit_growth is None and revenue_growth is not None:
+        gross_profit_growth = revenue_growth
+    gp_cagr, gp_consistency = _calc_cagr_and_consistency(gp_vals)
 
-    # ── FCF margin (for display only, not scoring) ────────────────────────
-    fcf_margin = None
-    try:
-        if revenue and fcf and revenue > 0:
-            fcf_margin = round((fcf / revenue) * 100, 2)
-    except Exception:
-        pass
+    cost_to_revenue_pct = None
+    if cost_of_revenue is not None and total_revenue > 0:
+        cost_to_revenue_pct = round((cost_of_revenue / total_revenue) * 100.0, 2)
+    elif yf_info.get("grossMargins") is not None:
+        gm_raw = _safe_float(yf_info.get("grossMargins"))
+        if gm_raw is not None:
+            cost_to_revenue_pct = round((1.0 - gm_raw) * 100.0, 2)
 
-    # ── Profit Margins composite (gross + operating + net, equal weight) ──
-    gross  = _safe_float(info.get("grossMargins"))
-    op     = _safe_float(info.get("operatingMargins"))
-    net    = _safe_float(info.get("profitMargins"))
-    margin_vals = [v * 100 for v in [gross, op, net] if v is not None]
-    profit_margins = round(sum(margin_vals) / len(margin_vals), 2) if margin_vals else None
+    cost_efficiency_change = None
+    if len(cost_vals) >= 2 and len(rev_vals) >= 2 and rev_vals[-2] > 0 and rev_vals[-1] > 0:
+        prev_cr = (cost_vals[-2] / rev_vals[-2]) * 100.0
+        curr_cr = (cost_vals[-1] / rev_vals[-1]) * 100.0
+        cost_efficiency_change = round(curr_cr - prev_cr, 2)  # negative = cost ratio improved!
 
-    # ── Low leverage score: debt-to-assets ratio (lower = better) ─────────
-    debt_ratio = None
-    if total_assets and total_assets > 0 and total_debt is not None:
-        debt_ratio = round((total_debt / total_assets) * 100, 2)
+    # ── 4. Operating Income & 5. Net Income ─────────────────────────────────
+    op_vals = _extract_ts_series(ts_df, ["OperatingIncome", "TotalOperatingIncomeAsReported", "EBIT"])
+    ni_vals = _extract_ts_series(ts_df, ["NetIncome", "NetIncomeCommonStockholders"])
 
-    # ── Balance strength: assets-to-liabilities ratio ─────────────────────
+    operating_income = op_vals[-1] if op_vals else None
+    net_income = ni_vals[-1] if ni_vals else _safe_float(yf_info.get("netIncomeToCommon"))
+
+    op_income_growth = _calc_yoy_growth(op_vals)
+    earnings_growth = _calc_yoy_growth(ni_vals)
+    if earnings_growth is None:
+        earnings_growth = _safe_metric(yf_info, "earningsGrowth")
+    ni_cagr, ni_consistency = _calc_cagr_and_consistency(ni_vals)
+    op_cagr, op_consistency = _calc_cagr_and_consistency(op_vals)
+
+    # ── 5 & 6. Gross Margin %, Operating Margin %, Net Profit Margin % ──────
+    gross_margin = round((gross_profit / total_revenue) * 100.0, 2) if (gross_profit is not None and total_revenue > 0) else _safe_metric(yf_info, "grossMargins")
+    operating_margin = round((operating_income / total_revenue) * 100.0, 2) if (operating_income is not None and total_revenue > 0) else _safe_metric(yf_info, "operatingMargins")
+    net_margin = round((net_income / total_revenue) * 100.0, 2) if (net_income is not None and total_revenue > 0) else _safe_metric(yf_info, "profitMargins")
+
+    # Guard against one-time tax benefit distorting Net Margin above Operating Margin
+    eff_net_margin = net_margin
+    if net_margin is not None and operating_margin is not None and net_margin > operating_margin + 12.0:
+        eff_net_margin = operating_margin
+
+    pm_parts = [v for v in [operating_margin, eff_net_margin] if v is not None]
+    profit_margins = round(sum(pm_parts) / len(pm_parts), 2) if pm_parts else None
+
+    # ── 7. Diluted EPS ──────────────────────────────────────────────────────
+    eps_vals = _extract_ts_series(ts_df, ["DilutedEPS", "BasicEPS"])
+    diluted_eps = eps_vals[-1] if eps_vals else _safe_float(yf_info.get("trailingEps"))
+    eps_growth = _calc_yoy_growth(eps_vals)
+    if eps_growth is None:
+        eps_growth = earnings_growth
+    eps_cagr, eps_consistency = _calc_cagr_and_consistency(eps_vals)
+
+    # ── 8. Shares Outstanding (Buybacks vs Dilution) ────────────────────────
+    sh_vals = _extract_ts_series(ts_df, ["DilutedAverageShares", "OrdinarySharesNumber", "ShareIssued", "BasicAverageShares"])
+    shares_outstanding = sh_vals[-1] if sh_vals else _safe_float(yf_info.get("sharesOutstanding"))
+    share_change_pct = None
+    buyback_score = None
+    if len(sh_vals) >= 2 and sh_vals[0] > 0 and sh_vals[-1] > 0:
+        n_sh = len(sh_vals) - 1
+        share_change_pct = round(((sh_vals[-1] / sh_vals[0]) ** (1.0 / n_sh) - 1.0) * 100.0, 2)
+        reductions = sum(1 for i in range(1, len(sh_vals)) if sh_vals[i] < sh_vals[i - 1])
+        freq_score = (reductions / n_sh) * 100.0
+        rate_score = max(0.0, min(100.0, 65.0 - share_change_pct * 9.0))
+        buyback_score = round(0.5 * freq_score + 0.5 * rate_score, 1)
+
+    # ── 9. Free Cash Flow & 10. Operating Cash Flow ─────────────────────────
+    fcf_vals = _extract_ts_series(ts_df, ["FreeCashFlow"])
+    ocf_vals = _extract_ts_series(ts_df, ["OperatingCashFlow"])
+    capex_vals = _extract_ts_series(ts_df, ["CapitalExpenditure"])
+
+    operating_cash_flow = ocf_vals[-1] if ocf_vals else _safe_float(yf_info.get("operatingCashflow"))
+    free_cash_flow = fcf_vals[-1] if fcf_vals else _safe_float(yf_info.get("freeCashflow"))
+    if free_cash_flow is None and operating_cash_flow is not None and capex_vals:
+        free_cash_flow = operating_cash_flow - abs(capex_vals[-1])
+
+    fcf_margin = round((free_cash_flow / total_revenue) * 100.0, 2) if (free_cash_flow is not None and total_revenue > 0) else None
+    ocf_margin = round((operating_cash_flow / total_revenue) * 100.0, 2) if (operating_cash_flow is not None and total_revenue > 0) else None
+
+    fcf_growth = _calc_yoy_growth(fcf_vals)
+    ocf_growth = _calc_yoy_growth(ocf_vals)
+    fcf_cagr, fcf_consistency = _calc_cagr_and_consistency(fcf_vals)
+    ocf_cagr, ocf_consistency = _calc_cagr_and_consistency(ocf_vals)
+    fcf_growth_score = fcf_consistency
+
+    # ── 11. Total Assets & 12. Total Liabilities ────────────────────────────
+    assets_vals = _extract_ts_series(ts_df, ["TotalAssets"])
+    liab_vals = _extract_ts_series(ts_df, ["TotalLiabilitiesNetMinorityInterest"])
+    eq_vals = _extract_ts_series(ts_df, ["StockholdersEquity", "CommonStockEquity"])
+
+    total_assets = assets_vals[-1] if assets_vals else _safe_float(yf_info.get("totalAssets"))
+    total_liabilities = liab_vals[-1] if liab_vals else _safe_float(yf_info.get("totalLiab"))
+    stockholders_equity = eq_vals[-1] if eq_vals else (
+        (total_assets - total_liabilities) if (total_assets is not None and total_liabilities is not None) else None
+    )
+
+    assets_growth = _calc_yoy_growth(assets_vals)
+    roa = round((net_income / total_assets) * 100.0, 2) if (net_income is not None and total_assets and total_assets > 0) else _safe_metric(yf_info, "returnOnAssets")
+    roe = round((net_income / stockholders_equity) * 100.0, 2) if (net_income is not None and stockholders_equity and stockholders_equity > 0) else _safe_metric(yf_info, "returnOnEquity")
+
     balance_ratio = None
-    if total_assets and total_assets > 0 and total_liab and total_liab > 0:
+    if total_assets and total_assets > 0 and total_liabilities and total_liabilities > 0:
+        balance_ratio = round(total_assets / total_liabilities, 2)
 
-        balance_ratio = round(total_assets / total_liab, 4)
+    # ── 13. Total Debt & 14. Cash on Hand ───────────────────────────────────
+    debt_vals = _extract_ts_series(ts_df, ["TotalDebt", "LongTermDebt"])
+    cash_vals = _extract_ts_series(ts_df, ["CashCashEquivalentsAndShortTermInvestments", "CashAndCashEquivalents"])
 
-    # ── FCF growth trend (from annual cashflow) ───────────────────────────
-    fcf_growth_score = _compute_fcf_growth_score(cashflow_df)
+    total_debt = debt_vals[-1] if debt_vals else (_safe_float(yf_info.get("totalDebt")) or 0.0)
+    total_cash = cash_vals[-1] if cash_vals else (_safe_float(yf_info.get("totalCash")) or 0.0)
+    net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else None
 
-    # ── Buyback score (from annual balance sheet) ─────────────────────────
-    buyback_score = _compute_buyback_score(balance_sheet_df)
+    cash_to_debt = None
+    if total_cash is not None and total_debt is not None:
+        if total_debt <= 0 and total_cash > 0:
+            cash_to_debt = 10.0
+        elif total_debt > 0:
+            cash_to_debt = round(min(10.0, total_cash / total_debt), 2)
+
+    cash_to_assets_pct = round((total_cash / total_assets) * 100.0, 2) if (total_cash is not None and total_assets and total_assets > 0) else None
+
+    # ── 15. Leverage Ratios (Liabilities/Assets %, Debt/Assets %, Debt/Equity)
+    liab_to_assets_pct = round((total_liabilities / total_assets) * 100.0, 2) if (total_liabilities is not None and total_assets and total_assets > 0) else None
+    debt_ratio = round((total_debt / total_assets) * 100.0, 2) if (total_debt is not None and total_assets and total_assets > 0) else None
+    debt_to_equity = round(total_debt / stockholders_equity, 2) if (total_debt is not None and stockholders_equity and stockholders_equity > 0) else None
+
+    # ── Composite Raw Signals (Blending Scale + Multi-Year Growth + Consistency)
+    def _blend_growth_and_scale(yoy, cagr, cons, dollar_val, min_e=8.7, max_e=11.5):
+        g_parts = []
+        if yoy is not None:
+            g_parts.append(_clip(yoy, -50.0, 80.0) * 0.45)
+        if cagr is not None:
+            g_parts.append(_clip(cagr, -40.0, 65.0) * 0.35)
+        if cons is not None:
+            g_parts.append(cons * 0.20)
+        g_sc = sum(g_parts) if g_parts else 0.0
+        s_sc = _log_scale_score(dollar_val, min_e, max_e)
+        return round(0.65 * g_sc + 0.35 * s_sc, 2)
+
+    rev_score_raw = _blend_growth_and_scale(revenue_growth, revenue_cagr, rev_consistency, total_revenue, 9.0, 11.6)
+    gp_score_raw = _blend_growth_and_scale(gross_profit_growth, gp_cagr, gp_consistency, gross_profit, 8.7, 11.3)
+
+    ni_blend = _blend_growth_and_scale(earnings_growth, ni_cagr, ni_consistency, net_income, 8.3, 11.0)
+    op_blend = _blend_growth_and_scale(op_income_growth, op_cagr, op_consistency, operating_income, 8.3, 11.0)
+    ni_op_parts = [v for v in [ni_blend, op_blend] if v is not None]
+    ni_op_score_raw = round(sum(ni_op_parts) / len(ni_op_parts), 2) if ni_op_parts else None
+
+    eps_score_raw = None
+    if eps_growth is not None or diluted_eps is not None:
+        eps_g = _clip(eps_growth or 0.0, -50.0, 85.0) * 0.50 + _clip(eps_cagr or 0.0, -40.0, 65.0) * 0.30 + (eps_consistency or 50.0) * 0.20
+        eps_lvl = _clip((diluted_eps or 0.0) * 4.0, 0.0, 40.0)
+        eps_score_raw = round(0.75 * eps_g + 0.25 * eps_lvl, 2)
+
+    fcf_g_blend = _blend_growth_and_scale(fcf_growth, fcf_cagr, fcf_consistency, free_cash_flow, 8.3, 11.0)
+    fcf_score_raw = None
+    if fcf_margin is not None or fcf_g_blend is not None:
+        fcf_score_raw = round(
+            (_clip(fcf_margin or 0.0, -25.0, 50.0) * 0.45) + ((fcf_g_blend or 0.0) * 0.55),
+            2
+        )
+
+    ocf_g_blend = _blend_growth_and_scale(ocf_growth, ocf_cagr, ocf_consistency, operating_cash_flow, 8.5, 11.1)
+    ocf_score_raw = None
+    if ocf_margin is not None or ocf_g_blend is not None:
+        ocf_score_raw = round(
+            (_clip(ocf_margin or 0.0, -25.0, 55.0) * 0.45) + ((ocf_g_blend or 0.0) * 0.55),
+            2
+        )
+
+    assets_return_raw = None
+    if roa is not None or roe is not None:
+        assets_return_raw = round(
+            (_clip(roa or 0.0, -20.0, 40.0) * 0.45) +
+            (_clip(roe or 0.0, -30.0, 75.0) * 0.35) +
+            (_log_scale_score(total_assets, 9.0, 11.6) * 0.20),
+            2
+        )
+
+    debt_payoff_raw = None
+    if total_debt is not None:
+        if total_debt <= 0:
+            debt_payoff_raw = 100.0
+        elif free_cash_flow and free_cash_flow > 0:
+            debt_payoff_raw = round(_clip((free_cash_flow / total_debt) * 100.0, -50.0, 150.0), 2)
+        else:
+            debt_payoff_raw = -25.0
+
+    cash_strength_raw = None
+    if cash_to_debt is not None or cash_to_assets_pct is not None:
+        cash_strength_raw = round(
+            ((cash_to_debt or 0.0) * 6.0) +
+            (_clip(cash_to_assets_pct or 0.0, 0.0, 50.0) * 0.45) +
+            (_log_scale_score(total_cash, 8.5, 11.0) * 0.35),
+            2
+        )
+
+    leverage_composite = None
+    if debt_ratio is not None or liab_to_assets_pct is not None:
+        dr = debt_ratio if debt_ratio is not None else 40.0
+        lr = liab_to_assets_pct if liab_to_assets_pct is not None else 55.0
+        leverage_composite = round(0.55 * dr + 0.45 * lr, 2)  # lower is better
+
+    price = meta_info.get("current_price") or _safe_float(yf_info.get("currentPrice")) or _safe_float(yf_info.get("regularMarketPrice")) or 0.0
+    mcap = meta_info.get("market_cap") or _safe_float(yf_info.get("marketCap")) or 0.0
 
     return {
-        "ticker":            sym,
-        "name":              info.get("longName") or info.get("shortName") or sym,
-        "sector":            info.get("sector", "N/A"),
-        "industry":          info.get("industry", "N/A"),
-        "market_cap":        info.get("marketCap", 0) or 0,
-        "current_price":     info.get("currentPrice") or info.get("regularMarketPrice") or 0,
-        "currency":          info.get("currency", "USD"),
-        # ── Scoring metrics ──────────────────────────────────────────────
-        "revenue_growth":    _safe_metric(info, "revenueGrowth"),          # % YoY
-        "earnings_growth":   _safe_metric(info, "earningsGrowth"),         # % YoY
-        "profit_margins":    profit_margins,                                # avg margin %
-        "fcf_growth_score":  fcf_growth_score,                             # 0-100, % years FCF grew
-        "buyback_score":     buyback_score,                                 # 0-100, % years shares shrank
-        "debt_ratio":        debt_ratio,                                    # % (lower=better, inverted in scoring)
-        "balance_ratio":     balance_ratio,                                 # assets/liabilities (higher=better)
-        # ── Display-only metrics ─────────────────────────────────────────
-        "gross_margin":      _safe_metric(info, "grossMargins"),
-        "operating_margin":  _safe_metric(info, "operatingMargins"),
-        "net_margin":        _safe_metric(info, "profitMargins"),
-        "roe":               _safe_metric(info, "returnOnEquity"),
-        "fcf_margin":        fcf_margin,
-        "composite_score":   0,
+        "ticker":                 sym,
+        "name":                   meta_info.get("name") or yf_info.get("longName") or yf_info.get("shortName") or sym,
+        "sector":                 _normalize_sector(meta_info.get("sector") or yf_info.get("sector")),
+        "industry":               meta_info.get("industry") or yf_info.get("industry") or "N/A",
+        "market_cap":             mcap,
+        "current_price":          price,
+        "currency":               "USD",
+        # ── 8 Income Statement Metrics ────────────────────────────────────────
+        "total_revenue":          total_revenue,
+        "revenue_growth":         revenue_growth,
+        "revenue_cagr":           revenue_cagr,
+        "gross_profit":           gross_profit,
+        "gross_profit_growth":    gross_profit_growth,
+        "operating_income":       operating_income,
+        "op_income_growth":       op_income_growth,
+        "net_income":             net_income,
+        "earnings_growth":        earnings_growth,
+        "cost_of_revenue":        cost_of_revenue,
+        "cost_to_revenue_pct":    cost_to_revenue_pct,
+        "cost_efficiency_change": cost_efficiency_change,
+        "gross_margin":           gross_margin,
+        "operating_margin":       operating_margin,
+        "net_margin":             net_margin,
+        "profit_margins":         profit_margins,
+        "diluted_eps":            diluted_eps,
+        "eps_growth":             eps_growth,
+        "shares_outstanding":     shares_outstanding,
+        "share_change_pct":       share_change_pct,
+        "buyback_score":          buyback_score,
+        # ── 7 Cash Flow & Balance Sheet Metrics ──────────────────────────────
+        "free_cash_flow":         free_cash_flow,
+        "fcf_margin":             fcf_margin,
+        "fcf_growth":             fcf_growth,
+        "fcf_growth_score":       fcf_growth_score,
+        "operating_cash_flow":    operating_cash_flow,
+        "ocf_margin":             ocf_margin,
+        "ocf_growth":             ocf_growth,
+        "total_assets":           total_assets,
+        "assets_growth":          assets_growth,
+        "roa":                    roa,
+        "roe":                    roe,
+        "total_liabilities":      total_liabilities,
+        "balance_ratio":          balance_ratio,
+        "total_debt":             total_debt,
+        "net_debt":               net_debt,
+        "total_cash":             total_cash,
+        "cash_to_debt":           cash_to_debt,
+        "cash_to_assets_pct":     cash_to_assets_pct,
+        "liab_to_assets_pct":     liab_to_assets_pct,
+        "debt_ratio":             debt_ratio,
+        "debt_to_equity":         debt_to_equity,
+        # ── Internal Scoring Signals ─────────────────────────────────────────
+        "rev_score_raw":          rev_score_raw,
+        "gp_score_raw":           gp_score_raw,
+        "ni_op_score_raw":        ni_op_score_raw,
+        "eps_score_raw":          eps_score_raw,
+        "fcf_score_raw":          fcf_score_raw,
+        "ocf_score_raw":          ocf_score_raw,
+        "assets_return_raw":      assets_return_raw,
+        "debt_payoff_raw":        debt_payoff_raw,
+        "cash_strength_raw":      cash_strength_raw,
+        "leverage_composite":     leverage_composite,
+        # ── Final Category & Composite Scores (0-100) ────────────────────────
+        "income_score":           0.0,
+        "cashflow_score":         0.0,
+        "balance_sheet_score":    0.0,
+        "composite_score":        0.0,
     }
 
 
-def _percentile_score(all_values, target, invert=False):
+def _percentile_score(sorted_valid: list, target, invert=False) -> float:
     """
-    Return 0-100 percentile score of target within a list (None-safe).
-    If invert=True, lower values score higher (used for debt ratio).
+    Fast O(log N) percentile score (0-100) of target within a sorted list of valid values.
+    If invert=True, lower values score higher (used for Cost/Rev % and Leverage Ratios).
     """
-    valid = [v for v in all_values if v is not None]
-    if not valid or target is None:
-        return 50.0
-    below = sum(1 for v in valid if v <= target)
-    pct = round((below / len(valid)) * 100, 1)
-    return (100.0 - pct) if invert else pct
+    import bisect
+    if not sorted_valid or target is None:
+        return 45.0
+    idx = bisect.bisect_right(sorted_valid, target)
+    pct = (idx / len(sorted_valid)) * 100.0
+    res = (100.0 - pct) if invert else pct
+    return round(res, 1)
 
 
-def _compute_all_scores(rows):
+def _compute_all_scores(rows: list) -> list:
     """
-    Compute percentile-based composite scores.
-    Uses METRIC_WEIGHTS. debt_ratio is inverted (lower=better).
-    low_leverage_score and balance_strength are mapped from debt_ratio/balance_ratio.
+    Compute percentile-based sub-scores (Income Statement, Cash Flow, Balance Sheet)
+    and overall Composite Score across all 15 Financial Statements metrics.
     """
-    # Map internal fields to scoring keys
-    field_map = {
-        "revenue_growth":     ("revenue_growth",   False),
-        "earnings_growth":    ("earnings_growth",  False),
-        "profit_margins":     ("profit_margins",   False),
-        "fcf_growth_score":   ("fcf_growth_score", False),
-        "buyback_score":      ("buyback_score",    False),
-        "low_leverage_score": ("debt_ratio",       True),   # inverted: lower debt = better
-        "balance_strength":   ("balance_ratio",    False),  # higher assets/liab = better
+    if not rows:
+        return rows
+
+    field_specs = {
+        # Income Statement (weight sum = 0.55)
+        "rev_score_raw":       ("rev_score_raw",       False, "inc", 0.09),
+        "gp_score_raw":        ("gp_score_raw",        False, "inc", 0.07),
+        "ni_op_score_raw":     ("ni_op_score_raw",     False, "inc", 0.10),
+        "cost_to_revenue_pct": ("cost_to_revenue_pct", True,  "inc", 0.05),  # Lower Cost/Rev % is better
+        "gross_margin":        ("gross_margin",        False, "inc", 0.07),
+        "profit_margins":      ("profit_margins",      False, "inc", 0.08),
+        "eps_score_raw":       ("eps_score_raw",       False, "inc", 0.05),
+        "buyback_score":       ("buyback_score",       False, "inc", 0.04),
+        # Cash Flow (weight sum = 0.18)
+        "fcf_score_raw":       ("fcf_score_raw",       False, "cf",  0.10),
+        "ocf_score_raw":       ("ocf_score_raw",       False, "cf",  0.08),
+        # Balance Sheet & Leverage (weight sum = 0.27)
+        "assets_return_raw":   ("assets_return_raw",   False, "bs",  0.06),
+        "balance_ratio":       ("balance_ratio",       False, "bs",  0.05),
+        "debt_payoff_raw":     ("debt_payoff_raw",     False, "bs",  0.05),
+        "cash_strength_raw":   ("cash_strength_raw",   False, "bs",  0.05),
+        "leverage_composite":  ("leverage_composite",  True,  "bs",  0.06),  # Lower leverage is better
     }
 
-    for weight_key, (field, invert) in field_map.items():
-        weight = METRIC_WEIGHTS.get(weight_key, 0)
-        all_vals = [r.get(field) for r in rows]
-        for r in rows:
-            pct = _percentile_score(all_vals, r.get(field), invert=invert)
-            r["composite_score"] = round(r.get("composite_score", 0) + pct * weight, 2)
+    sorted_cols = {}
+    for key, (field, _, _, _) in field_specs.items():
+        vals = sorted(v for v in (r.get(field) for r in rows) if v is not None)
+        sorted_cols[key] = vals
+
+    for r in rows:
+        inc_weighted = 0.0
+        cf_weighted = 0.0
+        bs_weighted = 0.0
+        for key, (field, invert, group, weight) in field_specs.items():
+            pct = _percentile_score(sorted_cols[key], r.get(field), invert=invert)
+            if group == "inc":
+                inc_weighted += pct * weight
+            elif group == "cf":
+                cf_weighted += pct * weight
+            else:
+                bs_weighted += pct * weight
+
+        inc_score = round(inc_weighted / 0.55, 1)
+        cf_score = round(cf_weighted / 0.18, 1)
+        bs_score = round(bs_weighted / 0.27, 1)
+        comp = inc_weighted + cf_weighted + bs_weighted
+
+        # Quality guardrails: penalize negative Net Income, Operating Income, or Free Cash Flow
+        if (r.get("net_income") or 0) <= 0:
+            comp -= 15.0
+        if (r.get("operating_income") or 0) <= 0:
+            comp -= 10.0
+        if (r.get("free_cash_flow") or 0) <= 0:
+            comp -= 12.0
+
+        r["income_score"] = max(0.0, min(100.0, inc_score))
+        r["cashflow_score"] = max(0.0, min(100.0, cf_score))
+        r["balance_sheet_score"] = max(0.0, min(100.0, bs_score))
+        r["composite_score"] = round(max(0.0, min(100.0, comp)), 2)
+
     return rows
 
 
-
-def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 8, top_n: int = 20):
+def _fetch_direct_timeseries_df(sym: str, sess) -> pd.DataFrame:
     """
-    Scan the full US stock universe (~9000 stocks).
+    Directly query Yahoo Finance's fundamentals-timeseries endpoint without requiring
+    yfinance's crumb/cookie handshake (which is prone to 429 rate-limiting).
+    """
+    type_str = ",".join(["annual" + k for k in _SCREENER_FIN_KEYS])
+    url = (
+        f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{sym}"
+        f"?symbol={sym}&type={type_str}&period1=1483142400&period2=1900000000"
+    )
+    r = sess.get(url, timeout=10)
+    if r.status_code != 200:
+        return pd.DataFrame()
+    res = r.json().get("timeseries", {}).get("result", [])
+    rows = {}
+    for item in res:
+        for k, v in item.items():
+            if k not in ("meta", "timestamp") and isinstance(v, list):
+                clean_k = k[6:] if k.startswith("annual") else k
+                pts = {
+                    pd.Timestamp(x["asOfDate"]): x["reportedValue"]["raw"]
+                    for x in v
+                    if isinstance(x, dict) and "asOfDate" in x and isinstance(x.get("reportedValue"), dict) and "raw" in x["reportedValue"]
+                }
+                if pts:
+                    rows[clean_k] = pts
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df[sorted(df.columns)]
 
-    Tuning for COMPLETENESS + reasonable speed:
-    ─────────────────────────────────────────────────────────────────────
-    • 8 parallel workers  — aggressive enough to be fast, gentle enough
-      not to trigger Yahoo Finance mass-blocking.
-    • 3 retries per ticker with exponential backoff on 401/429 errors
-      (3 s → 6 s → 9 s).  Without retries, rate-limits silently drop
-      90 % of tickers (causing the "only 825/9000" problem).
-    • 1.2 s pause between batches of 100 tickers.
-    • info-only: 1 API call per ticker (no cashflow / balance_sheet).
-    ─────────────────────────────────────────────────────────────────────
-    Expected: ~25-35 min for 9,000 tickers.
+
+def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 20, top_n: int = 20):
+    """
+    Scan all S&P 500 & NASDAQ stocks across all 15 Financial Statements metrics.
+    Uses bulk metadata from Nasdaq/Wikipedia + fast single-call Yahoo Finance
+    fundamentals-timeseries per ticker (~15-20 seconds total).
     """
     import concurrent.futures
+    import requests
     import time
 
-    universe    = _get_screener_universe()
-    total       = len(universe)
-    rows        = []
-    completed   = 0
-    BATCH_SIZE  = 100
-    BATCH_PAUSE = 1.2   # seconds between batches
+    universe, meta_map = get_sp500_and_nasdaq_universe()
+    total = len(universe)
+    rows = []
+    completed = 0
+
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers)
+    sess.mount("https://", adapter)
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    })
 
     def _fetch_one(sym):
-        """Fetch a single ticker with up to 3 retries on rate-limit errors."""
         for attempt in range(3):
             try:
-                info = yf.Ticker(sym).info
-                if not info or not isinstance(info, dict):
-                    return None
-                price = (info.get("regularMarketPrice") or
-                         info.get("currentPrice") or
-                         info.get("previousClose"))
-                if price and float(price) > 0:
-                    return score_single_stock(sym, info, None, None)
+                ts_df = _fetch_direct_timeseries_df(sym, sess)
+                if ts_df is not None and not ts_df.empty:
+                    m_info = meta_map.get(sym, {})
+                    scored = score_single_stock_from_ts(sym, ts_df, meta_info=m_info)
+                    if scored is not None:
+                        return scored
                 return None
             except Exception as e:
                 err = str(e).lower()
-                if "rate" in err or "429" in err or "401" in err or "crumb" in err:
-                    time.sleep((attempt + 1) * 3.0)  # 3s → 6s → 9s
-                    continue   # retry
-                return None    # non-rate-limit error — skip immediately
+                if "rate" in err or "429" in err or "401" in err or "timeout" in err:
+                    time.sleep((attempt + 1) * 1.2)
+                    continue
+                return None
         return None
 
     def _update_ui(sym):
@@ -3877,33 +4308,26 @@ def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 8,
             try:
                 status_text.markdown(
                     f'<span style="color:#848e9c;font-size:13px;">'
-                    f'Scanning <b>{sym}</b>&nbsp;({completed}/{total})'
+                    f'📊 Scanning S&P 500 & NASDAQ Financial Statements: <b>{sym}</b>&nbsp;({completed}/{total})'
                     f'</span>',
                     unsafe_allow_html=True
                 )
             except Exception:
                 pass
 
-    # ── Process universe in batches ────────────────────────────────────────
-    batches = [universe[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-
-    for batch_idx, batch in enumerate(batches):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_fetch_one, sym): sym for sym in batch}
-            for fut in concurrent.futures.as_completed(futures):
-                completed += 1
-                sym = futures[fut]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, sym): sym for sym in universe}
+        for fut in concurrent.futures.as_completed(futures):
+            completed += 1
+            sym = futures[fut]
+            if completed % 8 == 0 or completed == total:
                 _update_ui(sym)
-                try:
-                    res = fut.result()
-                    if res is not None:
-                        rows.append(res)
-                except Exception:
-                    pass
-
-        # Pause between batches (skip after last)
-        if batch_idx < len(batches) - 1:
-            time.sleep(BATCH_PAUSE)
+            try:
+                res = fut.result()
+                if res is not None:
+                    rows.append(res)
+            except Exception:
+                pass
 
     rows = _compute_all_scores(rows)
     rows.sort(key=lambda x: x["composite_score"], reverse=True)
@@ -3915,7 +4339,7 @@ def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 8,
     for row in rows:
         sec = (row.get("sector") or "").strip()
         if sec and sec not in ("N/A", ""):
-            _sector_map[sec].append(row)   # already sorted by composite_score
+            _sector_map[sec].append(row)
 
     by_sector = {
         sec: stocks[:10]
@@ -3936,8 +4360,6 @@ def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 8,
         pass
 
     return cache_data
-
-
 
 
 def load_screener_cache():
@@ -7136,7 +7558,7 @@ elif st.session_state.page_selector == "Portfolio":
 
 
 # ==========================================
-# PAGE 5: SCREENER — TOP PERFORMERS BY SECTOR
+# PAGE 5: SCREENER — TOP PERFORMERS BY SECTOR (15 FINANCIAL STATEMENT METRICS)
 # ==========================================
 elif st.session_state.page_selector == "Screener":
     st.title(tr("screener_page_title"))
@@ -7147,6 +7569,11 @@ elif st.session_state.page_selector == "Screener":
         st.session_state.screener_cache = load_screener_cache()
 
     cache = st.session_state.screener_cache
+    # Auto-upgrade cache if it is from an older schema missing the 15-metric fields
+    if cache and cache.get("top_20"):
+        first_row = cache["top_20"][0]
+        if "income_score" not in first_row or "cost_to_revenue_pct" not in first_row:
+            cache = None
 
     # ── Header row: last scan info + re-scan button ────────────────────────────
     hdr_left, hdr_right = st.columns([4, 1])
@@ -7176,7 +7603,7 @@ elif st.session_state.page_selector == "Screener":
             st.session_state.screener_cache = cache
             prog_bar.empty()
             stat_text.empty()
-            st.success(f"✅ Scan complete — {cache['universe_size']} stocks analyzed!")
+            st.success(f"✅ Scan complete — {cache['universe_size']} S&P 500 & NASDAQ stocks analyzed!")
             st.rerun()
 
     if not cache:
@@ -7192,36 +7619,72 @@ elif st.session_state.page_selector == "Screener":
 
     st.markdown("---")
 
-    # ── Shared helpers ─────────────────────────────────────────────────────────
-    def _cell(val, suffix="%", good_above=0):
+    # ── Shared formatting helpers ──────────────────────────────────────────────
+    def _cell(val, suffix="%", good_above=0, invert=False, show_plus=True):
         if val is None:
             return '<span style="color:#4a5568;">—</span>'
-        color = "#10b981" if val >= good_above else "#ef4444"
-        sign  = "+" if val > 0 else ""
+        if invert:
+            is_good = val <= good_above
+        else:
+            is_good = val >= good_above
+        color = "#10b981" if is_good else "#ef4444"
+        sign  = "+" if (show_plus and val > 0) else ""
         return f'<span style="color:{color};font-weight:600;">{sign}{val:.1f}{suffix}</span>'
 
-    def _score_badge(score):
+    def _fmt_b(val):
+        if val is None:
+            return '<span style="color:#4a5568;">—</span>'
+        abs_v = abs(val)
+        sign = "-" if val < 0 else ""
+        if abs_v >= 1e12:
+            return f"{sign}${abs_v/1e12:.2f}T"
+        if abs_v >= 1e9:
+            return f"{sign}${abs_v/1e9:.2f}B"
+        if abs_v >= 1e6:
+            return f"{sign}${abs_v/1e6:.0f}M"
+        return f"{sign}${abs_v:,.0f}"
+
+    def _fmt_sh(val):
+        if val is None or val <= 0:
+            return '<span style="color:#4a5568;">—</span>'
+        if val >= 1e9:
+            return f"{val/1e9:.2f}B"
+        if val >= 1e6:
+            return f"{val/1e6:.1f}M"
+        return f"{val:,.0f}"
+
+    def _score_badge(score, small=False):
+        score = score or 0.0
         if score >= 75:
             bg, fg = "#0d3321", "#10b981"
         elif score >= 55:
             bg, fg = "#1a2744", "#60a5fa"
         else:
             bg, fg = "#2b1111", "#ef4444"
-        return (f'<span style="background:{bg};color:{fg};font-weight:800;font-size:15px;'
-                f'padding:3px 10px;border-radius:6px;">{score:.1f}</span>')
+        fs = "12px" if small else "15px"
+        pad = "2px 7px" if small else "3px 10px"
+        return (f'<span style="background:{bg};color:{fg};font-weight:800;font-size:{fs};'
+                f'padding:{pad};border-radius:6px;">{score:.1f}</span>')
 
     medals = ["🥇", "🥈", "🥉"]
-    _col_widths = [0.4, 0.7, 2.0, 0.7, 0.8, 0.8, 0.9, 0.9, 0.8, 0.8, 0.8, 0.9]
+    _col_widths = [0.45, 0.7, 1.55, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.8]
     _hdr_labels = [
         tr("screener_rank"), "Ticker", "Company",
         tr("screener_score"),
-        tr("screener_rev_growth"), tr("screener_ni_growth"),
-        tr("screener_gross_margin"), tr("screener_op_margin"), tr("screener_net_margin"),
-        tr("screener_roe"), tr("screener_fcf_margin"), ""
+        tr("screener_rev_growth"),
+        tr("screener_ni_growth"),
+        tr("screener_gross_margin"),
+        tr("screener_net_margin"),
+        tr("screener_cost_ratio"),
+        tr("screener_shares_chg"),
+        tr("screener_fcf_margin"),
+        tr("screener_cash_debt"),
+        tr("screener_leverage"),
+        ""
     ]
 
-    def _render_stock_table(stock_list, max_rows=20):
-        """Render spotlight cards + leaderboard table for a given list of stocks."""
+    def _render_stock_table(stock_list, max_rows=20, key_prefix="overall"):
+        """Render spotlight cards + leaderboard table + 15-metric detailed breakdown."""
         # ── SPOTLIGHT CARDS ────────────────────────────────────────────────────
         n_spots = min(5, len(stock_list))
         if n_spots:
@@ -7229,6 +7692,9 @@ elif st.session_state.page_selector == "Screener":
             for i, stock in enumerate(stock_list[:5]):
                 medal   = medals[i] if i < 3 else f"#{i+1}"
                 score   = stock.get("composite_score", 0)
+                inc_sc  = stock.get("income_score", score)
+                cf_sc   = stock.get("cashflow_score", score)
+                bs_sc   = stock.get("balance_sheet_score", score)
                 ticker  = stock.get("ticker", "")
                 name    = stock.get("name", ticker)
                 sector  = stock.get("sector", "N/A")
@@ -7239,14 +7705,19 @@ elif st.session_state.page_selector == "Screener":
                 score_c  = border_c
                 spot_cols[i].markdown(
                     f'<div style="background:#1c2030;border:1px solid {border_c};border-top:3px solid {border_c};'
-                    f'border-radius:10px;padding:16px 14px;text-align:center;min-height:180px;">'
-                    f'<div style="font-size:24px;margin-bottom:4px;">{medal}</div>'
+                    f'border-radius:10px;padding:14px 12px;text-align:center;min-height:210px;">'
+                    f'<div style="font-size:22px;margin-bottom:2px;">{medal}</div>'
                     f'<div style="color:#fff;font-weight:800;font-size:18px;font-family:Outfit,Rubik,sans-serif;">{ticker}</div>'
-                    f'<div style="color:#848e9c;font-size:10px;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:22]}</div>'
+                    f'<div style="color:#848e9c;font-size:10px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:22]}</div>'
                     f'<div style="color:{score_c};font-weight:800;font-size:26px;line-height:1;">{score:.1f}</div>'
-                    f'<div style="color:#848e9c;font-size:9px;margin-bottom:8px;">SCORE</div>'
+                    f'<div style="color:#848e9c;font-size:9px;margin-bottom:6px;">TOTAL SCORE</div>'
+                    f'<div style="display:flex;justify-content:center;gap:4px;margin-bottom:8px;font-size:9px;">'
+                    f'<span style="background:#131722;color:#60a5fa;padding:2px 5px;border-radius:4px;" title="Income Statement Score">Inc: {inc_sc:.0f}</span>'
+                    f'<span style="background:#131722;color:#10b981;padding:2px 5px;border-radius:4px;" title="Cash Flow Score">CF: {cf_sc:.0f}</span>'
+                    f'<span style="background:#131722;color:#f59e0b;padding:2px 5px;border-radius:4px;" title="Balance Sheet Score">BS: {bs_sc:.0f}</span>'
+                    f'</div>'
                     f'<div style="color:#d1d4dc;font-size:11px;">${price:,.2f} &nbsp;|&nbsp; {mcap_str}</div>'
-                    f'<div style="color:#848e9c;font-size:9px;margin-top:4px;">{sector}</div>'
+                    f'<div style="color:#848e9c;font-size:9px;margin-top:3px;">{sector}</div>'
                     f'</div>',
                     unsafe_allow_html=True
                 )
@@ -7268,25 +7739,120 @@ elif st.session_state.page_selector == "Screener":
             cols    = st.columns(_col_widths)
             cols[0].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{medal}</div>', unsafe_allow_html=True)
             cols[1].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;font-weight:700;color:#fff;font-size:13px;">{ticker}</div>', unsafe_allow_html=True)
-            cols[2].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;color:#848e9c;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:28]}</div>', unsafe_allow_html=True)
+            cols[2].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;color:#848e9c;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{name[:24]}</div>', unsafe_allow_html=True)
             cols[3].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;">{_score_badge(score)}</div>', unsafe_allow_html=True)
-            cols[4].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("revenue_growth"))}</div>', unsafe_allow_html=True)
-            cols[5].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("earnings_growth"))}</div>', unsafe_allow_html=True)
-            cols[6].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("gross_margin"), good_above=30)}</div>', unsafe_allow_html=True)
-            cols[7].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("operating_margin"), good_above=10)}</div>', unsafe_allow_html=True)
-            cols[8].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("net_margin"), good_above=5)}</div>', unsafe_allow_html=True)
-            cols[9].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("roe"), good_above=10)}</div>', unsafe_allow_html=True)
-            cols[10].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:13px;">{_cell(stock.get("fcf_margin"), good_above=5)}</div>', unsafe_allow_html=True)
-            with cols[11]:
-                if st.button(tr("screener_open_dashboard"), key=f"open_{ticker}_{rank_idx}", use_container_width=True):
+            cols[4].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("revenue_growth"), good_above=5)}</div>', unsafe_allow_html=True)
+            cols[5].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("earnings_growth"), good_above=5)}</div>', unsafe_allow_html=True)
+            cols[6].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("gross_margin"), good_above=35, show_plus=False)}</div>', unsafe_allow_html=True)
+            cols[7].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("net_margin"), good_above=10, show_plus=False)}</div>', unsafe_allow_html=True)
+            cols[8].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("cost_to_revenue_pct"), good_above=60, invert=True, show_plus=False)}</div>', unsafe_allow_html=True)
+            cols[9].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("share_change_pct"), good_above=0.5, invert=True)}</div>', unsafe_allow_html=True)
+            cols[10].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("fcf_margin"), good_above=10, show_plus=False)}</div>', unsafe_allow_html=True)
+            cols[11].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("cash_to_debt"), suffix="x", good_above=0.8, show_plus=False)}</div>', unsafe_allow_html=True)
+            cols[12].markdown(f'<div style="background:{row_bg};padding:8px 4px;border-radius:4px;text-align:center;font-size:12px;">{_cell(stock.get("debt_ratio"), good_above=35, invert=True, show_plus=False)}</div>', unsafe_allow_html=True)
+            with cols[13]:
+                if st.button(tr("screener_open_dashboard"), key=f"open_{key_prefix}_{ticker}_{rank_idx}", use_container_width=True):
                     st.session_state.selected_ticker = ticker
                     st.session_state.page_selector   = "Dashboard"
                     st.rerun()
             st.markdown('<div style="border-bottom:1px solid #2a2e3930;"></div>', unsafe_allow_html=True)
 
+        # ── FULL 15-METRIC FINANCIAL STATEMENTS BREAKDOWN TABLE ────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander(tr("screener_full_metrics_expander"), expanded=True):
+            _is_he_tbl = st.session_state.language == "he"
+            inc_hdr = "📈 מדדי דוח רווח והפסד (Income Statement Metrics — 8 מדדים)" if _is_he_tbl else "📈 Income Statement Metrics (All 8 Metrics)"
+            cf_bs_hdr = "💰 מדדי תזרים מזומנים ומאזן (Cash Flow & Balance Sheet Metrics — 7 מדדים)" if _is_he_tbl else "💰 Cash Flow & Balance Sheet Metrics (All 7 Metrics)"
+
+            st.markdown(f"#### {inc_hdr}")
+            inc_html = """<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;color:#d1d4dc;background:#161b2d;border:1px solid #2a2e39;border-radius:8px;">
+            <thead><tr style="background:#131722;color:#848e9c;text-transform:uppercase;font-size:10px;border-bottom:2px solid #2a2e39;">
+                <th style="padding:8px;text-align:left;"># / Ticker</th>
+                <th style="padding:8px;text-align:center;">Income Score</th>
+                <th style="padding:8px;text-align:right;">1. Total Revenue (YoY)</th>
+                <th style="padding:8px;text-align:right;">2. Gross Profit (YoY)</th>
+                <th style="padding:8px;text-align:right;">3. Op. / Net Income (YoY)</th>
+                <th style="padding:8px;text-align:right;">4. Cost of Revenue (Cost/Rev%)</th>
+                <th style="padding:8px;text-align:center;">5. Gross Margin %</th>
+                <th style="padding:8px;text-align:center;">6. Op / Net Margin %</th>
+                <th style="padding:8px;text-align:right;">7. Diluted EPS (YoY)</th>
+                <th style="padding:8px;text-align:right;">8. Shares Out. (Chg/Yr)</th>
+            </tr></thead><tbody>"""
+            for idx_s, st_row in enumerate(stock_list[:max_rows], start=1):
+                t_sym = st_row.get("ticker", "")
+                inc_s = st_row.get("income_score", st_row.get("composite_score", 0))
+                rev_s = f"{_fmt_b(st_row.get('total_revenue'))} ({_cell(st_row.get('revenue_growth'), good_above=5)})"
+                gp_s  = f"{_fmt_b(st_row.get('gross_profit'))} ({_cell(st_row.get('gross_profit_growth'), good_above=5)})"
+                ni_s  = f"{_fmt_b(st_row.get('operating_income'))} / {_fmt_b(st_row.get('net_income'))} ({_cell(st_row.get('earnings_growth'), good_above=5)})"
+                cr_s  = f"{_fmt_b(st_row.get('cost_of_revenue'))} ({_cell(st_row.get('cost_to_revenue_pct'), good_above=60, invert=True, show_plus=False)})"
+                gm_s  = _cell(st_row.get("gross_margin"), good_above=35, show_plus=False)
+                pm_s  = f"{_cell(st_row.get('operating_margin'), good_above=12, show_plus=False)} / {_cell(st_row.get('net_margin'), good_above=10, show_plus=False)}"
+                eps_v = st_row.get("diluted_eps")
+                eps_str = f"${eps_v:.2f}" if eps_v is not None else "—"
+                eps_s = f"{eps_str} ({_cell(st_row.get('eps_growth'), good_above=5)})"
+                sh_s  = f"{_fmt_sh(st_row.get('shares_outstanding'))} ({_cell(st_row.get('share_change_pct'), good_above=0.5, invert=True)})"
+                r_bg  = "#1c2030" if idx_s % 2 == 0 else "#161b2d"
+                inc_html += f"""<tr style="background:{r_bg};border-bottom:1px solid #2a2e3960;">
+                    <td style="padding:7px 8px;font-weight:700;color:#fff;">#{idx_s} {t_sym}</td>
+                    <td style="padding:7px 8px;text-align:center;">{_score_badge(inc_s, small=True)}</td>
+                    <td style="padding:7px 8px;text-align:right;">{rev_s}</td>
+                    <td style="padding:7px 8px;text-align:right;">{gp_s}</td>
+                    <td style="padding:7px 8px;text-align:right;">{ni_s}</td>
+                    <td style="padding:7px 8px;text-align:right;">{cr_s}</td>
+                    <td style="padding:7px 8px;text-align:center;">{gm_s}</td>
+                    <td style="padding:7px 8px;text-align:center;">{pm_s}</td>
+                    <td style="padding:7px 8px;text-align:right;">{eps_s}</td>
+                    <td style="padding:7px 8px;text-align:right;">{sh_s}</td>
+                </tr>"""
+            inc_html += "</tbody></table></div>"
+            st.markdown(inc_html, unsafe_allow_html=True)
+
+            st.markdown(f"<br><h4>{cf_bs_hdr}</h4>", unsafe_allow_html=True)
+            cf_html = """<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;color:#d1d4dc;background:#161b2d;border:1px solid #2a2e39;border-radius:8px;">
+            <thead><tr style="background:#131722;color:#848e9c;text-transform:uppercase;font-size:10px;border-bottom:2px solid #2a2e39;">
+                <th style="padding:8px;text-align:left;"># / Ticker</th>
+                <th style="padding:8px;text-align:center;">CF / BS Score</th>
+                <th style="padding:8px;text-align:right;">9. Free Cash Flow (FCF Margin / YoY)</th>
+                <th style="padding:8px;text-align:right;">10. Operating Cash Flow (OCF Margin / YoY)</th>
+                <th style="padding:8px;text-align:right;">11. Total Assets (ROA / ROE)</th>
+                <th style="padding:8px;text-align:right;">12. Total Liabilities (Assets/Liab)</th>
+                <th style="padding:8px;text-align:right;">13. Total Debt (Net Debt)</th>
+                <th style="padding:8px;text-align:right;">14. Cash on Hand (Cash/Debt)</th>
+                <th style="padding:8px;text-align:center;">15. Leverage Ratios (Debt/Assets | Liab/Assets | D/E)</th>
+            </tr></thead><tbody>"""
+            for idx_s, st_row in enumerate(stock_list[:max_rows], start=1):
+                t_sym = st_row.get("ticker", "")
+                cf_s  = st_row.get("cashflow_score", st_row.get("composite_score", 0))
+                bs_s  = st_row.get("balance_sheet_score", st_row.get("composite_score", 0))
+                fcf_cell = f"{_fmt_b(st_row.get('free_cash_flow'))} ({_cell(st_row.get('fcf_margin'), good_above=10, show_plus=False)} | {_cell(st_row.get('fcf_growth'), good_above=5)})"
+                ocf_cell = f"{_fmt_b(st_row.get('operating_cash_flow'))} ({_cell(st_row.get('ocf_margin'), good_above=12, show_plus=False)} | {_cell(st_row.get('ocf_growth'), good_above=5)})"
+                ast_cell = f"{_fmt_b(st_row.get('total_assets'))} ({_cell(st_row.get('roa'), good_above=8, show_plus=False)} / {_cell(st_row.get('roe'), good_above=15, show_plus=False)})"
+                lib_cell = f"{_fmt_b(st_row.get('total_liabilities'))} ({_cell(st_row.get('balance_ratio'), suffix='x', good_above=1.5, show_plus=False)})"
+                dbt_cell = f"{_fmt_b(st_row.get('total_debt'))} ({_fmt_b(st_row.get('net_debt'))})"
+                csh_cell = f"{_fmt_b(st_row.get('total_cash'))} ({_cell(st_row.get('cash_to_debt'), suffix='x', good_above=0.8, show_plus=False)})"
+                lev_cell = (
+                    f"{_cell(st_row.get('debt_ratio'), good_above=35, invert=True, show_plus=False)} | "
+                    f"{_cell(st_row.get('liab_to_assets_pct'), good_above=60, invert=True, show_plus=False)} | "
+                    f"{_cell(st_row.get('debt_to_equity'), suffix='x', good_above=1.0, invert=True, show_plus=False)}"
+                )
+                r_bg  = "#1c2030" if idx_s % 2 == 0 else "#161b2d"
+                cf_html += f"""<tr style="background:{r_bg};border-bottom:1px solid #2a2e3960;">
+                    <td style="padding:7px 8px;font-weight:700;color:#fff;">#{idx_s} {t_sym}</td>
+                    <td style="padding:7px 8px;text-align:center;">{_score_badge(cf_s, small=True)} / {_score_badge(bs_s, small=True)}</td>
+                    <td style="padding:7px 8px;text-align:right;">{fcf_cell}</td>
+                    <td style="padding:7px 8px;text-align:right;">{ocf_cell}</td>
+                    <td style="padding:7px 8px;text-align:right;">{ast_cell}</td>
+                    <td style="padding:7px 8px;text-align:right;">{lib_cell}</td>
+                    <td style="padding:7px 8px;text-align:right;">{dbt_cell}</td>
+                    <td style="padding:7px 8px;text-align:right;">{csh_cell}</td>
+                    <td style="padding:7px 8px;text-align:center;">{lev_cell}</td>
+                </tr>"""
+            cf_html += "</tbody></table></div>"
+            st.markdown(cf_html, unsafe_allow_html=True)
+
     # ── Build tab labels ───────────────────────────────────────────────────────
     _is_he = st.session_state.language == "he"
-    _overall_label = "🏆 Top 20 כללי" if _is_he else "🏆 Overall Top 20"
+    _overall_label = "🏆 Top 20 כללי (S&P 500 & NASDAQ)" if _is_he else "🏆 Overall Top 20 (S&P 500 & NASDAQ)"
 
     # Sector emoji map
     _sector_emoji = {
@@ -7307,7 +7873,7 @@ elif st.session_state.page_selector == "Screener":
     # Tab 0 — Overall Top 20
     with tabs[0]:
         st.markdown(f"### {tr('screener_spotlight')}")
-        _render_stock_table(top_20, max_rows=20)
+        _render_stock_table(top_20, max_rows=20, key_prefix="overall")
 
     # Tab 1..N — Sector Top 10
     for tab_obj, sec_name in zip(tabs[1:], _sector_names):
@@ -7321,30 +7887,39 @@ elif st.session_state.page_selector == "Screener":
                 unsafe_allow_html=True
             )
             if sec_stocks:
-                _render_stock_table(sec_stocks, max_rows=10)
+                _render_stock_table(sec_stocks, max_rows=10, key_prefix=f"sec_{sec_name}")
             else:
                 st.info("No data for this sector in current scan.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Score methodology explainer ────────────────────────────────────────────
-    with st.expander("ℹ️ How the Score is Calculated", expanded=False):
+    with st.expander("ℹ️ כיצד מחושב הציון הפיננסי (15 מדדי Financial Statements)" if _is_he else "ℹ️ How the 15-Metric Financial Statements Score is Calculated", expanded=False):
         st.markdown("""
-        The **Composite Score** (0–100) is a **percentile-ranked**, weighted average of 7 financial metrics.
-        Each metric is scored against all stocks in the scanned universe, then weighted:
+        **הציון המשוקלל (0–100)** מדרג את כל מניות ה-**S&P 500** וה-**NASDAQ** לפי אחוזונים (Percentile Ranking) על פני **כל 15 המדדים של 📊 Financial Statements**:
 
-        | Metric | Weight | Source |
-        |---|---|---|
-        | Revenue Growth (YoY) | **20%** | `revenueGrowth` |
-        | Net Income Growth (YoY) | **20%** | `earningsGrowth` |
-        | Gross Margin | **15%** | `grossMargins` |
-        | Operating Margin | **15%** | `operatingMargins` |
-        | Net Profit Margin | **10%** | `profitMargins` |
-        | Return on Equity (ROE) | **10%** | `returnOnEquity` |
-        | Free Cash Flow Margin | **10%** | `freeCashflow / totalRevenue` |
+        #### 📈 קבוצה א': מדדי דוח רווח והפסד (Income Statement Metrics — 55% מהציון)
+        | # | מדד פיננסי | משקל | שיטת דירוג |
+        |---|---|---|---|
+        | 1 | **הכנסות (Total Revenue)** | **9%** | צמיחה שנתית (YoY) + קצב צמיחה רב-שנתי (CAGR) ועקביות צמיחה |
+        | 2 | **רווח גולמי (Gross Profit)** | **7%** | צמיחת הרווח הגולמי (YoY + CAGR) והתרחבות רב-שנתית |
+        | 3 | **רווח נקי ותפעולי (Net / Operating Income)** | **10%** | צמיחת רווח תפעולי ורווח נקי ורציפות רווחיות |
+        | 4 | **עלות ההכנסות (Cost of Revenue)** | **5%** | יחס עלות להכנסות (`Cost / Revenue %`) — **נמוך יותר = יעיל יותר (ציון גבוה יותר)** |
+        | 5 | **מרווח גולמי (Gross Margin %)** | **7%** | `Gross Profit / Total Revenue` |
+        | 6 | **שולי רווח (Profit Margin %)** | **8%** | שילוב מרווח תפעולי (`Operating Margin %`) ומרווח נקי (`Net Profit Margin %`) |
+        | 7 | **רווח למניה (Diluted EPS)** | **5%** | צמיחת ה-EPS המדולל ועקביות רב-שנתית |
+        | 8 | **כמות מניות (Shares Outstanding)** | **4%** | שינוי שנתי בכמות המניות — **קיטון במניות (Buybacks) מעניק ציון גבוה, דילול מוריד ציון** |
 
-        A score of **75+** = Top quartile. **55–75** = Above average. **<55** = Below average within this universe.
-        Data is sourced from Yahoo Finance (`yfinance`). A `—` means the metric was not reported.
+        #### 💰 קבוצה ב': מדדי תזרים מזומנים ומאזן (Cash Flow & Balance Sheet Metrics — 45% מהציון)
+        | # | מדד פיננסי | משקל | שיטת דירוג |
+        |---|---|---|---|
+        | 9 | **תזרים מזומנים חופשי (Free Cash Flow)** | **10%** | מרווח תזרים חופשי (`FCF Margin %`) + צמיחת FCF ועקביות רב-שנתית |
+        | 10 | **תזרים תפעולי (Operating Cash Flow)** | **8%** | מרווח תזרים תפעולי (`OCF Margin %`) + צמיחת OCF |
+        | 11 | **סך נכסים (Total Assets)** | **6%** | תשואה על הנכסים (`ROA %`), תשואה על ההון (`ROE %`) וצמיחת נכסים |
+        | 12 | **סך התחייבויות (Total Liabilities)** | **5%** | יחס כיסוי נכסים להתחייבויות (`Total Assets / Total Liabilities`) |
+        | 13 | **סך חוב (Total Debt)** | **5%** | כושר פירעון חוב מתזרים חופשי (`FCF / Total Debt`) וחוב נטו שלילי |
+        | 14 | **יתרת מזומנים (Cash on Hand)** | **5%** | יחס מזומנים לחוב (`Cash / Debt`) ושיעור המזומנים מסך הנכסים |
+        | 15 | **יחסי מינוף (Leverage Ratios)** | **6%** | יחס חוב לנכסים (`Debt / Assets %`) והתחייבויות לנכסים (`Liabilities / Assets %`) — **נמוך יותר = ציון גבוה יותר** |
         """)
 
 
