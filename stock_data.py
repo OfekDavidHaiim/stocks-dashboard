@@ -1607,20 +1607,22 @@ def get_ticker_tape_prices():
     tape_data = []
     for ticker in tickers:
         try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="2d")
+            hist, _ = _fetch_direct_yahoo_chart(ticker, range_str="5d")
+            if hist is None or hist.empty:
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period="2d")
             symbol_upper = ticker.upper()
             is_tase = symbol_upper.endswith(".TA")
             scale = 0.01 if is_tase else 1.0
             currency_sym = "₪" if is_tase else "$"
             
-            if len(hist) >= 2:
-                price = hist['Close'].iloc[-1] * scale
-                prev = hist['Close'].iloc[-2] * scale
+            if hist is not None and len(hist) >= 2:
+                price = float(hist['Close'].iloc[-1]) * scale
+                prev = float(hist['Close'].iloc[-2]) * scale
                 change = ((price - prev) / prev) * 100
                 tape_data.append({"ticker": ticker, "price": price, "change": change, "symbol": currency_sym})
-            elif len(hist) == 1:
-                price = hist['Close'].iloc[-1] * scale
+            elif hist is not None and len(hist) == 1:
+                price = float(hist['Close'].iloc[-1]) * scale
                 tape_data.append({"ticker": ticker, "price": price, "change": 0.0, "symbol": currency_sym})
         except Exception:
             pass
@@ -1656,7 +1658,8 @@ def render_ticker_tape():
 
 def _fetch_statement(ticker_obj, method_name, freq, fallback_attr):
     """
-    Try the newer get_* API first (returns 5 yrs), fall back to old property (4 yrs).
+    Try the newer get_* API first (returns 5 yrs), fall back to old property (4 yrs),
+    then fall back to direct Crumb-free Yahoo fundamentals-timeseries API.
     Returns a DataFrame transposed so rows=dates, cols=metrics.
     """
     try:
@@ -1670,6 +1673,46 @@ def _fetch_statement(ticker_obj, method_name, freq, fallback_attr):
         df = getattr(ticker_obj, fallback_attr)
         if df is not None and not df.empty:
             return df.T          # old property: same layout
+    except Exception:
+        pass
+    # Direct Crumb-free fallback via Yahoo fundamentals-timeseries API
+    try:
+        import re
+        from yfinance import const as _yf_const
+        sym = getattr(ticker_obj, "ticker", "")
+        if sym:
+            key_group = "financials" if "income" in method_name else ("balance-sheet" if "balance" in method_name else "cash-flow")
+            keys = _yf_const.fundamentals_keys.get(key_group, [])
+            prefix = "annual" if freq == "yearly" else "quarterly"
+            if keys:
+                type_str = ",".join([prefix + k for k in keys])
+                url = (
+                    f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{sym}"
+                    f"?symbol={sym}&type={type_str}&period1=1420070400&period2=1900000000"
+                )
+                r = requests.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    res = r.json().get("timeseries", {}).get("result", [])
+                    cols_dict = {}
+                    for item in res:
+                        for k, v in item.items():
+                            if k not in ("meta", "timestamp") and isinstance(v, list):
+                                raw_k = k[len(prefix):] if k.startswith(prefix) else k
+                                pretty_k = re.sub(r"([A-Z]+)", r" \1", raw_k).strip()
+                                pts = {
+                                    pd.Timestamp(x["asOfDate"]): x["reportedValue"]["raw"]
+                                    for x in v
+                                    if isinstance(x, dict) and "asOfDate" in x and isinstance(x.get("reportedValue"), dict) and "raw" in x["reportedValue"]
+                                }
+                                if pts:
+                                    cols_dict[pretty_k] = pts
+                    if cols_dict:
+                        df_direct = pd.DataFrame(cols_dict).sort_index()
+                        return df_direct
     except Exception:
         pass
     return pd.DataFrame()
@@ -2176,8 +2219,78 @@ def _merge_sec_with_yf(yf_df: pd.DataFrame, sec_df: pd.DataFrame, max_periods: i
         return yf_df.tail(max_periods)
 
 
+def _fetch_direct_yahoo_chart(ticker_symbol: str, range_str: str = "10y"):
+    """
+    Fetch daily OHLCV + Dividends + Stock Splits + Chart Meta directly from Yahoo Finance v8 chart API
+    without yfinance's getcrumb handshake (immune to YFRateLimitError on getcrumb).
+    Returns (df_history, meta_dict).
+    """
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?range={range_str}&interval=1d&events=div,split"
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return pd.DataFrame(), {}
+        res = r.json().get("chart", {}).get("result", [])
+        if not res:
+            return pd.DataFrame(), {}
+        d = res[0]
+        meta = d.get("meta") or {}
+        ts = d.get("timestamp", [])
+        if not ts:
+            return pd.DataFrame(), meta
+        q = d.get("indicators", {}).get("quote", [{}])[0]
+        tz_name = meta.get("exchangeTimezoneName") or "America/New_York"
+        try:
+            idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(tz_name).normalize()
+        except Exception:
+            idx = pd.to_datetime(ts, unit="s", utc=True).tz_localize(None).normalize()
+        df = pd.DataFrame({
+            "Open": pd.to_numeric(q.get("open", []), errors="coerce"),
+            "High": pd.to_numeric(q.get("high", []), errors="coerce"),
+            "Low": pd.to_numeric(q.get("low", []), errors="coerce"),
+            "Close": pd.to_numeric(q.get("close", []), errors="coerce"),
+            "Volume": pd.to_numeric(q.get("volume", []), errors="coerce"),
+        }, index=idx)
+        df = df.dropna(subset=["Close"])
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        df["Dividends"] = 0.0
+        df["Stock Splits"] = 0.0
+
+        divs = d.get("events", {}).get("dividends", {})
+        for k, v in divs.items():
+            try:
+                dt = pd.to_datetime(int(k), unit="s", utc=True).tz_convert(tz_name).normalize()
+                amt = float(v.get("amount", 0.0))
+                pos = df.index.searchsorted(dt)
+                if pos < len(df.index):
+                    df.iloc[pos, df.columns.get_loc("Dividends")] = amt
+            except Exception:
+                pass
+
+        splits = d.get("events", {}).get("splits", {})
+        for k, v in splits.items():
+            try:
+                dt = pd.to_datetime(int(k), unit="s", utc=True).tz_convert(tz_name).normalize()
+                num = float(v.get("numerator", 1.0))
+                den = float(v.get("denominator", 1.0))
+                if den > 0:
+                    pos = df.index.searchsorted(dt)
+                    if pos < len(df.index):
+                        df.iloc[pos, df.columns.get_loc("Stock Splits")] = num / den
+            except Exception:
+                pass
+
+        return df, meta
+    except Exception:
+        return pd.DataFrame(), {}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str, _cache_v: int = 5):
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 8):
 
     stock = yf.Ticker(ticker_symbol)
 
@@ -2190,16 +2303,22 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 5):
     quarterly_balance_sheet = _fetch_statement(stock, "get_balance_sheet","quarterly", "quarterly_balance_sheet")
     quarterly_cashflow      = _fetch_statement(stock, "get_cash_flow",     "quarterly", "quarterly_cashflow")
 
-    # ── History with robust fallback periods (split-adjusted, without dividend distortion) ──
-    history = None
-    for p in ["10y", "max", "5y", "1y", "6m"]:
-        try:
-            h = stock.history(period=p, auto_adjust=False)
-            if h is not None and not h.empty:
-                history = h
+    # ── History with direct Crumb-free v8/finance/chart primary/fallback ──
+    history, chart_meta = _fetch_direct_yahoo_chart(ticker_symbol, range_str="10y")
+    if history is None or history.empty:
+        for r_str in ["max", "5y", "1y"]:
+            history, chart_meta = _fetch_direct_yahoo_chart(ticker_symbol, range_str=r_str)
+            if history is not None and not history.empty:
                 break
-        except Exception:
-            pass
+    if history is None or history.empty:
+        for p in ["10y", "max", "5y", "1y", "6m"]:
+            try:
+                h = stock.history(period=p, auto_adjust=False)
+                if h is not None and not h.empty:
+                    history = h
+                    break
+            except Exception:
+                pass
 
     if history is None:
         history = pd.DataFrame()
@@ -2209,32 +2328,6 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 5):
         info = dict(stock.info) if stock.info else {}
     except Exception:
         info = {}
-
-    # Handle ILA Agora currency scaling to standard Shekels (ILS)
-    try:
-        if info:
-            currency = info.get("currency", "USD")
-            if currency == "ILA":
-                scale = 0.01
-                if history is not None and not history.empty:
-                    for col in ['Open', 'High', 'Low', 'Close']:
-                        if col in history.columns:
-                            history[col] = history[col] * scale
-                # Scale info price-related fields
-                price_keys = [
-                    'currentPrice', 'trailingEps', 'dividendRate', 'fiftyTwoWeekHigh', 
-                    'fiftyTwoWeekLow', 'fiftyDayAverage', 'twoHundredDayAverage',
-                    'targetHighPrice', 'targetLowPrice', 'targetMeanPrice', 'targetMedianPrice',
-                    'bookValue', 'navPrice'
-                ]
-                for key in price_keys:
-                    if key in info and info[key] is not None:
-                        try:
-                            info[key] = info[key] * scale
-                        except Exception:
-                            pass
-    except Exception:
-        pass
 
     df_fin_a = financials.sort_index() if not financials.empty else pd.DataFrame()
     df_bs_a  = balance_sheet.sort_index() if not balance_sheet.empty else pd.DataFrame()
@@ -2299,17 +2392,158 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 5):
     except Exception:
         pass
 
+    # ── Populate/Fallback `info` from chart_meta + statements + history when yfinance info is rate-limited ──
+    try:
+        if not info.get("sector") or not info.get("longName"):
+            try:
+                _, _uni_meta = get_sp500_and_nasdaq_universe()
+                _m = _uni_meta.get(ticker_symbol.upper(), {})
+                if _m:
+                    if _m.get("name"):
+                        info.setdefault("longName", _m["name"])
+                        info.setdefault("shortName", _m["name"])
+                    if _m.get("sector") and _m.get("sector") != "N/A":
+                        info.setdefault("sector", _m["sector"])
+                    if _m.get("industry") and _m.get("industry") != "N/A":
+                        info.setdefault("industry", _m["industry"])
+                    if _m.get("market_cap") and _m.get("market_cap") > 0:
+                        info.setdefault("marketCap", float(_m["market_cap"]))
+            except Exception:
+                pass
+
+        if chart_meta:
+            info.setdefault("currency", chart_meta.get("currency", "USD"))
+            info.setdefault("longName", chart_meta.get("longName") or chart_meta.get("shortName") or ticker_symbol)
+            info.setdefault("shortName", chart_meta.get("shortName") or ticker_symbol)
+            if chart_meta.get("regularMarketPrice"):
+                info.setdefault("currentPrice", float(chart_meta["regularMarketPrice"]))
+                info.setdefault("regularMarketPrice", float(chart_meta["regularMarketPrice"]))
+            if chart_meta.get("fiftyTwoWeekHigh"):
+                info.setdefault("fiftyTwoWeekHigh", float(chart_meta["fiftyTwoWeekHigh"]))
+            if chart_meta.get("fiftyTwoWeekLow"):
+                info.setdefault("fiftyTwoWeekLow", float(chart_meta["fiftyTwoWeekLow"]))
+
+        if history is not None and not history.empty and "Close" in history.columns:
+            last_close = float(history["Close"].iloc[-1])
+            info.setdefault("currentPrice", last_close)
+            info.setdefault("regularMarketPrice", last_close)
+            info.setdefault("fiftyDayAverage", float(history["Close"].tail(50).mean()))
+            info.setdefault("twoHundredDayAverage", float(history["Close"].tail(200).mean()))
+            info.setdefault("fiftyTwoWeekHigh", float(history["Close"].tail(252).max()))
+            info.setdefault("fiftyTwoWeekLow", float(history["Close"].tail(252).min()))
+
+        def _latest_col_val(df_s, cols):
+            if df_s is None or df_s.empty:
+                return None
+            for c in cols:
+                if c in df_s.columns:
+                    s = pd.to_numeric(df_s[c], errors="coerce").dropna()
+                    if not s.empty:
+                        return float(s.iloc[-1])
+            return None
+
+        sh_out = info.get("sharesOutstanding") or _latest_col_val(df_fin_q, ["Diluted Average Shares", "Basic Average Shares"]) or _latest_col_val(df_fin_a, ["Diluted Average Shares", "Basic Average Shares"])
+        if sh_out and sh_out > 0:
+            info.setdefault("sharesOutstanding", sh_out)
+            if info.get("currentPrice"):
+                info.setdefault("marketCap", float(info["currentPrice"]) * float(sh_out))
+
+        t_eps = _latest_col_val(df_fin_a, ["Diluted EPS", "Basic EPS"])
+        if t_eps is not None:
+            info.setdefault("trailingEps", t_eps)
+            if info.get("currentPrice") and t_eps > 0:
+                info.setdefault("trailingPE", float(info["currentPrice"]) / t_eps)
+
+        rev_v = _latest_col_val(df_fin_a, ["Total Revenue", "Operating Revenue"])
+        gp_v = _latest_col_val(df_fin_a, ["Gross Profit"])
+        op_v = _latest_col_val(df_fin_a, ["Operating Income"])
+        ni_v = _latest_col_val(df_fin_a, ["Net Income"])
+        ocf_v = _latest_col_val(df_cf_a, ["Operating Cash Flow"])
+        fcf_v = _latest_col_val(df_cf_a, ["Free Cash Flow"])
+        ast_v = _latest_col_val(df_bs_a, ["Total Assets"])
+        liab_v = _latest_col_val(df_bs_a, ["Total Liabilities Net Minority Interest"])
+        eq_v = _latest_col_val(df_bs_a, ["Stockholders Equity", "Common Stock Equity"])
+        dbt_v = _latest_col_val(df_bs_a, ["Total Debt", "Long Term Debt"])
+        csh_v = _latest_col_val(df_bs_a, ["Cash And Cash Equivalents"])
+        ca_v = _latest_col_val(df_bs_a, ["Current Assets", "Total Current Assets"])
+        cl_v = _latest_col_val(df_bs_a, ["Current Liabilities", "Total Current Liabilities"])
+
+        if rev_v is not None:
+            info.setdefault("totalRevenue", rev_v)
+        if gp_v is not None:
+            info.setdefault("grossProfits", gp_v)
+        if ni_v is not None:
+            info.setdefault("netIncomeToCommon", ni_v)
+        if ocf_v is not None:
+            info.setdefault("operatingCashflow", ocf_v)
+        if fcf_v is not None:
+            info.setdefault("freeCashflow", fcf_v)
+        if dbt_v is not None:
+            info.setdefault("totalDebt", dbt_v)
+        if csh_v is not None:
+            info.setdefault("totalCash", csh_v)
+        if rev_v and rev_v > 0:
+            if gp_v is not None:
+                info.setdefault("grossMargins", gp_v / rev_v)
+            if op_v is not None:
+                info.setdefault("operatingMargins", op_v / rev_v)
+            if ni_v is not None:
+                info.setdefault("profitMargins", ni_v / rev_v)
+        if eq_v and eq_v > 0:
+            if ni_v is not None:
+                info.setdefault("returnOnEquity", ni_v / eq_v)
+            if sh_out and sh_out > 0:
+                info.setdefault("bookValue", eq_v / sh_out)
+                if info.get("currentPrice"):
+                    info.setdefault("priceToBook", float(info["currentPrice"]) / (eq_v / sh_out))
+            if dbt_v is not None:
+                info.setdefault("debtToEquity", (dbt_v / eq_v) * 100.0)
+        if ast_v and ast_v > 0 and ni_v is not None:
+            info.setdefault("returnOnAssets", ni_v / ast_v)
+        if ca_v and cl_v and cl_v > 0:
+            info.setdefault("currentRatio", ca_v / cl_v)
+    except Exception:
+        pass
+
+    # Handle ILA Agora currency scaling to standard Shekels (ILS)
+    try:
+        if info:
+            currency = info.get("currency", "USD")
+            if currency == "ILA":
+                scale = 0.01
+                if history is not None and not history.empty:
+                    for col in ['Open', 'High', 'Low', 'Close']:
+                        if col in history.columns:
+                            history[col] = history[col] * scale
+                price_keys = [
+                    'currentPrice', 'trailingEps', 'dividendRate', 'fiftyTwoWeekHigh', 
+                    'fiftyTwoWeekLow', 'fiftyDayAverage', 'twoHundredDayAverage',
+                    'targetHighPrice', 'targetLowPrice', 'targetMeanPrice', 'targetMedianPrice',
+                    'bookValue', 'navPrice'
+                ]
+                for key in price_keys:
+                    if key in info and info[key] is not None:
+                        try:
+                            info[key] = info[key] * scale
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
     return df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q, history, info
 
 def get_live_price_info(ticker_symbol: str):
     try:
-        stock = yf.Ticker(ticker_symbol)
-        hist = stock.history(period="2d")
         symbol_upper = ticker_symbol.upper().strip()
         is_tase = symbol_upper.endswith(".TA")
         scale = 0.01 if is_tase else 1.0
         symbol = "₪" if is_tase else "$"
-        
+
+        hist, _ = _fetch_direct_yahoo_chart(ticker_symbol, range_str="5d")
+        if hist is None or hist.empty:
+            stock = yf.Ticker(ticker_symbol)
+            hist = stock.history(period="2d")
+
         if len(hist) >= 2:
             current_price = hist['Close'].iloc[-1] * scale
             prev_close = hist['Close'].iloc[-2] * scale
