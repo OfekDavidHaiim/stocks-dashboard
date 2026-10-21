@@ -2290,7 +2290,7 @@ def _fetch_direct_yahoo_chart(ticker_symbol: str, range_str: str = "10y"):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str, _cache_v: int = 8):
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
 
     stock = yf.Ticker(ticker_symbol)
 
@@ -2383,10 +2383,10 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 8):
     try:
         splits_s = history['Stock Splits'] if (history is not None and not history.empty and 'Stock Splits' in history.columns) else pd.Series(dtype=float)
         sec_fin_a, sec_bs_a, sec_cf_a, sec_fin_q, sec_bs_q, sec_cf_q = _fetch_sec_edgar_statements(ticker_symbol, splits_s)
-        df_fin_a = _merge_sec_with_yf(df_fin_a, sec_fin_a, max_periods=10)
+        df_fin_a = _merge_sec_with_yf(df_fin_a, sec_fin_a, max_periods=11)
         df_bs_a  = _merge_sec_with_yf(df_bs_a,  sec_bs_a,  max_periods=10)
         df_cf_a  = _merge_sec_with_yf(df_cf_a,  sec_cf_a,  max_periods=10)
-        df_fin_q = _merge_sec_with_yf(df_fin_q, sec_fin_q, max_periods=40)
+        df_fin_q = _merge_sec_with_yf(df_fin_q, sec_fin_q, max_periods=44)
         df_bs_q  = _merge_sec_with_yf(df_bs_q,  sec_bs_q,  max_periods=40)
         df_cf_q  = _merge_sec_with_yf(df_cf_q,  sec_cf_q,  max_periods=40)
     except Exception:
@@ -2612,6 +2612,138 @@ def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: st
     )
 
     return fig
+
+def create_yoy_growth_bar_chart(
+    df_full: pd.DataFrame,
+    column_name: str,
+    title: str,
+    is_quarterly: bool = True,
+    max_periods: int = 40,
+    bar_color: str = "#f24e4e",
+    neg_color: str = "#b91c1c",
+    growth_mode: str = "yoy",
+    x_label: str = None
+):
+    """
+    Create a dedicated YoY / QoQ percentage growth bar chart styled after Qualtrim:
+    - Rounded vertical bars showing exact growth % for each period
+    - For Quarterly + YoY: compares each quarter Q_t to the same quarter a year prior Q_{t-4}
+    - For Annual + YoY (or Quarterly + QoQ): compares each period to the immediately preceding period
+    """
+    if df_full is None or df_full.empty or column_name not in df_full.columns:
+        return None
+
+    s = pd.to_numeric(df_full[column_name], errors="coerce").dropna()
+    if len(s) < 2:
+        return None
+
+    g_series = pd.Series(dtype=float)
+    if is_quarterly and growth_mode == "yoy":
+        # Match each quarter to exact same quarter 1 year ago (Q - 4)
+        g_dict = {}
+        s_map = {str(k): float(v) for k, v in s.items()}
+        for k_str, curr_val in s_map.items():
+            try:
+                prev_k = (pd.Period(k_str, freq="Q") - 4).strftime("%YQ%q")
+                if prev_k in s_map and s_map[prev_k] != 0:
+                    g_dict[k_str] = ((curr_val - s_map[prev_k]) / abs(s_map[prev_k])) * 100.0
+            except Exception:
+                pass
+        if g_dict:
+            g_series = pd.Series(g_dict)
+        else:
+            lag = 4 if len(s) > 4 else 1
+            prev_s = s.shift(lag).abs().replace(0, np.nan)
+            g_series = ((s.diff(lag)) / prev_s) * 100.0
+            g_series = g_series.dropna()
+    else:
+        prev_s = s.shift(1).abs().replace(0, np.nan)
+        g_series = ((s.diff(1)) / prev_s) * 100.0
+        g_series = g_series.dropna()
+
+    if g_series.empty:
+        return None
+
+    g_series = g_series.tail(max_periods)
+    raw_vals = [float(v) for v in g_series.values]
+
+    # Format X-axis labels cleanly (e.g., "2021Q1" -> "2021 Q1" as in the reference screenshot)
+    x_cats = []
+    for idx in g_series.index:
+        s_idx = str(idx)
+        if "Q" in s_idx and " Q" not in s_idx:
+            s_idx = s_idx.replace("Q", " Q")
+        x_cats.append(s_idx)
+
+    # Guard against a single turnaround quarter (+2000%) squashing all other bars flat,
+    # while keeping the exact unclipped percentage in the hover tooltip (customdata)
+    abs_sorted = sorted(abs(v) for v in raw_vals)
+    med_abs = abs_sorted[len(abs_sorted) // 2] if abs_sorted else 20.0
+    cap_limit = max(250.0, med_abs * 5.0) if med_abs < 80.0 else 1000.0
+    plot_vals = [max(-cap_limit, min(cap_limit, v)) for v in raw_vals]
+
+    colors = [bar_color if v >= 0 else neg_color for v in raw_vals]
+    show_bar_text = len(x_cats) <= 14
+    bar_texts = [f"{v:+.1f}%" for v in raw_vals] if show_bar_text else None
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_cats,
+        y=plot_vals,
+        customdata=raw_vals,
+        name=title,
+        marker=dict(
+            color=colors,
+            line=dict(width=0),
+            cornerradius=4
+        ),
+        text=bar_texts,
+        textposition="outside" if show_bar_text else "none",
+        textfont=dict(size=11, color="#d1d4dc", family="Outfit, Rubik, sans-serif"),
+        cliponaxis=False,
+        hovertemplate="<b>%{x}</b><br>Value: %{customdata:.2f}%<extra></extra>"
+    ))
+
+    fig.add_hline(y=0, line_color="rgba(255, 255, 255, 0.22)", line_width=1)
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{title}</b>",
+            font=dict(size=16, color="#ffffff", family="Outfit, Rubik, sans-serif"),
+            x=0.0
+        ),
+        xaxis=dict(
+            title=x_label or "",
+            type="category",
+            categoryorder="array",
+            categoryarray=x_cats,
+            showgrid=False,
+            tickangle=0,
+            nticks=14 if len(x_cats) > 16 else len(x_cats),
+            tickfont=dict(color="#848e9c", size=11)
+        ),
+        yaxis=dict(
+            title="",
+            ticksuffix="%",
+            showgrid=True,
+            gridcolor="rgba(255, 255, 255, 0.06)",
+            zeroline=True,
+            zerolinecolor="rgba(255, 255, 255, 0.22)",
+            tickfont=dict(color="#848e9c", size=11)
+        ),
+        hoverlabel=dict(
+            bgcolor="#131722",
+            bordercolor="#2a2e39",
+            font=dict(color="#ffffff", size=13, family="Outfit, Rubik, sans-serif")
+        ),
+        hovermode="x unified",
+        bargap=0.22,
+        height=370,
+        showlegend=False,
+        margin=dict(t=55, b=35, l=50, r=20)
+    )
+    return fig
+
 
 def create_line_chart(series: pd.Series, title: str, y_label: str):
     if series.empty:
@@ -5194,6 +5326,103 @@ if st.session_state.page_selector == "Dashboard":
                             if fig_cor:
                                 col_f4.plotly_chart(fig_cor, use_container_width=True)
 
+                        # ── Dedicated YoY Growth (%) Charts (Revenue Growth % & Profitability Growth %) ──
+                        st.markdown("---")
+                        _is_he_g = (st.session_state.language == "he")
+                        st.subheader(
+                            "📊 צמיחת הכנסות וצמיחת רווחיות באחוזים (YoY Growth %)"
+                            if _is_he_g
+                            else "📊 Revenue Growth (%) & Profitability Growth (%) — YoY"
+                        )
+
+                        _g_col1, _g_col2, _g_col3 = st.columns([1.2, 1.2, 1.6])
+                        with _g_col1:
+                            _g_chart_type = st.selectbox(
+                                "Chart Type / תצוגה" if _is_he_g else "Chart Type",
+                                options=["Quarterly (רבעוני)" if _is_he_g else "Quarterly", "Annual (שנתי)" if _is_he_g else "Annual"],
+                                index=0,
+                                key="yoy_growth_chart_type"
+                            )
+                        with _g_col2:
+                            _g_view_mode = st.selectbox(
+                                "View / חישוב צמיחה" if _is_he_g else "View",
+                                options=["YOY Growth (מול שנה שעברה)" if _is_he_g else "YOY Growth", "QoQ / Period Growth (מול תקופה קודמת)" if _is_he_g else "QoQ / Period Growth"],
+                                index=0,
+                                key="yoy_growth_view_mode"
+                            )
+                        with _g_col3:
+                            _prof_default_idx = 0 if earnings_choice == "Net Income (Bottom Line)" else 1
+                            _g_prof_metric = st.selectbox(
+                                "מדד רווחיות (Profitability Metric)" if _is_he_g else "Profitability Metric",
+                                options=[
+                                    "Net Income (רווח נקי)" if _is_he_g else "Net Income",
+                                    "Operating Income / EBIT (רווח תפעולי)" if _is_he_g else "Operating Income / EBIT",
+                                    "Gross Profit (רווח גולמי)" if _is_he_g else "Gross Profit",
+                                ],
+                                index=_prof_default_idx,
+                                key="yoy_growth_prof_metric"
+                            )
+
+                        _g_is_q = "Quarterly" in _g_chart_type or "רבעוני" in _g_chart_type
+                        _g_mode = "yoy" if "YOY" in _g_view_mode else "qoq"
+                        _g_df_full = df_fin_q if _g_is_q else df_fin_a
+                        _g_max_periods = (selected_years_tab2 * 4) if _g_is_q else selected_years_tab2
+                        _g_mode_lbl = "YOY Growth" if _g_mode == "yoy" else ("QoQ Growth" if _g_is_q else "YoY Growth")
+                        _g_tf_lbl = ("רבעוני" if _g_is_q else "שנתי") if _is_he_g else ("Quarterly" if _g_is_q else "Annual")
+
+                        if _g_df_full is not None and not _g_df_full.empty:
+                            # 1. Revenue Growth (%) Bar Chart
+                            _g_rev_col = "Total Revenue" if "Total Revenue" in _g_df_full.columns else ("Operating Revenue" if "Operating Revenue" in _g_df_full.columns else None)
+                            if _g_rev_col:
+                                _rev_g_title = (
+                                    f"🟥 צמיחת הכנסות באחוזים — Total Revenues ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
+                                    if _is_he_g
+                                    else f"🟥 Total Revenues — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
+                                )
+                                fig_rev_yoy = create_yoy_growth_bar_chart(
+                                    _g_df_full,
+                                    _g_rev_col,
+                                    _rev_g_title,
+                                    is_quarterly=_g_is_q,
+                                    max_periods=_g_max_periods,
+                                    bar_color="#f24e4e",
+                                    neg_color="#991b1b",
+                                    growth_mode=_g_mode,
+                                )
+                                if fig_rev_yoy:
+                                    st.plotly_chart(fig_rev_yoy, use_container_width=True)
+
+                            # 2. Profitability Growth (%) Bar Chart
+                            if "Net Income" in _g_prof_metric:
+                                _g_prof_col = "Net Income" if "Net Income" in _g_df_full.columns else None
+                                _prof_lbl = "רווח נקי (Net Income)" if _is_he_g else "Net Income"
+                            elif "Operating" in _g_prof_metric:
+                                _g_prof_col = "Operating Income" if "Operating Income" in _g_df_full.columns else ("EBIT" if "EBIT" in _g_df_full.columns else None)
+                                _prof_lbl = "רווח תפעולי (Operating Income)" if _is_he_g else "Operating Income / EBIT"
+                            else:
+                                _g_prof_col = "Gross Profit" if "Gross Profit" in _g_df_full.columns else None
+                                _prof_lbl = "רווח גולמי (Gross Profit)" if _is_he_g else "Gross Profit"
+
+                            if _g_prof_col:
+                                _prof_g_title = (
+                                    f"🟥 צמיחת רווחיות באחוזים — {_prof_lbl} ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
+                                    if _is_he_g
+                                    else f"🟥 Profitability Growth ({_prof_lbl}) — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
+                                )
+                                fig_prof_yoy = create_yoy_growth_bar_chart(
+                                    _g_df_full,
+                                    _g_prof_col,
+                                    _prof_g_title,
+                                    is_quarterly=_g_is_q,
+                                    max_periods=_g_max_periods,
+                                    bar_color="#f24e4e",
+                                    neg_color="#991b1b",
+                                    growth_mode=_g_mode,
+                                )
+                                if fig_prof_yoy:
+                                    st.plotly_chart(fig_prof_yoy, use_container_width=True)
+
+                        st.markdown("---")
                         # --- Margin Charts (Gross + Net/Op side by side) ---
                         col_mg1, col_mg2 = st.columns(2)
 
