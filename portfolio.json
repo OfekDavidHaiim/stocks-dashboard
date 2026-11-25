@@ -25,7 +25,7 @@
             "currentPrice": 499.94000244140625,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 522.6099853515625
+            "prevClosePrice": 518.760009765625
         },
         {
             "id": "4_1780495791.149946_0.8269889893430076",
@@ -44,7 +44,7 @@
             "currentPrice": 184.02000427246094,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 180.7100067138672
+            "prevClosePrice": 242.4499969482422
         },
         {
             "id": "7_1780495791.150008_0.3309760724123072",
@@ -59,7 +59,7 @@
             "currentPrice": 129.8699951171875,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 127.55999755859375
+            "prevClosePrice": 129.58999633789062
         },
         {
             "id": "6_1780495791.149987_0.07498589789711085",
@@ -74,7 +74,7 @@
             "currentPrice": 250.41000366210938,
             "locked": false,
             "currency": "USD",
-            "prevClosePrice": 247.89999389648438
+            "prevClosePrice": 247.08999633789062
         },
         {
             "id": "1780497659.098571_0.3715223988840236",
@@ -89,7 +89,7 @@
             "sells": [],
             "currentPrice": 62.75,
             "locked": false,
-            "prevClosePrice": 63.06999969482422
+            "prevClosePrice": 71.87000274658203
         },
         {
             "id": "1780497803.142143_0.08337689043678842",
@@ -104,22 +104,7 @@
             "sells": [],
             "currentPrice": 29.209999084472656,
             "locked": false,
-            "prevClosePrice": 29.350000381469727
-        },
-        {
-            "id": "1780497442.65047_0.2688869708819652",
-            "symbol": "SOFI",
-            "currency": "USD",
-            "buys": [
-                {
-                    "p": 16.03,
-                    "q": 100.0
-                }
-            ],
-            "sells": [],
-            "currentPrice": 16.309999465942383,
-            "locked": false,
-            "prevClosePrice": 16.469999313354492
+            "prevClosePrice": 29.719999313354492
         },
         {
             "id": "1780497654.362546_0.9976082401314909",
@@ -132,9 +117,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 366.1300048828125,
+            "currentPrice": 406.75,
             "locked": false,
-            "prevClosePrice": 366.2699890136719
+            "prevClosePrice": 402.9200134277344
         },
         {
             "id": "1780497650.022737_0.17443380526300734",
@@ -147,9 +132,39 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 464.7200012207031,
+            "currentPrice": 530.780029296875,
             "locked": false,
-            "prevClosePrice": 451.1000061035156
+            "prevClosePrice": 533.52001953125
+        },
+        {
+            "id": "1780497442.65047_0.2688869708819652",
+            "symbol": "SOFI",
+            "currency": "USD",
+            "buys": [
+                {
+                    "p": 16.03,
+                    "q": 100.0
+                }
+            ],
+            "sells": [],
+            "currentPrice": 14.675000190734863,
+            "locked": false,
+            "prevClosePrice": 14.300000190734863
+        },
+        {
+            "id": "1780762007.441868_0.5633577453901008",
+            "symbol": "BMNR",
+            "currency": "USD",
+            "buys": [
+                {
+                    "p": 17.87,
+                    "q": 56.0
+                }
+            ],
+            "sells": [],
+            "currentPrice": 22.80500030517578,
+            "prevClosePrice": 21.56999969482422,
+            "locked": false
         },
         {
             "id": "1780497653.364499_0.6386975416727173",
@@ -162,9 +177,9 @@
                 }
             ],
             "sells": [],
-            "currentPrice": 122.25,
+            "currentPrice": 108.36399841308594,
             "locked": false,
-            "prevClosePrice": 116.31999969482422
+            "prevClosePrice": 108.56999969482422
         },
         {
             "id": "1780498105.969742_0.8808906734608393",
@@ -179,22 +194,7 @@
             "sells": [],
             "currentPrice": 41.709999084472656,
             "locked": false,
-            "prevClosePrice": 42.290000915527344
-        },
-        {
-            "id": "1780762007.441868_0.5633577453901008",
-            "symbol": "BMNR",
-            "currency": "USD",
-            "buys": [
-                {
-                    "p": 17.87,
-                    "q": 56.0
-                }
-            ],
-            "sells": [],
-            "currentPrice": 17.280000686645508,
-            "prevClosePrice": 18.079999923706055,
-            "locked": false
+            "prevClosePrice": 37.209999084472656
         },
         {
             "id": "1780497368.522782_0.06333504377969124",

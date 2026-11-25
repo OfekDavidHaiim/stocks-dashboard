@@ -332,6 +332,72 @@ def get_usd_ils_rate():
 # --- Internationalization ---
 from translations import TRANSLATIONS
 
+CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "ILS": "₪",
+    "ILA": "₪",
+    "EUR": "€",
+    "GBP": "£",
+    "GBp": "£",
+    "GBX": "£",
+    "CNY": "¥",
+    "CNH": "¥",
+    "JPY": "¥",
+    "TWD": "NT$",
+    "DKK": "kr",
+    "SEK": "kr",
+    "NOK": "kr",
+    "CHF": "CHF ",
+    "CAD": "C$",
+    "AUD": "A$",
+    "HKD": "HK$",
+    "KRW": "₩",
+    "INR": "₹",
+}
+
+_DYNAMIC_CURRENCY_TR_KEYS = {
+    "target_price_fv",
+    "intrinsic_value_pv",
+    "historical_stock_price",
+    "backtest_target_intrinsic",
+    "historic_price_undervalued_info",
+    "historic_price_overvalued_info",
+}
+
+def _norm_currency_code(code: str) -> str:
+    if not code:
+        return "USD"
+    c = str(code).strip()
+    if c == "ILA":
+        return "ILS"
+    if c in ("GBp", "GBX"):
+        return "GBP"
+    if c == "ZAc":
+        return "ZAR"
+    if c == "CNH":
+        return "CNY"
+    return c.upper()
+
+def currency_symbol_for(code: str) -> str:
+    if not code:
+        return "$"
+    c = str(code).strip()
+    return CURRENCY_SYMBOLS.get(c) or CURRENCY_SYMBOLS.get(_norm_currency_code(c), f"{_norm_currency_code(c)} ")
+
+def _get_effective_shares(info: dict) -> float:
+    if not info:
+        return 1.0
+    for key in ("impliedSharesOutstanding", "sharesOutstanding"):
+        val = info.get(key)
+        if val is not None and not pd.isna(val):
+            try:
+                fval = float(val)
+                if fval > 0:
+                    return fval
+            except Exception:
+                pass
+    return 1.0
+
 def cs() -> str:
     """Get dynamic currency symbol based on current stock currency."""
     return st.session_state.get("currency_symbol", "$")
@@ -341,7 +407,7 @@ def tr(key: str) -> str:
     lang = st.session_state.get("language", "en")
     val = TRANSLATIONS.get(lang, {}).get(key, key)
     symbol = cs()
-    if symbol != "$" and isinstance(val, str):
+    if symbol != "$" and isinstance(val, str) and key in _DYNAMIC_CURRENCY_TR_KEYS:
         val = val.replace("$", symbol)
     return val
 
@@ -1065,10 +1131,14 @@ def create_technical_gauge(gauge_value, recommendation):
     return fig
 
 
-def render_financial_forecasting_tab(df_fin_a):
+def render_financial_forecasting_tab(df_fin_a, fin_curr: str = "USD"):
     if df_fin_a is None or df_fin_a.empty:
         st.info("נתוני דוחות פיננסיים שנתיים אינם זמינים עבור מניה זו לצורך חישוב תחזיות." if st.session_state.language == 'he' else "Annual financial statement data is not available for this stock to calculate projections.")
         return
+
+    _fc_proj = _norm_currency_code(fin_curr or "USD")
+    if _fc_proj != "USD":
+        df_fin_a = _convert_statement_df_to_usd(df_fin_a, _fc_proj, is_quarterly=False)
 
     # Check for columns
     rev_col = 'Total Revenue' if 'Total Revenue' in df_fin_a.columns else ('Operating Revenue' if 'Operating Revenue' in df_fin_a.columns else None)
@@ -1100,8 +1170,8 @@ def render_financial_forecasting_tab(df_fin_a):
         
     hist_years = valid_years[-4:]
     df_hist = df_sorted.loc[hist_years]
-    
-    sym = cs()
+
+    sym = "$"
     
     # Calculate historical growth rates
     hist_rev = []
@@ -1355,13 +1425,19 @@ def render_manual_valuation_calculator(info, df_fin_a, ticker_sym=""):
     ))
 
     sym_cur = cs()
-    shares_out = info.get('sharesOutstanding', 1) or 1
+    shares_out = _get_effective_shares(info)
     current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0.0
     market_cap = info.get('marketCap') or (current_price * shares_out)
     trailing_pe = info.get('trailingPE') or 20.0
     forward_pe  = info.get('forwardPE')  or trailing_pe
 
-    # Derive base revenue from financial statements
+    trade_curr = _norm_currency_code(info.get("_trade_currency") or info.get("currency", "USD"))
+    fin_curr = _norm_currency_code(info.get("_financial_currency") or info.get("financialCurrency") or trade_curr)
+    fx_fin_to_trade, _ = get_fx_data(fin_curr, trade_curr)
+    if not fx_fin_to_trade or fx_fin_to_trade <= 0:
+        fx_fin_to_trade = info.get("_fx_fin_to_trade") or 1.0
+
+    # Derive base revenue from financial statements and convert from fin_curr to trade_curr
     base_rev = 0.0
     if df_fin_a is not None and not df_fin_a.empty:
         rev_col_f = 'Total Revenue' if 'Total Revenue' in df_fin_a.columns else (
@@ -1373,7 +1449,7 @@ def render_manual_valuation_calculator(info, df_fin_a, ticker_sym=""):
     if base_rev == 0:
         base_rev = info.get('totalRevenue') or 0.0
 
-    base_rev_b = base_rev / 1e9  # convert to billions for display
+    base_rev_b = (base_rev * fx_fin_to_trade) / 1e9  # convert to billions in trading currency for display
 
     # Derive base margin
     net_income = 0.0
@@ -1868,11 +1944,49 @@ def _get_sec_cik_map() -> dict:
     return {}
 
 
-def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = None):
+def _detect_statement_currency(ticker_symbol: str) -> str:
+    """Detect the financial reporting currency directly from Yahoo fundamentals-timeseries."""
+    try:
+        url = (
+            f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{ticker_symbol}"
+            f"?symbol={ticker_symbol}&type=annualTotalRevenue,annualOperatingRevenue,annualNetIncome"
+            f"&period1=1483142400&period2=1900000000"
+        )
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            res = r.json().get("timeseries", {}).get("result", [])
+            for item in res:
+                for k, v in item.items():
+                    if k not in ("meta", "timestamp") and isinstance(v, list):
+                        for pt in reversed(v):
+                            if isinstance(pt, dict) and pt.get("currencyCode"):
+                                return str(pt["currencyCode"]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _to_fiscal_q_str(e_dt: pd.Timestamp) -> str:
+    """
+    Map a period-end timestamp to a consistent calendar-quarter key 'YYYYQ#'.
+    For 52/53-week fiscal calendars that end 1-6 days into the next quarter
+    (e.g. Jan 1-3, Apr 1-3, Jul 1-3, Oct 1-3), shift back 6 days to avoid collisions.
+    """
+    ts = pd.Timestamp(e_dt)
+    if ts.month in (1, 4, 7, 10) and ts.day <= 6:
+        ts = ts - pd.Timedelta(days=6)
+    return ts.to_period('Q').strftime('%YQ%q')
+
+
+def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = None, preferred_currency: str = None):
     """
     Fetch 10+ years of Annual (10-K/20-F/40-F) and Quarterly (10-Q) financial statements
     from the official SEC EDGAR XBRL API, automatically adjusting historical EPS and
-    share counts for subsequent stock splits.
+    share counts for subsequent stock splits while keeping currency consistent.
     """
     empty = pd.DataFrame()
     try:
@@ -1896,6 +2010,27 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                 gaap.update(facts_json[ns])
         if not gaap:
             return empty, empty, empty, empty, empty, empty
+
+        pref_curr = _norm_currency_code(preferred_currency) if preferred_currency else None
+
+        def _pick_unit_items(units_dict, is_eps=False, is_shares=False):
+            if not units_dict:
+                return []
+            if is_shares:
+                return units_dict.get('shares') or next(iter(units_dict.values()), [])
+            if is_eps:
+                if pref_curr:
+                    for uk, uvals in units_dict.items():
+                        if uk.upper() == f"{pref_curr}/SHARES":
+                            return uvals
+                    return []
+                return units_dict.get('USD/shares') or next(iter(units_dict.values()), [])
+            if pref_curr:
+                for uk, uvals in units_dict.items():
+                    if uk.upper() == pref_curr:
+                        return uvals
+                return []
+            return units_dict.get('USD') or next(iter(units_dict.values()), [])
 
         # Prepare timezone-naive splits series for split adjustment
         splits_clean = pd.Series(dtype=float)
@@ -1926,12 +2061,23 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                 'NetIncomeLoss', 'ProfitLossAttributableToOwnersOfParent',
                 'NetIncomeLossAvailableToCommonStockholdersBasic', 'ProfitLoss'
             ],
-            'Diluted EPS': ['EarningsPerShareDiluted', 'DilutedEarningsLossPerShare'],
-            'Basic EPS': ['EarningsPerShareBasic', 'BasicEarningsLossPerShare'],
-            'Diluted Average Shares': [
-                'WeightedAverageNumberOfDilutedSharesOutstanding', 'WeightedAverageShares'
+            'Diluted EPS': [
+                'EarningsPerShareDiluted', 'DilutedEarningsLossPerShare',
+                'EarningsPerShareBasicAndDiluted', 'IncomeLossFromContinuingOperationsPerDilutedShare'
             ],
-            'Basic Average Shares': ['WeightedAverageNumberOfSharesOutstandingBasic'],
+            'Basic EPS': [
+                'EarningsPerShareBasic', 'BasicEarningsLossPerShare',
+                'EarningsPerShareBasicAndDiluted'
+            ],
+            'Diluted Average Shares': [
+                'WeightedAverageNumberOfDilutedSharesOutstanding',
+                'WeightedAverageNumberOfSharesOutstandingBasicAndDiluted',
+                'WeightedAverageShares'
+            ],
+            'Basic Average Shares': [
+                'WeightedAverageNumberOfSharesOutstandingBasic',
+                'WeightedAverageNumberOfSharesOutstandingBasicAndDiluted'
+            ],
         }
 
         CF_CONCEPTS = {
@@ -1977,6 +2123,21 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
         }
 
         annual_forms = {'10-K', '10-K/A', '20-F', '20-F/A', '40-F', '40-F/A'}
+        primary_fin_forms = annual_forms | {'10-Q', '10-Q/A', 'S-1', 'S-1/A', '6-K', '6-K/A'}
+        skip_proxy_forms = {'DEF 14A', 'DEF 14A/A', 'PRE 14A', 'DEFA14A'}
+
+        def _find_match_by_start(entries, target_start, max_end=None):
+            best = None
+            best_diff = 999
+            for ent in entries:
+                if max_end is not None and ent['end'] >= max_end:
+                    continue
+                diff = abs((ent['start'] - target_start).days)
+                if diff <= 6:
+                    if diff < best_diff or (diff == best_diff and (best is None or ent['filed'] > best['filed'])):
+                        best = ent
+                        best_diff = diff
+            return best
 
         def _extract_flow_group(concept_dict):
             ann_cols = {}
@@ -1993,38 +2154,58 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                     if tag not in gaap:
                         continue
                     units_dict = gaap[tag].get('units', {})
-                    if not units_dict:
+                    items = _pick_unit_items(units_dict, is_eps=is_eps, is_shares=is_shares)
+                    if not items:
                         continue
-                    if is_eps:
-                        items = units_dict.get('USD/shares') or next(iter(units_dict.values()), [])
-                    elif is_shares:
-                        items = units_dict.get('shares') or next(iter(units_dict.values()), [])
-                    else:
-                        items = units_dict.get('USD') or next(iter(units_dict.values()), [])
 
-                    a_rows, q_rows = [], []
+                    # Deduplicate by (start, end) preferring primary financial filings over proxy/other forms, then latest filed
+                    by_span = {}
                     for it in items:
                         if 'start' not in it or 'end' not in it or it.get('val') is None:
                             continue
+                        form_u = str(it.get('form', '') or '').upper().strip()
+                        if form_u in skip_proxy_forms:
+                            continue
                         s_dt = pd.to_datetime(it['start'])
                         e_dt = pd.to_datetime(it['end'])
-                        days = (e_dt - s_dt).days
                         f_dt = pd.to_datetime(it.get('filed', it['end']))
                         val = float(it['val'])
                         if (is_eps or is_shares) and not splits_clean.empty:
                             later_splits = splits_clean[splits_clean.index > f_dt]
                             factor = float(later_splits.prod()) if not later_splits.empty else 1.0
                             val = (val / factor) if is_eps else (val * factor)
+                        is_prim = form_u in primary_fin_forms
+                        key_span = (s_dt, e_dt)
+                        prev_ent = by_span.get(key_span)
+                        if prev_ent is None or (is_prim, f_dt) >= (prev_ent['is_prim'], prev_ent['filed']):
+                            by_span[key_span] = {
+                                'start': s_dt,
+                                'end': e_dt,
+                                'days': (e_dt - s_dt).days,
+                                'filed': f_dt,
+                                'is_prim': is_prim,
+                                'val': val,
+                                'form': form_u,
+                                'fp': it.get('fp', ''),
+                            }
 
-                        form = it.get('form', '')
-                        fp = it.get('fp', '')
-                        if 330 <= days <= 380 and (form in annual_forms or fp == 'FY'):
+                    a_rows = []
+                    standalone_q, ytd6, ytd9, fy_list = [], [], [], []
+                    for ent in by_span.values():
+                        days = ent['days']
+                        e_dt = ent['end']
+                        form, fp = ent['form'], ent['fp']
+                        if 325 <= days <= 390 and (form in annual_forms or fp == 'FY'):
                             yr = (e_dt - pd.Timedelta(days=6)).year if (e_dt.month == 1 and e_dt.day <= 6) else e_dt.year
-                            qp = e_dt.to_period('Q').strftime('%YQ%q')
-                            a_rows.append({'year': yr, 'q_period': qp, 'filed': f_dt, 'val': val})
-                        elif 75 <= days <= 105:
-                            qp = e_dt.to_period('Q').strftime('%YQ%q')
-                            q_rows.append({'q_period': qp, 'filed': f_dt, 'val': val})
+                            qp = _to_fiscal_q_str(e_dt)
+                            a_rows.append({'year': yr, 'q_period': qp, 'filed': ent['filed'], 'val': ent['val']})
+                            fy_list.append(ent)
+                        elif 65 <= days <= 115:
+                            standalone_q.append(ent)
+                        elif 155 <= days <= 205:
+                            ytd6.append(ent)
+                        elif 245 <= days <= 295:
+                            ytd9.append(ent)
 
                     if a_rows:
                         df_a_tag = pd.DataFrame(a_rows).sort_values('filed')
@@ -2032,9 +2213,46 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                         s_aq = df_a_tag.groupby('q_period').last()['val']
                         s_ann_combined = s_a if s_ann_combined.empty else s_ann_combined.combine_first(s_a)
                         s_ann_q_combined = s_aq if s_ann_q_combined.empty else s_ann_q_combined.combine_first(s_aq)
-                    if q_rows:
-                        df_q_tag = pd.DataFrame(q_rows).sort_values('filed')
-                        s_q = df_q_tag.groupby('q_period').last()['val']
+
+                    # Build standalone quarters map, then reconstruct missing Q2/Q3/Q4 from YTD cumulative filings
+                    q_tag_map = {}
+                    q_tag_filed = {}
+                    for ent in sorted(standalone_q, key=lambda x: x['filed']):
+                        qp = _to_fiscal_q_str(ent['end'])
+                        q_tag_map[qp] = ent['val']
+                        q_tag_filed[qp] = ent['filed']
+
+                    if is_shares:
+                        # Weighted-average shares are non-additive: fill missing Q2/Q3/Q4 from YTD / FY averages
+                        for ent in sorted(ytd6 + ytd9 + fy_list, key=lambda x: x['filed']):
+                            qp = _to_fiscal_q_str(ent['end'])
+                            if qp not in q_tag_map:
+                                q_tag_map[qp] = ent['val']
+                    else:
+                        # Reconstruct Q2 = YTD_6M - Q1
+                        for ent6 in sorted(ytd6, key=lambda x: x['filed']):
+                            qp2 = _to_fiscal_q_str(ent6['end'])
+                            if qp2 not in q_tag_map:
+                                m1 = _find_match_by_start(standalone_q, ent6['start'], max_end=ent6['end'] - pd.Timedelta(days=45))
+                                if m1 is not None:
+                                    q_tag_map[qp2] = ent6['val'] - m1['val']
+                        # Reconstruct Q3 = YTD_9M - YTD_6M
+                        for ent9 in sorted(ytd9, key=lambda x: x['filed']):
+                            qp3 = _to_fiscal_q_str(ent9['end'])
+                            if qp3 not in q_tag_map:
+                                m6 = _find_match_by_start(ytd6, ent9['start'], max_end=ent9['end'] - pd.Timedelta(days=45))
+                                if m6 is not None:
+                                    q_tag_map[qp3] = ent9['val'] - m6['val']
+                        # Reconstruct Q4 = FY - YTD_9M
+                        for ent_fy in sorted(fy_list, key=lambda x: x['filed']):
+                            qp4 = _to_fiscal_q_str(ent_fy['end'])
+                            if qp4 not in q_tag_map:
+                                m9 = _find_match_by_start(ytd9, ent_fy['start'], max_end=ent_fy['end'] - pd.Timedelta(days=45))
+                                if m9 is not None:
+                                    q_tag_map[qp4] = ent_fy['val'] - m9['val']
+
+                    if q_tag_map:
+                        s_q = pd.Series(q_tag_map).sort_index()
                         s_q_combined = s_q if s_q_combined.empty else s_q_combined.combine_first(s_q)
 
                 if not s_ann_combined.empty:
@@ -2047,7 +2265,7 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
             df_ann_out = pd.DataFrame(ann_cols).sort_index() if ann_cols else pd.DataFrame()
             df_q_out = pd.DataFrame(q_cols).sort_index() if q_cols else pd.DataFrame()
 
-            # Fill missing fiscal Q4 in df_q_out using Annual - (Q1 + Q2 + Q3)
+            # Cross-tag fallback: fill any remaining missing Q4 in df_q_out using Annual - (Q1 + Q2 + Q3)
             if not df_q_out.empty and ann_q_map:
                 for col_name, s_aq in ann_q_map.items():
                     if col_name not in df_q_out.columns:
@@ -2081,9 +2299,9 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                     if tag not in gaap:
                         continue
                     units_dict = gaap[tag].get('units', {})
-                    if not units_dict:
+                    items = _pick_unit_items(units_dict, is_eps=False, is_shares=False)
+                    if not items:
                         continue
-                    items = units_dict.get('USD') or next(iter(units_dict.values()), [])
                     a_rows, q_rows = [], []
                     for it in items:
                         if 'end' not in it or 'start' in it or it.get('val') is None:
@@ -2093,7 +2311,7 @@ def _fetch_sec_edgar_statements(ticker_symbol: str, splits_series: pd.Series = N
                         val = float(it['val'])
                         form = it.get('form', '')
                         fp = it.get('fp', '')
-                        qp = e_dt.to_period('Q').strftime('%YQ%q')
+                        qp = _to_fiscal_q_str(e_dt)
                         q_rows.append({'q_period': qp, 'filed': f_dt, 'val': val})
                         if form in annual_forms or fp == 'FY':
                             yr = (e_dt - pd.Timedelta(days=6)).year if (e_dt.month == 1 and e_dt.day <= 6) else e_dt.year
@@ -2219,6 +2437,644 @@ def _merge_sec_with_yf(yf_df: pd.DataFrame, sec_df: pd.DataFrame, max_periods: i
         return yf_df.tail(max_periods)
 
 
+def _lookup_fx_series_rate(fx_series: pd.Series, fx_spot: float, dt: pd.Timestamp) -> float:
+    """Return historical FX rate on or right before `dt`, falling back to earliest or spot rate."""
+    try:
+        if fx_series is not None and not fx_series.empty:
+            pos = int(fx_series.index.searchsorted(pd.Timestamp(dt).normalize(), side="right")) - 1
+            val = float(fx_series.iloc[pos]) if pos >= 0 else float(fx_series.iloc[0])
+            if np.isfinite(val) and val > 0:
+                return val
+    except Exception:
+        pass
+    return float(fx_spot) if fx_spot and np.isfinite(fx_spot) and fx_spot > 0 else 1.0
+
+
+def _convert_statement_df_to_usd(df: pd.DataFrame, from_curr: str, is_quarterly: bool = False) -> pd.DataFrame:
+    """
+    Convert monetary and per-share columns in a statement DataFrame from `from_curr` into USD
+    using period-end historical FX rates (`get_fx_data`), while keeping share counts and ratios unchanged.
+    """
+    fc = _norm_currency_code(from_curr or "USD")
+    if df is None or df.empty or not fc or fc == "USD":
+        return df
+    try:
+        fx_spot, fx_series = get_fx_data(fc, "USD")
+        if not fx_spot or not np.isfinite(fx_spot) or fx_spot <= 0:
+            return df
+
+        def _is_non_monetary_col(col_name: str) -> bool:
+            cl = str(col_name).strip().lower()
+            if cl in (
+                "diluted average shares", "basic average shares",
+                "ordinary shares number", "share issued", "treasury shares number",
+                "tax rate for calcs", "number of employees",
+            ):
+                return True
+            if any(k in cl for k in ("tax rate", "margin", "ratio", "employees", "split")):
+                return True
+            if "shares" in cl and "per" not in cl and "based" not in cl:
+                return True
+            return False
+
+        rates = []
+        for idx in df.index:
+            dt = None
+            try:
+                if is_quarterly:
+                    dt = pd.Period(str(idx), freq="Q").end_time.normalize()
+                else:
+                    s_idx = str(idx).strip()
+                    if s_idx.isdigit() and len(s_idx) == 4:
+                        dt = pd.Timestamp(f"{s_idx}-12-31")
+                    else:
+                        dt = pd.to_datetime(idx, errors="coerce")
+            except Exception:
+                dt = None
+            if dt is not None and pd.notna(dt):
+                rates.append(_lookup_fx_series_rate(fx_series, fx_spot, dt))
+            else:
+                rates.append(float(fx_spot))
+
+        rate_s = pd.Series(rates, index=df.index, dtype=float)
+        out = df.copy()
+        for col in out.columns:
+            if _is_non_monetary_col(col):
+                continue
+            num_s = pd.to_numeric(out[col], errors="coerce")
+            if num_s.notna().any():
+                out[col] = num_s * rate_s
+        return out
+    except Exception:
+        return df
+
+
+def _scale_adr_eps_if_needed(src_fin_q: pd.DataFrame, ref_fin_q: pd.DataFrame = None,
+                             ref_shares: float = None) -> pd.DataFrame:
+    """
+    Align source `Diluted EPS` / `Basic EPS` to ADR / reference per-share scale when overlapping
+    quarters (or `Net Income / Diluted EPS` vs `ref_shares`) reveal an integer ADR multiple.
+    """
+    if src_fin_q is None or src_fin_q.empty or "Diluted EPS" not in src_fin_q.columns:
+        return src_fin_q
+    try:
+        ratios = []
+        if ref_fin_q is not None and not ref_fin_q.empty and "Diluted EPS" in ref_fin_q.columns:
+            common = src_fin_q.index.intersection(ref_fin_q.index)
+            for idx in common:
+                sv = pd.to_numeric(src_fin_q.loc[idx, "Diluted EPS"], errors="coerce")
+                rv = pd.to_numeric(ref_fin_q.loc[idx, "Diluted EPS"], errors="coerce")
+                if pd.notna(sv) and pd.notna(rv) and abs(sv) > 1e-4 and abs(rv) > 1e-4 and (sv * rv > 0):
+                    ratios.append(float(rv) / float(sv))
+        if not ratios and ref_shares and ref_shares > 1 and "Net Income" in src_fin_q.columns:
+            sub = src_fin_q[["Net Income", "Diluted EPS"]].apply(pd.to_numeric, errors="coerce").dropna().tail(4)
+            for _, row in sub.iterrows():
+                if abs(row["Diluted EPS"]) > 0.02 and (row["Net Income"] * row["Diluted EPS"] > 0):
+                    implied_sh = float(row["Net Income"]) / float(row["Diluted EPS"])
+                    if implied_sh > 0:
+                        ratios.append(implied_sh / float(ref_shares))
+        if not ratios:
+            return src_fin_q
+        med_r = float(np.median(ratios))
+        if not (med_r >= 1.8 or med_r <= 0.55):
+            return src_fin_q
+        if med_r >= 1.8 and abs(med_r - round(med_r)) / med_r < 0.18:
+            mult = float(round(med_r))
+        elif med_r <= 0.55 and abs((1.0 / med_r) - round(1.0 / med_r)) / (1.0 / med_r) < 0.18:
+            mult = 1.0 / float(round(1.0 / med_r))
+        else:
+            mult = med_r
+        out = src_fin_q.copy()
+        for col in ("Diluted EPS", "Basic EPS"):
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce") * mult
+        return out
+    except Exception:
+        return src_fin_q
+
+
+def _fetch_stockanalysis_quarterly(ticker_symbol: str, fin_curr: str,
+                                   ref_fin_q: pd.DataFrame = None,
+                                   ref_shares: float = None):
+    """
+    Fetch ~20 quarters (5 years) of Income Statement, Balance Sheet & Cash Flow from
+    StockAnalysis SSR HTML tables (especially valuable for foreign 20-F/6-K and `.TA` stocks).
+    Converts values to `fin_curr` and aligns EPS to ADR scale if needed.
+    """
+    import re
+    from bs4 import BeautifulSoup
+
+    empty = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    sym = (ticker_symbol or "").strip().upper()
+    if not sym:
+        return empty
+
+    if sym.endswith(".TA"):
+        base_sym = sym[:-3]
+        base_urls = [
+            f"https://stockanalysis.com/quote/tlv/{base_sym}",
+            f"https://stockanalysis.com/stocks/{base_sym.lower()}",
+        ]
+    elif "-" in sym:
+        base_urls = [
+            f"https://stockanalysis.com/stocks/{sym.lower().replace('-', '.')}",
+            f"https://stockanalysis.com/stocks/{sym.lower()}",
+        ]
+    else:
+        base_urls = [f"https://stockanalysis.com/stocks/{sym.lower()}"]
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    unit_scale_map = {"billions": 1e9, "millions": 1e6, "thousands": 1e3}
+    fx_cache: dict[str, tuple[float, pd.Series]] = {}
+
+    def _parse_sa_page(html_text: str, row_spec: dict):
+        soup = BeautifulSoup(html_text, "html.parser")
+        tbl = soup.find("table")
+        if tbl is None:
+            return pd.DataFrame()
+        page_txt = soup.get_text(" ", strip=True)
+        sa_curr = fin_curr
+        unit_mult = 1e6
+        m_note = re.search(
+            r"Financials in\s+(?:(billions|millions|thousands)\s+)?([A-Za-z]{3})\b",
+            page_txt, re.IGNORECASE
+        )
+        if m_note:
+            if m_note.group(1):
+                unit_mult = unit_scale_map.get(m_note.group(1).lower(), 1e6)
+            else:
+                unit_mult = 1.0
+            sa_curr = _norm_currency_code(m_note.group(2).upper())
+
+        if sa_curr not in fx_cache:
+            fx_cache[sa_curr] = get_fx_data(sa_curr, fin_curr) if sa_curr != fin_curr else (1.0, pd.Series(dtype=float))
+        fx_spot, fx_series = fx_cache[sa_curr]
+
+        q_keys = []
+        q_dates = []
+        raw_rows = tbl.find_all("tr")
+        for tr_el in raw_rows:
+            cells = [c.get_text(" ", strip=True) for c in tr_el.find_all(["th", "td"])]
+            if len(cells) < 2:
+                continue
+            c0 = re.sub(r"\s+", " ", cells[0]).strip().lower()
+            if c0.startswith("period ending"):
+                parsed_q, parsed_dt = [], []
+                for cell in cells[1:]:
+                    m_dt = re.search(r"([A-Za-z]{3}\s+\d{1,2},\s+\d{4})", cell)
+                    dt_val = pd.to_datetime(m_dt.group(1) if m_dt else cell, errors="coerce")
+                    if pd.notna(dt_val):
+                        parsed_q.append(_to_fiscal_q_str(dt_val))
+                        parsed_dt.append(dt_val.normalize())
+                    else:
+                        parsed_q.append(None)
+                        parsed_dt.append(None)
+                if any(parsed_q):
+                    q_keys, q_dates = parsed_q, parsed_dt
+                    break
+
+        if not q_keys and raw_rows:
+            for tr_el in raw_rows[:2]:
+                cells = [c.get_text(" ", strip=True) for c in tr_el.find_all(["th", "td"])]
+                c0 = re.sub(r"\s+", " ", cells[0]).strip().lower()
+                if c0.startswith("fiscal quarter") and len(cells) >= 2:
+                    for cell in cells[1:]:
+                        m_fq = re.search(r"Q([1-4])\s+(\d{4})", cell, re.IGNORECASE)
+                        if m_fq:
+                            q_str = f"{m_fq.group(2)}Q{m_fq.group(1)}"
+                            q_keys.append(q_str)
+                            q_dates.append(pd.Period(q_str, freq="Q").end_time.normalize())
+                        else:
+                            q_keys.append(None)
+                            q_dates.append(None)
+                    break
+
+        if not q_keys or not any(q_keys):
+            return pd.DataFrame()
+
+        data_by_q: dict[str, dict[str, float]] = {}
+        for tr_el in raw_rows:
+            cells = [c.get_text(" ", strip=True) for c in tr_el.find_all(["th", "td"])]
+            if len(cells) < 2:
+                continue
+            label = re.sub(r"\s+", " ", cells[0]).strip().lower()
+            target = row_spec.get(label)
+            if not target:
+                continue
+            std_col, is_per_share, negate = target
+            for col_i, cell_val in enumerate(cells[1:]):
+                if col_i >= len(q_keys) or not q_keys[col_i]:
+                    continue
+                s_val = cell_val.strip().replace(",", "")
+                if not s_val or s_val in ("-", "—", "N/A", "nan") or s_val.endswith("%"):
+                    continue
+                try:
+                    num = float(s_val)
+                except ValueError:
+                    continue
+                if not np.isfinite(num):
+                    continue
+                q_str = q_keys[col_i]
+                q_dt = q_dates[col_i]
+                fx_rate = _lookup_fx_series_rate(fx_series, fx_spot, q_dt) if q_dt is not None else (fx_spot or 1.0)
+                scaled = (num * fx_rate) if is_per_share else (num * unit_mult * fx_rate)
+                if negate:
+                    scaled = -abs(scaled)
+                row_d = data_by_q.setdefault(q_str, {})
+                if std_col not in row_d:
+                    row_d[std_col] = scaled
+
+        if not data_by_q:
+            return pd.DataFrame()
+        df = pd.DataFrame.from_dict(data_by_q, orient="index")
+        df.index = df.index.astype(str)
+        return df.sort_index()
+
+    fin_spec = {
+        "revenue": ("Total Revenue", False, False),
+        "revenue revenue growth": ("Total Revenue", False, False),
+        "gross profit": ("Gross Profit", False, False),
+        "gross profit gross profit growth": ("Gross Profit", False, False),
+        "operating income": ("Operating Income", False, False),
+        "operating income operating income growth": ("Operating Income", False, False),
+        "net income": ("Net Income", False, False),
+        "net income net income growth": ("Net Income", False, False),
+        "net income common": ("Net Income", False, False),
+        "net income common net income growth": ("Net Income", False, False),
+        "earnings per share": ("Diluted EPS", True, False),
+        "earnings per share eps growth": ("Diluted EPS", True, False),
+        "eps (diluted)": ("Diluted EPS", True, False),
+        "diluted eps": ("Diluted EPS", True, False),
+    }
+    bs_spec = {
+        "cash & equivalents": ("Cash And Cash Equivalents", False, False),
+        "cash and equivalents": ("Cash And Cash Equivalents", False, False),
+        "cash & short-term investments": ("Cash Cash Equivalents And Short Term Investments", False, False),
+        "total current assets": ("Current Assets", False, False),
+        "total assets": ("Total Assets", False, False),
+        "total debt": ("Total Debt", False, False),
+        "shareholders' equity": ("Stockholders Equity", False, False),
+        "stockholders' equity": ("Stockholders Equity", False, False),
+        "total equity": ("Stockholders Equity", False, False),
+    }
+    cf_spec = {
+        "operating cash flow": ("Operating Cash Flow", False, False),
+        "operating cash flow operating cash flow growth (yoy)": ("Operating Cash Flow", False, False),
+        "capital expenditures": ("Capital Expenditure", False, True),
+        "capital expenditure": ("Capital Expenditure", False, True),
+        "free cash flow": ("Free Cash Flow", False, False),
+    }
+
+    winning_base = None
+    sa_fin_q = pd.DataFrame()
+    for base in base_urls:
+        try:
+            r = requests.get(f"{base}/financials/?p=quarterly", headers=headers, timeout=10)
+            if r.status_code == 200:
+                parsed = _parse_sa_page(r.text, fin_spec)
+                if not parsed.empty:
+                    winning_base = base
+                    sa_fin_q = parsed
+                    break
+        except Exception:
+            continue
+
+    if not winning_base:
+        return empty
+
+    sa_bs_q = pd.DataFrame()
+    sa_cf_q = pd.DataFrame()
+    for path_suffix, spec, assign_target in (
+        ("/financials/balance-sheet/?p=quarterly", bs_spec, "bs"),
+        ("/financials/cash-flow-statement/?p=quarterly", cf_spec, "cf"),
+    ):
+        try:
+            r = requests.get(f"{winning_base}{path_suffix}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                parsed = _parse_sa_page(r.text, spec)
+                if assign_target == "bs":
+                    sa_bs_q = parsed
+                else:
+                    sa_cf_q = parsed
+        except Exception:
+            pass
+
+    if not sa_fin_q.empty:
+        sa_fin_q = _scale_adr_eps_if_needed(sa_fin_q, ref_fin_q=ref_fin_q, ref_shares=ref_shares)
+        if "Operating Income" in sa_fin_q.columns and "EBIT" not in sa_fin_q.columns:
+            sa_fin_q["EBIT"] = sa_fin_q["Operating Income"]
+        if "Net Income" in sa_fin_q.columns and "Normalized Income" not in sa_fin_q.columns:
+            sa_fin_q["Normalized Income"] = sa_fin_q["Net Income"]
+
+    return sa_fin_q, sa_bs_q, sa_cf_q
+
+
+def _fetch_tradingview_quarterly(ticker_symbol: str, fin_curr: str,
+                                  ref_fin_q: pd.DataFrame = None,
+                                  ref_bs_q: pd.DataFrame = None,
+                                  ref_shares: float = None):
+    """
+    Fetch up to 32 quarters (8 years) of historical quarterly fundamentals from TradingView
+    Scanner API (`america` / `israel`) and convert from `fundamental_currency_code` into `fin_curr`.
+    Includes overlap continuity checks so bank gross-vs-net revenue differences do not pollute data.
+    """
+    empty = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    sym = (ticker_symbol or "").strip().upper()
+    if not sym:
+        return empty
+
+    if sym.endswith(".TA"):
+        market = "israel"
+        candidates = [sym[:-3]]
+    else:
+        market = "america"
+        candidates = [sym]
+        if "-" in sym:
+            candidates.append(sym.replace("-", "."))
+
+    cols = [
+        "name", "fundamental_currency_code", "fiscal_period_end_fq",
+        "total_revenue_fq_h", "gross_profit_fq_h", "net_income_fq_h",
+        "earnings_per_share_diluted_fq_h", "free_cash_flow_fq_h",
+        "capital_expenditures_unchanged_fq_h", "ebitda_fq_h",
+        "total_assets_fq_h", "total_debt_fq_h",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    row_dict = None
+    for cand in candidates:
+        try:
+            resp = requests.post(
+                f"https://scanner.tradingview.com/{market}/scan",
+                json={
+                    "filter": [{"left": "name", "operation": "equal", "right": cand}],
+                    "columns": cols,
+                    "range": [0, 3],
+                },
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                items = resp.json().get("data", [])
+                if items:
+                    d_vals = items[0].get("d", [])
+                    if len(d_vals) == len(cols):
+                        row_dict = dict(zip(cols, d_vals))
+                        if row_dict.get("fiscal_period_end_fq"):
+                            break
+        except Exception:
+            continue
+
+    if not row_dict or not row_dict.get("fiscal_period_end_fq"):
+        return empty
+
+    try:
+        dt0 = pd.to_datetime(int(row_dict["fiscal_period_end_fq"]), unit="s", utc=True).tz_localize(None)
+        p0 = pd.Period(_to_fiscal_q_str(dt0), freq="Q")
+    except Exception:
+        return empty
+
+    tv_curr = _norm_currency_code(row_dict.get("fundamental_currency_code") or fin_curr)
+    fx_spot, fx_series = get_fx_data(tv_curr, fin_curr) if tv_curr != fin_curr else (1.0, pd.Series(dtype=float))
+
+    fin_fields = {
+        "total_revenue_fq_h": "Total Revenue",
+        "gross_profit_fq_h": "Gross Profit",
+        "net_income_fq_h": "Net Income",
+        "earnings_per_share_diluted_fq_h": "Diluted EPS",
+        "ebitda_fq_h": "EBITDA",
+    }
+    bs_fields = {
+        "total_assets_fq_h": "Total Assets",
+        "total_debt_fq_h": "Total Debt",
+    }
+
+    max_len = max(
+        (len(v) for k, v in row_dict.items() if k.endswith("_fq_h") and isinstance(v, list)),
+        default=0
+    )
+    if max_len == 0:
+        return empty
+
+    fin_rows, bs_rows, cf_rows = {}, {}, {}
+    for i in range(max_len):
+        p_i = p0 - i
+        q_str = str(p_i)
+        q_dt = p_i.end_time.normalize()
+        fx_rate = _lookup_fx_series_rate(fx_series, fx_spot, q_dt)
+
+        f_d = {}
+        for tv_k, std_k in fin_fields.items():
+            arr = row_dict.get(tv_k)
+            if isinstance(arr, list) and i < len(arr) and arr[i] is not None:
+                try:
+                    val = float(arr[i])
+                    if np.isfinite(val):
+                        f_d[std_k] = val * fx_rate
+                except Exception:
+                    pass
+        if f_d:
+            fin_rows[q_str] = f_d
+
+        b_d = {}
+        for tv_k, std_k in bs_fields.items():
+            arr = row_dict.get(tv_k)
+            if isinstance(arr, list) and i < len(arr) and arr[i] is not None:
+                try:
+                    val = float(arr[i])
+                    if np.isfinite(val):
+                        b_d[std_k] = val * fx_rate
+                except Exception:
+                    pass
+        if b_d:
+            bs_rows[q_str] = b_d
+
+        fcf_arr = row_dict.get("free_cash_flow_fq_h")
+        capex_arr = row_dict.get("capital_expenditures_unchanged_fq_h")
+        fcf_val = (float(fcf_arr[i]) * fx_rate) if (isinstance(fcf_arr, list) and i < len(fcf_arr) and fcf_arr[i] is not None) else None
+        capex_val = (abs(float(capex_arr[i])) * fx_rate) if (isinstance(capex_arr, list) and i < len(capex_arr) and capex_arr[i] is not None) else None
+        c_d = {}
+        if fcf_val is not None and np.isfinite(fcf_val):
+            c_d["Free Cash Flow"] = fcf_val
+        if capex_val is not None and np.isfinite(capex_val):
+            c_d["Capital Expenditure"] = -capex_val
+        if fcf_val is not None and capex_val is not None and np.isfinite(fcf_val) and np.isfinite(capex_val):
+            c_d["Operating Cash Flow"] = fcf_val + capex_val
+        if c_d:
+            cf_rows[q_str] = c_d
+
+    tv_fin_q = pd.DataFrame.from_dict(fin_rows, orient="index").sort_index() if fin_rows else pd.DataFrame()
+    tv_bs_q = pd.DataFrame.from_dict(bs_rows, orient="index").sort_index() if bs_rows else pd.DataFrame()
+    tv_cf_q = pd.DataFrame.from_dict(cf_rows, orient="index").sort_index() if cf_rows else pd.DataFrame()
+
+    # Continuity check vs existing Yahoo/SEC/SA quarters (catches bank gross-vs-net revenue)
+    if not tv_fin_q.empty and ref_fin_q is not None and not ref_fin_q.empty:
+        if "Total Revenue" in tv_fin_q.columns and "Total Revenue" in ref_fin_q.columns:
+            common = tv_fin_q.index.intersection(ref_fin_q.index)
+            rev_ratios = []
+            for idx in common:
+                tv_r = pd.to_numeric(tv_fin_q.loc[idx, "Total Revenue"], errors="coerce")
+                rf_r = pd.to_numeric(ref_fin_q.loc[idx, "Total Revenue"], errors="coerce")
+                if pd.notna(tv_r) and pd.notna(rf_r) and tv_r > 0 and rf_r > 0:
+                    rev_ratios.append(float(rf_r) / float(tv_r))
+            if rev_ratios:
+                med_rev_r = float(np.median(rev_ratios))
+                if med_rev_r < 0.67 or med_rev_r > 1.5:
+                    tv_fin_q = tv_fin_q.drop(columns=[c for c in ("Total Revenue", "Gross Profit") if c in tv_fin_q.columns])
+        tv_fin_q = _scale_adr_eps_if_needed(tv_fin_q, ref_fin_q=ref_fin_q, ref_shares=ref_shares)
+
+    if not tv_bs_q.empty and ref_bs_q is not None and not ref_bs_q.empty:
+        if "Total Assets" in tv_bs_q.columns and "Total Assets" in ref_bs_q.columns:
+            common = tv_bs_q.index.intersection(ref_bs_q.index)
+            a_ratios = []
+            for idx in common:
+                tv_a = pd.to_numeric(tv_bs_q.loc[idx, "Total Assets"], errors="coerce")
+                rf_a = pd.to_numeric(ref_bs_q.loc[idx, "Total Assets"], errors="coerce")
+                if pd.notna(tv_a) and pd.notna(rf_a) and tv_a > 0 and rf_a > 0:
+                    a_ratios.append(float(rf_a) / float(tv_a))
+            if a_ratios:
+                med_a_r = float(np.median(a_ratios))
+                if med_a_r < 0.67 or med_a_r > 1.5:
+                    tv_bs_q = pd.DataFrame()
+
+    if not tv_fin_q.empty and "Net Income" in tv_fin_q.columns and "Normalized Income" not in tv_fin_q.columns:
+        tv_fin_q["Normalized Income"] = tv_fin_q["Net Income"]
+
+    return tv_fin_q, tv_bs_q, tv_cf_q
+
+
+def _enrich_quarterly_history(ticker_symbol: str, fin_curr: str,
+                              df_fin_q: pd.DataFrame, df_bs_q: pd.DataFrame, df_cf_q: pd.DataFrame,
+                              ref_shares: float = None):
+    """
+    When Yahoo + SEC EDGAR leave < 30 quarters in core quarterly metrics (foreign 20-F/6-K filers,
+    Israeli `.TA` stocks, or dimensional SEC gaps such as Visa EPS), backfill via StockAnalysis
+    (up to 20Q GAAP) and TradingView Scanner (up to 32Q), then fill derived statement identities.
+    """
+    def _col_count(df: pd.DataFrame, col: str) -> int:
+        if df is None or df.empty or col not in df.columns:
+            return 0
+        return int(pd.to_numeric(df[col], errors="coerce").notna().sum())
+
+    def _min_core_depth() -> int:
+        counts = [
+            _col_count(df_fin_q, "Total Revenue"),
+            _col_count(df_fin_q, "Net Income"),
+            _col_count(df_fin_q, "Diluted EPS"),
+            _col_count(df_fin_q, "Diluted Average Shares"),
+            _col_count(df_cf_q, "Operating Cash Flow"),
+            _col_count(df_cf_q, "Free Cash Flow"),
+            _col_count(df_bs_q, "Total Assets"),
+        ]
+        return min(counts)
+
+    if _min_core_depth() < 30:
+        try:
+            sa_fin_q, sa_bs_q, sa_cf_q = _fetch_stockanalysis_quarterly(
+                ticker_symbol, fin_curr, ref_fin_q=df_fin_q, ref_shares=ref_shares
+            )
+            df_fin_q = _merge_sec_with_yf(df_fin_q, sa_fin_q, max_periods=40)
+            df_bs_q = _merge_sec_with_yf(df_bs_q, sa_bs_q, max_periods=40)
+            df_cf_q = _merge_sec_with_yf(df_cf_q, sa_cf_q, max_periods=40)
+        except Exception:
+            pass
+
+    if _min_core_depth() < 30:
+        try:
+            tv_fin_q, tv_bs_q, tv_cf_q = _fetch_tradingview_quarterly(
+                ticker_symbol, fin_curr, ref_fin_q=df_fin_q, ref_bs_q=df_bs_q, ref_shares=ref_shares
+            )
+            df_fin_q = _merge_sec_with_yf(df_fin_q, tv_fin_q, max_periods=40)
+            df_bs_q = _merge_sec_with_yf(df_bs_q, tv_bs_q, max_periods=40)
+            df_cf_q = _merge_sec_with_yf(df_cf_q, tv_cf_q, max_periods=40)
+        except Exception:
+            pass
+
+    # Post-merge derived identities on df_fin_q and df_cf_q
+    try:
+        if df_fin_q is not None and not df_fin_q.empty:
+            rev = pd.to_numeric(df_fin_q["Total Revenue"], errors="coerce") if "Total Revenue" in df_fin_q.columns else None
+            gp = pd.to_numeric(df_fin_q["Gross Profit"], errors="coerce") if "Gross Profit" in df_fin_q.columns else None
+            cor = pd.to_numeric(df_fin_q["Cost Of Revenue"], errors="coerce") if "Cost Of Revenue" in df_fin_q.columns else None
+
+            if rev is not None and gp is not None:
+                derived_cor = rev - gp
+                if cor is not None:
+                    df_fin_q["Cost Of Revenue"] = cor.combine_first(derived_cor)
+                else:
+                    df_fin_q["Cost Of Revenue"] = derived_cor
+            elif rev is not None and cor is not None:
+                derived_gp = rev - cor.abs()
+                df_fin_q["Gross Profit"] = gp.combine_first(derived_gp) if gp is not None else derived_gp
+
+            if "Operating Income" in df_fin_q.columns and "EBIT" in df_fin_q.columns:
+                op = pd.to_numeric(df_fin_q["Operating Income"], errors="coerce")
+                eb = pd.to_numeric(df_fin_q["EBIT"], errors="coerce")
+                df_fin_q["Operating Income"] = op.combine_first(eb)
+                df_fin_q["EBIT"] = eb.combine_first(op)
+            elif "Operating Income" in df_fin_q.columns:
+                df_fin_q["EBIT"] = pd.to_numeric(df_fin_q["Operating Income"], errors="coerce")
+            elif "EBIT" in df_fin_q.columns:
+                df_fin_q["Operating Income"] = pd.to_numeric(df_fin_q["EBIT"], errors="coerce")
+
+            if "Net Income" in df_fin_q.columns:
+                ni = pd.to_numeric(df_fin_q["Net Income"], errors="coerce")
+                if "Normalized Income" in df_fin_q.columns:
+                    df_fin_q["Normalized Income"] = pd.to_numeric(df_fin_q["Normalized Income"], errors="coerce").combine_first(ni)
+                else:
+                    df_fin_q["Normalized Income"] = ni
+
+                # Derive missing Diluted Average Shares from Net Income / Diluted EPS with plausibility bounds
+                if "Diluted EPS" in df_fin_q.columns:
+                    eps = pd.to_numeric(df_fin_q["Diluted EPS"], errors="coerce")
+                    existing_sh = pd.to_numeric(df_fin_q["Diluted Average Shares"], errors="coerce") if "Diluted Average Shares" in df_fin_q.columns else pd.Series(np.nan, index=df_fin_q.index)
+                    med_sh = existing_sh.dropna().median() if not existing_sh.dropna().empty else (float(ref_shares) if ref_shares and ref_shares > 1 else None)
+                    valid_eps = (eps.abs() >= 0.05) & ((ni * eps) > 0)
+                    est_sh = pd.Series(np.nan, index=df_fin_q.index, dtype=float)
+                    est_sh[valid_eps] = ni[valid_eps] / eps[valid_eps]
+                    if med_sh and np.isfinite(med_sh) and med_sh > 0:
+                        est_sh = est_sh.where((est_sh >= 0.12 * med_sh) & (est_sh <= 4.0 * med_sh))
+                    merged_sh = existing_sh.combine_first(est_sh)
+                    if merged_sh.notna().any():
+                        df_fin_q["Diluted Average Shares"] = merged_sh
+
+                # Conversely derive missing Diluted EPS from Net Income / Diluted Average Shares
+                if "Diluted Average Shares" in df_fin_q.columns:
+                    sh = pd.to_numeric(df_fin_q["Diluted Average Shares"], errors="coerce")
+                    existing_eps = pd.to_numeric(df_fin_q["Diluted EPS"], errors="coerce") if "Diluted EPS" in df_fin_q.columns else pd.Series(np.nan, index=df_fin_q.index)
+                    est_eps = pd.Series(np.nan, index=df_fin_q.index, dtype=float)
+                    valid_sh = sh > 0
+                    est_eps[valid_sh] = ni[valid_sh] / sh[valid_sh]
+                    merged_eps = existing_eps.combine_first(est_eps)
+                    if merged_eps.notna().any():
+                        df_fin_q["Diluted EPS"] = merged_eps
+    except Exception:
+        pass
+
+    try:
+        if df_cf_q is not None and not df_cf_q.empty:
+            if "Operating Cash Flow" in df_cf_q.columns and "Capital Expenditure" in df_cf_q.columns:
+                ocf = pd.to_numeric(df_cf_q["Operating Cash Flow"], errors="coerce")
+                capex = pd.to_numeric(df_cf_q["Capital Expenditure"], errors="coerce")
+                derived_fcf = ocf - capex.abs()
+                if "Free Cash Flow" in df_cf_q.columns:
+                    df_cf_q["Free Cash Flow"] = pd.to_numeric(df_cf_q["Free Cash Flow"], errors="coerce").combine_first(derived_fcf)
+                else:
+                    df_cf_q["Free Cash Flow"] = derived_fcf
+    except Exception:
+        pass
+
+    return df_fin_q.tail(40), df_bs_q.tail(40), df_cf_q.tail(40)
+
+
 def _fetch_direct_yahoo_chart(ticker_symbol: str, range_str: str = "10y"):
     """
     Fetch daily OHLCV + Dividends + Stock Splits + Chart Meta directly from Yahoo Finance v8 chart API
@@ -2289,8 +3145,140 @@ def _fetch_direct_yahoo_chart(ticker_symbol: str, range_str: str = "10y"):
         return pd.DataFrame(), {}
 
 
+def _normalize_sec_adr_shares(sec_fin_a: pd.DataFrame, sec_fin_q: pd.DataFrame,
+                                yf_fin_a: pd.DataFrame, yf_fin_q: pd.DataFrame,
+                                ref_shares: float = None):
+    """
+    If SEC 20-F reports ordinary shares while Yahoo/trading uses ADRs (e.g. BABA 8:1, TSM 5:1),
+    scale SEC share counts and EPS so the merged 10-year series stays on a consistent ADR basis.
+    """
+    try:
+        ratios = []
+        if sec_fin_a is not None and not sec_fin_a.empty:
+            for sh_col in ("Diluted Average Shares", "Basic Average Shares"):
+                if sh_col in sec_fin_a.columns and yf_fin_a is not None and not yf_fin_a.empty and sh_col in yf_fin_a.columns:
+                    common = sec_fin_a.index.intersection(yf_fin_a.index)
+                    for idx in common:
+                        s_v = pd.to_numeric(sec_fin_a.loc[idx, sh_col], errors="coerce")
+                        y_v = pd.to_numeric(yf_fin_a.loc[idx, sh_col], errors="coerce")
+                        if pd.notna(s_v) and pd.notna(y_v) and s_v > 0 and y_v > 0:
+                            ratios.append(float(s_v) / float(y_v))
+                    if ratios:
+                        break
+            if not ratios and yf_fin_q is not None and not yf_fin_q.empty:
+                for sh_col in ("Diluted Average Shares", "Basic Average Shares"):
+                    if sh_col in sec_fin_a.columns and sh_col in yf_fin_q.columns:
+                        s_sec = pd.to_numeric(sec_fin_a[sh_col], errors="coerce").dropna()
+                        s_yf = pd.to_numeric(yf_fin_q[sh_col], errors="coerce").dropna()
+                        if not s_sec.empty and not s_yf.empty and s_yf.iloc[-1] > 0:
+                            ratios.append(float(s_sec.iloc[-1]) / float(s_yf.iloc[-1]))
+                            break
+            if not ratios and ref_shares and ref_shares > 1:
+                for sh_col in ("Diluted Average Shares", "Basic Average Shares"):
+                    if sh_col in sec_fin_a.columns:
+                        s_sec = pd.to_numeric(sec_fin_a[sh_col], errors="coerce").dropna()
+                        if not s_sec.empty:
+                            ratios.append(float(s_sec.iloc[-1]) / float(ref_shares))
+                            break
+        if not ratios:
+            return sec_fin_a, sec_fin_q
+        med_r = float(np.median(ratios))
+        if not (med_r >= 1.8 or med_r <= 0.55):
+            return sec_fin_a, sec_fin_q
+        if med_r >= 1.8 and abs(med_r - round(med_r)) / med_r < 0.12:
+            adr_ratio = float(round(med_r))
+        elif med_r <= 0.55 and abs((1.0 / med_r) - round(1.0 / med_r)) / (1.0 / med_r) < 0.12:
+            adr_ratio = 1.0 / float(round(1.0 / med_r))
+        else:
+            adr_ratio = med_r
+        for df_s in (sec_fin_a, sec_fin_q):
+            if df_s is None or df_s.empty:
+                continue
+            for sh_col in ("Diluted Average Shares", "Basic Average Shares"):
+                if sh_col in df_s.columns:
+                    df_s[sh_col] = pd.to_numeric(df_s[sh_col], errors="coerce") / adr_ratio
+            for eps_col in ("Diluted EPS", "Basic EPS"):
+                if eps_col in df_s.columns:
+                    df_s[eps_col] = pd.to_numeric(df_s[eps_col], errors="coerce") * adr_ratio
+    except Exception:
+        pass
+    return sec_fin_a, sec_fin_q
+
+
+def _fetch_fx_pair_series(from_c: str, to_c: str):
+    """Fetch 10-year daily FX series (tz-naive) for from_c -> to_c."""
+    def _clean_close(hist_df):
+        if hist_df is None or hist_df.empty or "Close" not in hist_df.columns:
+            return pd.Series(dtype=float)
+        s = pd.to_numeric(hist_df["Close"], errors="coerce").dropna()
+        s = s[s > 0]
+        if s.empty:
+            return pd.Series(dtype=float)
+        try:
+            s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+        except Exception:
+            s.index = pd.to_datetime(s.index).normalize()
+        return s[~s.index.duplicated(keep="last")].sort_index()
+
+    h_direct, _ = _fetch_direct_yahoo_chart(f"{from_c}{to_c}=X", range_str="10y")
+    s_direct = _clean_close(h_direct)
+    if not s_direct.empty:
+        return float(s_direct.iloc[-1]), s_direct
+
+    h_inv, _ = _fetch_direct_yahoo_chart(f"{to_c}{from_c}=X", range_str="10y")
+    s_inv = _clean_close(h_inv)
+    if not s_inv.empty:
+        inv = 1.0 / s_inv
+        return float(inv.iloc[-1]), inv
+
+    try:
+        h_yf = yf.Ticker(f"{from_c}{to_c}=X").history(period="10y")
+        s_yf = _clean_close(h_yf)
+        if not s_yf.empty:
+            return float(s_yf.iloc[-1]), s_yf
+    except Exception:
+        pass
+
+    return None, pd.Series(dtype=float)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
+def get_fx_data(from_curr: str, to_curr: str):
+    """
+    Returns (spot_rate, daily_fx_series) converting 1 unit of `from_curr` into `to_curr`.
+    Triangulates through USD when direct cross pair is unavailable.
+    """
+    from_c = _norm_currency_code(from_curr)
+    to_c = _norm_currency_code(to_curr)
+    if not from_c or not to_c or from_c == to_c:
+        return 1.0, pd.Series(dtype=float)
+
+    rate, series = _fetch_fx_pair_series(from_c, to_c)
+    if rate is not None and rate > 0:
+        return rate, series
+
+    if from_c != "USD" and to_c != "USD":
+        r1, s1 = _fetch_fx_pair_series(from_c, "USD")
+        r2, s2 = _fetch_fx_pair_series("USD", to_c)
+        if r1 and r2 and r1 > 0 and r2 > 0:
+            if not s1.empty and not s2.empty:
+                idx = s1.index.union(s2.index).sort_values()
+                s1_a = s1.reindex(idx).ffill().bfill()
+                s2_a = s2.reindex(idx).ffill().bfill()
+                combined = (s1_a * s2_a).dropna()
+                if not combined.empty:
+                    return float(combined.iloc[-1]), combined
+            return float(r1 * r2), pd.Series(dtype=float)
+
+    if from_c == "USD" and to_c == "ILS":
+        return 3.70, pd.Series(dtype=float)
+    if from_c == "ILS" and to_c == "USD":
+        return 1.0 / 3.70, pd.Series(dtype=float)
+    return 1.0, pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 10):
 
     stock = yf.Ticker(ticker_symbol)
 
@@ -2329,6 +3317,11 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
     except Exception:
         info = {}
 
+    raw_trade_curr = info.get("currency") or (chart_meta.get("currency") if chart_meta else None) or ("ILA" if ticker_symbol.upper().endswith(".TA") else "USD")
+    trade_curr = _norm_currency_code(raw_trade_curr)
+    raw_fin_curr = info.get("financialCurrency") or _detect_statement_currency(ticker_symbol) or trade_curr
+    fin_curr = _norm_currency_code(raw_fin_curr)
+
     df_fin_a = financials.sort_index() if not financials.empty else pd.DataFrame()
     df_bs_a  = balance_sheet.sort_index() if not balance_sheet.empty else pd.DataFrame()
     df_cf_a  = cashflow.sort_index() if not cashflow.empty else pd.DataFrame()
@@ -2358,41 +3351,58 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
     except Exception:
         pass
 
-    try:
-        if not df_fin_q.empty:
-            df_fin_q.index = pd.to_datetime(df_fin_q.index).to_period('Q').astype(str)
-            df_fin_q = df_fin_q[~df_fin_q.index.duplicated(keep='last')]
-    except Exception:
-        pass
-
-    try:
-        if not df_bs_q.empty:
-            df_bs_q.index = pd.to_datetime(df_bs_q.index).to_period('Q').astype(str)
-            df_bs_q = df_bs_q[~df_bs_q.index.duplicated(keep='last')]
-    except Exception:
-        pass
-
-    try:
-        if not df_cf_q.empty:
-            df_cf_q.index = pd.to_datetime(df_cf_q.index).to_period('Q').astype(str)
-            df_cf_q = df_cf_q[~df_cf_q.index.duplicated(keep='last')]
-    except Exception:
-        pass
+    for _q_name in ("df_fin_q", "df_bs_q", "df_cf_q"):
+        try:
+            _q_df = locals()[_q_name]
+            if not _q_df.empty:
+                _q_df.index = [_to_fiscal_q_str(dt) for dt in pd.to_datetime(_q_df.index)]
+                _q_df = _q_df[~_q_df.index.duplicated(keep='last')]
+                if _q_name == "df_fin_q":
+                    df_fin_q = _q_df
+                elif _q_name == "df_bs_q":
+                    df_bs_q = _q_df
+                else:
+                    df_cf_q = _q_df
+        except Exception:
+            pass
 
     # ── Enrich with 10-Year SEC EDGAR Financial Statements ────────────────
+    ref_sh = 0.0
     try:
+        ref_sh = float(_get_effective_shares(info) or 0.0)
         splits_s = history['Stock Splits'] if (history is not None and not history.empty and 'Stock Splits' in history.columns) else pd.Series(dtype=float)
-        sec_fin_a, sec_bs_a, sec_cf_a, sec_fin_q, sec_bs_q, sec_cf_q = _fetch_sec_edgar_statements(ticker_symbol, splits_s)
-        df_fin_a = _merge_sec_with_yf(df_fin_a, sec_fin_a, max_periods=11)
+        sec_fin_a, sec_bs_a, sec_cf_a, sec_fin_q, sec_bs_q, sec_cf_q = _fetch_sec_edgar_statements(
+            ticker_symbol, splits_s, preferred_currency=fin_curr
+        )
+        sec_fin_a, sec_fin_q = _normalize_sec_adr_shares(
+            sec_fin_a, sec_fin_q, df_fin_a, df_fin_q, ref_shares=ref_sh if ref_sh > 1 else None
+        )
+        df_fin_a = _merge_sec_with_yf(df_fin_a, sec_fin_a, max_periods=10)
         df_bs_a  = _merge_sec_with_yf(df_bs_a,  sec_bs_a,  max_periods=10)
         df_cf_a  = _merge_sec_with_yf(df_cf_a,  sec_cf_a,  max_periods=10)
-        df_fin_q = _merge_sec_with_yf(df_fin_q, sec_fin_q, max_periods=44)
+        df_fin_q = _merge_sec_with_yf(df_fin_q, sec_fin_q, max_periods=40)
         df_bs_q  = _merge_sec_with_yf(df_bs_q,  sec_bs_q,  max_periods=40)
         df_cf_q  = _merge_sec_with_yf(df_cf_q,  sec_cf_q,  max_periods=40)
     except Exception:
         pass
 
-    # ── Populate/Fallback `info` from chart_meta + statements + history when yfinance info is rate-limited ──
+    # ── Backfill international / TASE / sparse quarterly metrics + derived identities ──
+    try:
+        if not (ref_sh and ref_sh > 1) and not df_fin_a.empty:
+            for _sh_c in ("Diluted Average Shares", "Basic Average Shares"):
+                if _sh_c in df_fin_a.columns:
+                    _sh_s = pd.to_numeric(df_fin_a[_sh_c], errors="coerce").dropna()
+                    if not _sh_s.empty and _sh_s.iloc[-1] > 1:
+                        ref_sh = float(_sh_s.iloc[-1])
+                        break
+        df_fin_q, df_bs_q, df_cf_q = _enrich_quarterly_history(
+            ticker_symbol, fin_curr, df_fin_q, df_bs_q, df_cf_q,
+            ref_shares=ref_sh if ref_sh > 1 else None
+        )
+    except Exception:
+        pass
+
+    # ── Populate price/profile from chart_meta + history first, then scale sub-unit currencies (ILA/GBp) ──
     try:
         if not info.get("sector") or not info.get("longName"):
             try:
@@ -2412,7 +3422,7 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
                 pass
 
         if chart_meta:
-            info.setdefault("currency", chart_meta.get("currency", "USD"))
+            info.setdefault("currency", chart_meta.get("currency", raw_trade_curr))
             info.setdefault("longName", chart_meta.get("longName") or chart_meta.get("shortName") or ticker_symbol)
             info.setdefault("shortName", chart_meta.get("shortName") or ticker_symbol)
             if chart_meta.get("regularMarketPrice"):
@@ -2431,7 +3441,37 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
             info.setdefault("twoHundredDayAverage", float(history["Close"].tail(200).mean()))
             info.setdefault("fiftyTwoWeekHigh", float(history["Close"].tail(252).max()))
             info.setdefault("fiftyTwoWeekLow", float(history["Close"].tail(252).min()))
+    except Exception:
+        pass
 
+    # Handle ILA (Israeli Agorot -> ILS) and GBp/GBX (British Pence -> GBP) on share-price fields only
+    try:
+        if raw_trade_curr in ("ILA", "GBp", "GBX"):
+            scale = 0.01
+            if history is not None and not history.empty:
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    if col in history.columns:
+                        history[col] = history[col] * scale
+            # Note: trailingEps, forwardEps, bookValue and dividendRate are already in major units (ILS/GBP), not Agorot/Pence
+            price_keys = [
+                'currentPrice', 'regularMarketPrice', 'previousClose', 'open', 'dayLow', 'dayHigh',
+                'fiftyTwoWeekHigh', 'fiftyTwoWeekLow', 'fiftyDayAverage', 'twoHundredDayAverage',
+                'targetHighPrice', 'targetLowPrice', 'targetMeanPrice', 'targetMedianPrice', 'navPrice'
+            ]
+            for key in price_keys:
+                if key in info and info[key] is not None:
+                    try:
+                        info[key] = float(info[key]) * scale
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # ── Fetch live FX rate between financial reporting currency & trading currency ──
+    fx_fin_to_trade, _ = get_fx_data(fin_curr, trade_curr)
+
+    # ── Fallback `info` population from financial statements when yfinance info is incomplete ──
+    try:
         def _latest_col_val(df_s, cols):
             if df_s is None or df_s.empty:
                 return None
@@ -2442,17 +3482,18 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
                         return float(s.iloc[-1])
             return None
 
-        sh_out = info.get("sharesOutstanding") or _latest_col_val(df_fin_q, ["Diluted Average Shares", "Basic Average Shares"]) or _latest_col_val(df_fin_a, ["Diluted Average Shares", "Basic Average Shares"])
+        sh_out = info.get("impliedSharesOutstanding") or info.get("sharesOutstanding") or _latest_col_val(df_fin_q, ["Diluted Average Shares", "Basic Average Shares"]) or _latest_col_val(df_fin_a, ["Diluted Average Shares", "Basic Average Shares"])
         if sh_out and sh_out > 0:
             info.setdefault("sharesOutstanding", sh_out)
             if info.get("currentPrice"):
                 info.setdefault("marketCap", float(info["currentPrice"]) * float(sh_out))
 
-        t_eps = _latest_col_val(df_fin_a, ["Diluted EPS", "Basic EPS"])
-        if t_eps is not None:
-            info.setdefault("trailingEps", t_eps)
-            if info.get("currentPrice") and t_eps > 0:
-                info.setdefault("trailingPE", float(info["currentPrice"]) / t_eps)
+        t_eps_fin = _latest_col_val(df_fin_a, ["Diluted EPS", "Basic EPS"])
+        if t_eps_fin is not None:
+            t_eps_trade = t_eps_fin * fx_fin_to_trade
+            info.setdefault("trailingEps", t_eps_trade)
+            if info.get("currentPrice") and t_eps_trade > 0:
+                info.setdefault("trailingPE", float(info["currentPrice"]) / t_eps_trade)
 
         rev_v = _latest_col_val(df_fin_a, ["Total Revenue", "Operating Revenue"])
         gp_v = _latest_col_val(df_fin_a, ["Gross Profit"])
@@ -2493,9 +3534,10 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
             if ni_v is not None:
                 info.setdefault("returnOnEquity", ni_v / eq_v)
             if sh_out and sh_out > 0:
-                info.setdefault("bookValue", eq_v / sh_out)
-                if info.get("currentPrice"):
-                    info.setdefault("priceToBook", float(info["currentPrice"]) / (eq_v / sh_out))
+                bv_trade = (eq_v / sh_out) * fx_fin_to_trade
+                info.setdefault("bookValue", bv_trade)
+                if info.get("currentPrice") and bv_trade > 0:
+                    info.setdefault("priceToBook", float(info["currentPrice"]) / bv_trade)
             if dbt_v is not None:
                 info.setdefault("debtToEquity", (dbt_v / eq_v) * 100.0)
         if ast_v and ast_v > 0 and ni_v is not None:
@@ -2505,30 +3547,13 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 9):
     except Exception:
         pass
 
-    # Handle ILA Agora currency scaling to standard Shekels (ILS)
-    try:
-        if info:
-            currency = info.get("currency", "USD")
-            if currency == "ILA":
-                scale = 0.01
-                if history is not None and not history.empty:
-                    for col in ['Open', 'High', 'Low', 'Close']:
-                        if col in history.columns:
-                            history[col] = history[col] * scale
-                price_keys = [
-                    'currentPrice', 'trailingEps', 'dividendRate', 'fiftyTwoWeekHigh', 
-                    'fiftyTwoWeekLow', 'fiftyDayAverage', 'twoHundredDayAverage',
-                    'targetHighPrice', 'targetLowPrice', 'targetMeanPrice', 'targetMedianPrice',
-                    'bookValue', 'navPrice'
-                ]
-                for key in price_keys:
-                    if key in info and info[key] is not None:
-                        try:
-                            info[key] = info[key] * scale
-                        except Exception:
-                            pass
-    except Exception:
-        pass
+    info["_raw_currency"] = raw_trade_curr
+    info["currency"] = trade_curr
+    info["financialCurrency"] = fin_curr
+    info["_trade_currency"] = trade_curr
+    info["_financial_currency"] = fin_curr
+    info["_fx_fin_to_trade"] = fx_fin_to_trade
+    info["_trailing_eps_currency"] = trade_curr
 
     return df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q, history, info
 
@@ -2613,138 +3638,6 @@ def create_combo_chart(df: pd.DataFrame, column_name: str, title: str, color: st
 
     return fig
 
-def create_yoy_growth_bar_chart(
-    df_full: pd.DataFrame,
-    column_name: str,
-    title: str,
-    is_quarterly: bool = True,
-    max_periods: int = 40,
-    bar_color: str = "#f24e4e",
-    neg_color: str = "#b91c1c",
-    growth_mode: str = "yoy",
-    x_label: str = None
-):
-    """
-    Create a dedicated YoY / QoQ percentage growth bar chart styled after Qualtrim:
-    - Rounded vertical bars showing exact growth % for each period
-    - For Quarterly + YoY: compares each quarter Q_t to the same quarter a year prior Q_{t-4}
-    - For Annual + YoY (or Quarterly + QoQ): compares each period to the immediately preceding period
-    """
-    if df_full is None or df_full.empty or column_name not in df_full.columns:
-        return None
-
-    s = pd.to_numeric(df_full[column_name], errors="coerce").dropna()
-    if len(s) < 2:
-        return None
-
-    g_series = pd.Series(dtype=float)
-    if is_quarterly and growth_mode == "yoy":
-        # Match each quarter to exact same quarter 1 year ago (Q - 4)
-        g_dict = {}
-        s_map = {str(k): float(v) for k, v in s.items()}
-        for k_str, curr_val in s_map.items():
-            try:
-                prev_k = (pd.Period(k_str, freq="Q") - 4).strftime("%YQ%q")
-                if prev_k in s_map and s_map[prev_k] != 0:
-                    g_dict[k_str] = ((curr_val - s_map[prev_k]) / abs(s_map[prev_k])) * 100.0
-            except Exception:
-                pass
-        if g_dict:
-            g_series = pd.Series(g_dict)
-        else:
-            lag = 4 if len(s) > 4 else 1
-            prev_s = s.shift(lag).abs().replace(0, np.nan)
-            g_series = ((s.diff(lag)) / prev_s) * 100.0
-            g_series = g_series.dropna()
-    else:
-        prev_s = s.shift(1).abs().replace(0, np.nan)
-        g_series = ((s.diff(1)) / prev_s) * 100.0
-        g_series = g_series.dropna()
-
-    if g_series.empty:
-        return None
-
-    g_series = g_series.tail(max_periods)
-    raw_vals = [float(v) for v in g_series.values]
-
-    # Format X-axis labels cleanly (e.g., "2021Q1" -> "2021 Q1" as in the reference screenshot)
-    x_cats = []
-    for idx in g_series.index:
-        s_idx = str(idx)
-        if "Q" in s_idx and " Q" not in s_idx:
-            s_idx = s_idx.replace("Q", " Q")
-        x_cats.append(s_idx)
-
-    # Guard against a single turnaround quarter (+2000%) squashing all other bars flat,
-    # while keeping the exact unclipped percentage in the hover tooltip (customdata)
-    abs_sorted = sorted(abs(v) for v in raw_vals)
-    med_abs = abs_sorted[len(abs_sorted) // 2] if abs_sorted else 20.0
-    cap_limit = max(250.0, med_abs * 5.0) if med_abs < 80.0 else 1000.0
-    plot_vals = [max(-cap_limit, min(cap_limit, v)) for v in raw_vals]
-
-    colors = [bar_color if v >= 0 else neg_color for v in raw_vals]
-    show_bar_text = len(x_cats) <= 14
-    bar_texts = [f"{v:+.1f}%" for v in raw_vals] if show_bar_text else None
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=x_cats,
-        y=plot_vals,
-        customdata=raw_vals,
-        name=title,
-        marker=dict(
-            color=colors,
-            line=dict(width=0),
-            cornerradius=4
-        ),
-        text=bar_texts,
-        textposition="outside" if show_bar_text else "none",
-        textfont=dict(size=11, color="#d1d4dc", family="Outfit, Rubik, sans-serif"),
-        cliponaxis=False,
-        hovertemplate="<b>%{x}</b><br>Value: %{customdata:.2f}%<extra></extra>"
-    ))
-
-    fig.add_hline(y=0, line_color="rgba(255, 255, 255, 0.22)", line_width=1)
-
-    fig.update_layout(
-        title=dict(
-            text=f"<b>{title}</b>",
-            font=dict(size=16, color="#ffffff", family="Outfit, Rubik, sans-serif"),
-            x=0.0
-        ),
-        xaxis=dict(
-            title=x_label or "",
-            type="category",
-            categoryorder="array",
-            categoryarray=x_cats,
-            showgrid=False,
-            tickangle=0,
-            nticks=14 if len(x_cats) > 16 else len(x_cats),
-            tickfont=dict(color="#848e9c", size=11)
-        ),
-        yaxis=dict(
-            title="",
-            ticksuffix="%",
-            showgrid=True,
-            gridcolor="rgba(255, 255, 255, 0.06)",
-            zeroline=True,
-            zerolinecolor="rgba(255, 255, 255, 0.22)",
-            tickfont=dict(color="#848e9c", size=11)
-        ),
-        hoverlabel=dict(
-            bgcolor="#131722",
-            bordercolor="#2a2e39",
-            font=dict(color="#ffffff", size=13, family="Outfit, Rubik, sans-serif")
-        ),
-        hovermode="x unified",
-        bargap=0.22,
-        height=370,
-        showlegend=False,
-        margin=dict(t=55, b=35, l=50, r=20)
-    )
-    return fig
-
-
 def create_line_chart(series: pd.Series, title: str, y_label: str):
     if series.empty:
         return None
@@ -2786,10 +3679,11 @@ def _get_risk_free_rate():
     return 4.5  # current approximate 10Y US yield
 
 
-def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discount=10.0):
+def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discount=10.0, fx_fin_to_trade=1.0):
     """
     Compute WACC using CAPM for cost of equity and after-tax cost of debt.
-    Returns (wacc_pct, beta_used, cost_of_equity_pct, notes).
+    Converts statement debt/cash/interest from financial currency to trading currency to match marketCap.
+    Returns (wacc_pct, beta_used, cost_of_equity_pct).
     """
     beta = info.get('beta')
     if beta is None or pd.isna(beta) or beta <= 0:
@@ -2797,8 +3691,9 @@ def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discoun
 
     cost_of_equity = risk_free_rate + beta * market_premium
 
-    total_debt = info.get('totalDebt', 0) or 0
-    total_cash = info.get('totalCash', 0) or 0
+    fx = fx_fin_to_trade if (fx_fin_to_trade and fx_fin_to_trade > 0) else 1.0
+    total_debt = (info.get('totalDebt', 0) or 0) * fx
+    total_cash = (info.get('totalCash', 0) or 0) * fx
     market_cap = info.get('marketCap', 0) or 0
     net_debt = max(total_debt - total_cash, 0)
     total_capital = market_cap + net_debt
@@ -2810,7 +3705,7 @@ def _compute_wacc(info, risk_free_rate=4.5, market_premium=5.5, fallback_discoun
         equity_weight = market_cap / total_capital
         debt_weight = net_debt / total_capital
         tax_rate = 0.21  # US corporate tax rate
-        interest_expense = info.get('interestExpense', 0) or 0
+        interest_expense = (info.get('interestExpense', 0) or 0) * fx
         if interest_expense < 0:
             interest_expense = abs(interest_expense)
         cost_of_debt_pretax = (interest_expense / net_debt * 100) if net_debt > 0 else risk_free_rate + 1.5
@@ -2920,22 +3815,12 @@ def _derive_growth_rates(info, df_fin, base_growth, df_cf=None):
 def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, years=5,
                          terminal_growth=2.5, use_wacc=True, df_bs=None, df_cf=None, history=None):
     """
-    Calculates the 9 core Intrinsic Value models:
-      1. Discounted Cash Flow 20-year (DCF-20)
-      2. Discounted Free Cash Flow 20-year (DFCF-20)
-      3. Discounted Net Income 20-year (DNI-20)
-      4. Discounted Free Cash Flow Terminal (DFCF-Terminal)
-      5. Mean Price to Sales (PS) Ratio
-      6. Mean Price to Earnings (PE) Ratio Without NRI
-      7. Mean Price to Book (PB) Ratio
-      8. Price to Sales Growth (PSG) Ratio
-      9. Price to Earnings Growth (PEG) Ratio Without NRI
-    All 9 models carry equal weight (1/9) so the consensus valuation is the exact average.
+    Calculates the 9 core Intrinsic Value models in the company's own financial reporting currency,
+    then converts the resulting per-share Intrinsic Value and Target Price into the stock's trading currency
+    (e.g. USD for US/ADR stocks, ILS ₪ for .TA Israeli stocks).
     """
     valuations = {}
-    shares_out = info.get('sharesOutstanding', 1)
-    if not shares_out or pd.isna(shares_out) or shares_out <= 0:
-        shares_out = 1
+    shares_out = _get_effective_shares(info)
 
     current_price = info.get('currentPrice')
     if not current_price or pd.isna(current_price) or current_price <= 0:
@@ -2944,15 +3829,26 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     trailing_eps = info.get('trailingEps')
     book_value = info.get('bookValue')
 
-    # Detect currency to format description strings
-    currency = info.get("currency", "USD") if info else "USD"
-    sym = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
+    # Determine trading currency vs financial reporting currency and live/historical FX
+    raw_trade_curr = info.get("_trade_currency") or info.get("currency", "USD") if info else "USD"
+    trade_curr = _norm_currency_code(raw_trade_curr)
+    raw_fin_curr = info.get("_financial_currency") or info.get("financialCurrency") or trade_curr if info else trade_curr
+    fin_curr = _norm_currency_code(raw_fin_curr)
+
+    fx_fin_to_trade, fx_series = get_fx_data(fin_curr, trade_curr)
+    if not fx_fin_to_trade or fx_fin_to_trade <= 0:
+        fx_fin_to_trade = info.get("_fx_fin_to_trade") or 1.0
+    fx_trade_to_fin = 1.0 / fx_fin_to_trade
+
+    price_fin = float(current_price) * fx_trade_to_fin
+    sym = currency_symbol_for(fin_curr)
+    trade_sym = currency_symbol_for(trade_curr)
 
     # --- WACC: Auto compute or use provided discount_rate ---
     rf_rate = 4.5
     if use_wacc and info:
         try:
-            wacc_val, beta_val, coe_val = _compute_wacc(info, risk_free_rate=rf_rate)
+            wacc_val, beta_val, coe_val = _compute_wacc(info, risk_free_rate=rf_rate, fx_fin_to_trade=fx_fin_to_trade)
             discount_rate_used = wacc_val
         except Exception:
             discount_rate_used = discount_rate
@@ -2965,7 +3861,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
 
     dr = discount_rate_used  # short alias
 
-    # --- Differentiated per-model growth rates ---
+    # --- Differentiated per-model growth rates (all statement figures in fin_curr) ---
     base_growth_val = growth_rate if (growth_rate is not None and not pd.isna(growth_rate)) else 10.0
     derived = _derive_growth_rates(info, df_fin, base_growth_val, df_cf=df_cf)
     eps_g = derived['eps_g']
@@ -2983,7 +3879,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     tg    = clamp_g(terminal_growth, 0.0, 5.0)
     tg_20 = 4.0  # standard 4% terminal growth for 20-year DCF models (years 11-20)
 
-    # --- Shared base data ---
+    # --- Shared base data (strictly in fin_curr) ---
     total_revenue = info.get('totalRevenue')
     if (total_revenue is None or pd.isna(total_revenue)) and df_fin is not None and not df_fin.empty:
         rev_col = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
@@ -2991,33 +3887,43 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         if rev_col and not df_fin[rev_col].dropna().empty:
             total_revenue = df_fin[rev_col].dropna().iloc[-1]
     if total_revenue is None or pd.isna(total_revenue) or total_revenue <= 0:
-        total_revenue = (current_price * shares_out) / 3.0
+        total_revenue = (price_fin * shares_out) / 3.0
     current_rev_per_share = total_revenue / shares_out
 
-    # --- EPS Without NRI (Normalized Income per share) ---
+    # Convert trailing_eps into fin_curr when needed
+    trailing_eps_fin = None
+    if trailing_eps is not None and not pd.isna(trailing_eps) and trailing_eps > 0:
+        eps_curr = _norm_currency_code(info.get("_trailing_eps_currency") or trade_curr)
+        if eps_curr == fin_curr:
+            trailing_eps_fin = float(trailing_eps)
+        elif eps_curr == trade_curr:
+            trailing_eps_fin = float(trailing_eps) * fx_trade_to_fin
+        else:
+            r_eps_fx, _ = get_fx_data(eps_curr, fin_curr)
+            trailing_eps_fin = float(trailing_eps) * (r_eps_fx if r_eps_fx > 0 else 1.0)
+
+    # --- EPS Without NRI (Normalized Income per share in fin_curr) ---
     eps_no_nri = None
     if df_fin is not None and not df_fin.empty and 'Normalized Income' in df_fin.columns:
         norm_s = df_fin['Normalized Income'].dropna()
         if not norm_s.empty and norm_s.iloc[-1] > 0:
             latest_norm_eps = norm_s.iloc[-1] / shares_out
-            # If trailing_eps is available and higher (due to newer TTM quarters), blend/take max
-            if trailing_eps and not pd.isna(trailing_eps) and trailing_eps > 0:
-                eps_no_nri = max(latest_norm_eps, trailing_eps)
+            if trailing_eps_fin is not None and trailing_eps_fin > 0:
+                eps_no_nri = max(latest_norm_eps, trailing_eps_fin)
             else:
                 eps_no_nri = latest_norm_eps
 
     if eps_no_nri is None or pd.isna(eps_no_nri) or eps_no_nri <= 0:
-        if trailing_eps and not pd.isna(trailing_eps) and trailing_eps > 0:
-            eps_no_nri = trailing_eps
+        if trailing_eps_fin is not None and trailing_eps_fin > 0:
+            eps_no_nri = trailing_eps_fin
         else:
             net_income = info.get('netIncomeToCommon') or info.get('netIncome')
             if net_income and net_income > 0:
                 eps_no_nri = net_income / shares_out
             else:
-                eps_no_nri = current_price / 15.0
+                eps_no_nri = price_fin / 15.0
 
-    # --- Operating Cash Flow (OCF) & Free Cash Flow (FCF) ---
-    # Prefer actual statement Free Cash Flow / Operating Cash Flow over Yahoo's levered info.freeCashflow
+    # --- Operating Cash Flow (OCF) & Free Cash Flow (FCF) in fin_curr ---
     ocf = None
     if df_cf is not None and not df_cf.empty:
         for c_name in ['Operating Cash Flow', 'Cash Flow From Continuing Operating Activities']:
@@ -3054,19 +3960,21 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     ocf_per_share = ocf / shares_out
     fcf_per_share = fcf / shares_out
 
-    # --- Book Value Per Share ---
-    bv = book_value if (book_value and not pd.isna(book_value) and book_value > 0) else None
-    if (bv is None or bv <= 0) and df_bs is not None and not df_bs.empty:
+    # --- Book Value Per Share in fin_curr (always prefer Balance Sheet Equity / Shares) ---
+    bv = None
+    if df_bs is not None and not df_bs.empty:
         for eq_col in ['Stockholders Equity', 'Common Stock Equity', 'Total Equity Gross Minority Interest']:
             if eq_col in df_bs.columns and not df_bs[eq_col].dropna().empty:
                 eq_val = df_bs[eq_col].dropna().iloc[-1]
                 if eq_val > 0:
                     bv = eq_val / shares_out
                     break
+    if (bv is None or pd.isna(bv) or bv <= 0) and book_value and not pd.isna(book_value) and book_value > 0:
+        bv = float(book_value) * fx_trade_to_fin
     if bv is None or pd.isna(bv) or bv <= 0:
-        bv = current_price / 3.0
+        bv = price_fin / 3.0
 
-    # --- Net Cash / Debt Per Share ---
+    # --- Net Cash / Debt Per Share in fin_curr ---
     total_debt = info.get('totalDebt', 0) or 0
     total_cash = info.get('totalCash', 0) or 0
     if pd.isna(total_debt): total_debt = 0
@@ -3085,7 +3993,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         pv_10_growth = sum(x ** k for k in range(1, 11))
         pv_10_term = (x ** 10) * sum(y ** k for k in range(1, 11))
         pv_total = base_ps * (pv_10_growth + pv_10_term)
-        return max(pv_total + net_cash_per_share, pv_total * 0.5, current_price * 0.05)
+        return max(pv_total + net_cash_per_share, pv_total * 0.5, price_fin * 0.05)
 
     # =========================================================
     # MODEL 1: Discounted Cash Flow 20-year (DCF-20)
@@ -3163,6 +4071,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
 
     # =========================================================
     # Historical Multiples Calculation (Mean PS, Mean PE Without NRI, Mean PB)
+    # Historical closing prices are converted to fin_curr using historical FX rates.
     # =========================================================
     ps_hist_list = []
     pe_hist_list = []
@@ -3171,10 +4080,30 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     if df_fin is not None and not df_fin.empty and history is not None and not history.empty:
         rev_col_h = 'Total Revenue' if 'Total Revenue' in df_fin.columns else (
             'Operating Revenue' if 'Operating Revenue' in df_fin.columns else None)
+
+        close_fin_series = pd.Series(dtype=float)
+        try:
+            h_close = pd.to_numeric(history['Close'], errors='coerce').dropna()
+            try:
+                h_idx_naive = pd.to_datetime(h_close.index).tz_localize(None).normalize()
+            except Exception:
+                h_idx_naive = pd.to_datetime(h_close.index).normalize()
+            h_close_naive = pd.Series(h_close.values, index=h_idx_naive)
+            if fin_curr == trade_curr:
+                close_fin_series = h_close_naive
+            elif fx_series is not None and not fx_series.empty:
+                fx_aligned = fx_series.reindex(h_idx_naive.union(fx_series.index)).sort_index().ffill().bfill().reindex(h_idx_naive)
+                fx_aligned = fx_aligned.where(fx_aligned > 0, fx_fin_to_trade)
+                close_fin_series = h_close_naive / fx_aligned
+            else:
+                close_fin_series = h_close_naive * fx_trade_to_fin
+        except Exception:
+            close_fin_series = pd.Series(dtype=float)
+
         for yr in df_fin.index:
             try:
                 yr_int = int(yr)
-                yr_prices = history[history.index.year == yr_int]['Close'].dropna()
+                yr_prices = close_fin_series[close_fin_series.index.year == yr_int].dropna()
                 if yr_prices.empty:
                     continue
                 avg_p_yr = float(yr_prices.mean())
@@ -3186,7 +4115,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
                 if pd.isna(sh_yr) or sh_yr <= 0:
                     sh_yr = shares_out
 
-                # Historical P/S
+                # Historical P/S (both price and revenue in fin_curr)
                 if rev_col_h:
                     r_yr = row_fin.get(rev_col_h, 0)
                     if r_yr and not pd.isna(r_yr) and r_yr > 0:
@@ -3194,7 +4123,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
                         if 0.1 <= ps_yr <= 60.0:
                             ps_hist_list.append(ps_yr)
 
-                # Historical P/E Without NRI
+                # Historical P/E Without NRI (both price and earnings in fin_curr)
                 ni_yr = row_fin.get('Normalized Income', row_fin.get('Net Income', 0))
                 if ni_yr and not pd.isna(ni_yr) and ni_yr > 0:
                     eps_yr = ni_yr / sh_yr
@@ -3203,7 +4132,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
                         if 3.0 <= pe_yr <= 85.0:
                             pe_hist_list.append(pe_yr)
 
-                # Historical P/B
+                # Historical P/B (both price and book value in fin_curr)
                 if df_bs is not None and not df_bs.empty and yr in df_bs.index:
                     row_bs = df_bs.loc[yr]
                     eq_yr = None
@@ -3223,9 +4152,9 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     # =========================================================
     # MODEL 5: Mean Price to Sales (PS) Ratio
     # =========================================================
-    curr_ps = info.get('priceToSalesTrailing12Months')
+    curr_ps = (price_fin / current_rev_per_share) if (fin_curr != trade_curr and current_rev_per_share > 0) else info.get('priceToSalesTrailing12Months')
     if curr_ps is None or pd.isna(curr_ps) or curr_ps <= 0:
-        curr_ps = (current_price / current_rev_per_share) if current_rev_per_share > 0 else 3.0
+        curr_ps = (price_fin / current_rev_per_share) if current_rev_per_share > 0 else 3.0
     if ps_hist_list:
         mean_ps = sum(ps_hist_list) / len(ps_hist_list)
     else:
@@ -3251,7 +4180,7 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     elif avg_pe and not pd.isna(avg_pe) and avg_pe > 0:
         mean_pe_no_nri = min(max(avg_pe, 8.0), 45.0)
     else:
-        t_pe = info.get('trailingPE') or 18.0
+        t_pe = (price_fin / eps_no_nri) if (fin_curr != trade_curr and eps_no_nri > 0) else (info.get('trailingPE') or 18.0)
         mean_pe_no_nri = min(max(t_pe, 8.0), 45.0)
 
     intrinsic_mean_pe = eps_no_nri * mean_pe_no_nri
@@ -3269,9 +4198,9 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     # =========================================================
     # MODEL 7: Mean Price to Book (PB) Ratio
     # =========================================================
-    curr_pb = info.get('priceToBook')
+    curr_pb = (price_fin / bv) if (fin_curr != trade_curr and bv > 0) else info.get('priceToBook')
     if curr_pb is None or pd.isna(curr_pb) or curr_pb <= 0:
-        curr_pb = (current_price / bv) if bv > 0 else 3.0
+        curr_pb = (price_fin / bv) if bv > 0 else 3.0
     if pb_hist_list:
         mean_pb = sum(pb_hist_list) / len(pb_hist_list)
     else:
@@ -3333,6 +4262,21 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         'description': f"EPS Without NRI ({sym}{eps_no_nri:.2f}) × Fair P/E ({fair_pe_from_peg:.1f}x at Fair PEG = 1.0 and {eps_g_peg:.1f}% EPS growth)."
     }
 
+    # Convert all 9 model outputs from financial currency (fin_curr) to trading currency (trade_curr)
+    for m_name, m_val in valuations.items():
+        iv_fin = float(m_val['intrinsic_value'])
+        fv_fin = float(m_val['future_price_5y'])
+        m_val['intrinsic_value_fin'] = iv_fin
+        m_val['future_price_fin'] = fv_fin
+        m_val['intrinsic_value'] = iv_fin * fx_fin_to_trade
+        m_val['future_price_5y'] = fv_fin * fx_fin_to_trade
+        m_val['future_price'] = fv_fin * fx_fin_to_trade
+        if fin_curr != trade_curr:
+            m_val['description'] += (
+                f" [Native {fin_curr}: IV {sym}{iv_fin:,.2f}, {years}Y {sym}{fv_fin:,.2f}"
+                f" → {trade_curr} {trade_sym}{m_val['intrinsic_value']:,.2f} @ {fx_fin_to_trade:.4f}]"
+            )
+
     # Store metadata for UI use
     valuations['_meta'] = {
         'wacc': dr,
@@ -3345,6 +4289,11 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
         'fcf_growth': fcf_g,
         'ocf_growth': ocf_g,
         'years': years,
+        'trade_currency': trade_curr,
+        'fin_currency': fin_curr,
+        'trade_symbol': trade_sym,
+        'fin_symbol': sym,
+        'fx_fin_to_trade': fx_fin_to_trade,
     }
 
     return valuations
@@ -3362,7 +4311,7 @@ def create_valuation_chart(valuations, current_price, years=5):
     names = list(models.keys())
     intrinsic_values = [v['intrinsic_value'] for v in models.values()]
     avg_intrinsic = sum(intrinsic_values) / len(intrinsic_values)
-    sym = cs()
+    sym = meta.get('trade_symbol') or cs()
     is_he = (st.session_state.get("language", "en") == "he")
 
     # Color-code each of the 9 bars like the reference Valuation Chart:
@@ -3469,6 +4418,7 @@ def create_future_valuation_chart(valuations, current_price, years=5):
     if not valuations:
         return None
 
+    meta = valuations.get('_meta', {})
     models = {k: v for k, v in valuations.items() if k != '_meta'}
     if not models:
         return None
@@ -3476,7 +4426,7 @@ def create_future_valuation_chart(valuations, current_price, years=5):
     names = list(models.keys())
     future_values = [v.get('future_price_5y', v.get('future_price', 0)) for v in models.values()]
     avg_future = sum(future_values) / len(future_values)
-    sym = cs()
+    sym = meta.get('trade_symbol') or cs()
     is_he = (st.session_state.get("language", "en") == "he")
 
     # Color-code each of the 9 bars based on 5-year target vs current price:
@@ -4206,9 +5156,26 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
     if "Depositary" in raw_name or " ADR" in raw_name or " ADS" in raw_name:
         return None
 
+    sc_trade_curr = _norm_currency_code(meta_info.get("currency") or yf_info.get("currency") or "USD")
+    sc_fin_curr = _norm_currency_code(yf_info.get("financialCurrency") or meta_info.get("financialCurrency") or sc_trade_curr or "USD")
+    sc_fin_fx = float(get_fx_data(sc_fin_curr, "USD")[0] or 1.0) if (sc_fin_curr and sc_fin_curr != "USD") else 1.0
+    sc_trade_fx = float(get_fx_data(sc_trade_curr, "USD")[0] or 1.0) if (sc_trade_curr and sc_trade_curr != "USD") else 1.0
+    if sc_fin_fx <= 0:
+        sc_fin_fx = 1.0
+    if sc_trade_fx <= 0:
+        sc_trade_fx = 1.0
+
+    def _ex_usd(keys):
+        vals = _extract_ts_series(ts_df, keys)
+        return [v * sc_fin_fx for v in vals] if sc_fin_fx != 1.0 else vals
+
+    def _yf_fin_usd(key):
+        v = _safe_float(yf_info.get(key))
+        return (v * sc_fin_fx) if v is not None else None
+
     # ── 1. Total Revenue ────────────────────────────────────────────────────
-    rev_vals = _extract_ts_series(ts_df, ["TotalRevenue"])
-    total_revenue = rev_vals[-1] if rev_vals else _safe_float(yf_info.get("totalRevenue"))
+    rev_vals = _ex_usd(["TotalRevenue"])
+    total_revenue = rev_vals[-1] if rev_vals else _yf_fin_usd("totalRevenue")
     revenue_growth = _calc_yoy_growth(rev_vals)
     if revenue_growth is None:
         revenue_growth = _safe_metric(yf_info, "revenueGrowth")
@@ -4219,11 +5186,11 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
         return None
 
     # ── 2. Cost of Revenue & 3. Gross Profit ────────────────────────────────
-    cost_vals = _extract_ts_series(ts_df, ["CostOfRevenue", "ReconciledCostOfRevenue"])
-    gp_vals = _extract_ts_series(ts_df, ["GrossProfit"])
+    cost_vals = _ex_usd(["CostOfRevenue", "ReconciledCostOfRevenue"])
+    gp_vals = _ex_usd(["GrossProfit"])
 
     cost_of_revenue = cost_vals[-1] if cost_vals else None
-    gross_profit = gp_vals[-1] if gp_vals else _safe_float(yf_info.get("grossProfits"))
+    gross_profit = gp_vals[-1] if gp_vals else _yf_fin_usd("grossProfits")
 
     if gross_profit is None and total_revenue is not None and cost_of_revenue is not None:
         gross_profit = total_revenue - cost_of_revenue
@@ -4250,11 +5217,11 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
         cost_efficiency_change = round(curr_cr - prev_cr, 2)  # negative = cost ratio improved!
 
     # ── 4. Operating Income & 5. Net Income ─────────────────────────────────
-    op_vals = _extract_ts_series(ts_df, ["OperatingIncome", "TotalOperatingIncomeAsReported", "EBIT"])
-    ni_vals = _extract_ts_series(ts_df, ["NetIncome", "NetIncomeCommonStockholders"])
+    op_vals = _ex_usd(["OperatingIncome", "TotalOperatingIncomeAsReported", "EBIT"])
+    ni_vals = _ex_usd(["NetIncome", "NetIncomeCommonStockholders"])
 
     operating_income = op_vals[-1] if op_vals else None
-    net_income = ni_vals[-1] if ni_vals else _safe_float(yf_info.get("netIncomeToCommon"))
+    net_income = ni_vals[-1] if ni_vals else _yf_fin_usd("netIncomeToCommon")
 
     op_income_growth = _calc_yoy_growth(op_vals)
     earnings_growth = _calc_yoy_growth(ni_vals)
@@ -4277,8 +5244,9 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
     profit_margins = round(sum(pm_parts) / len(pm_parts), 2) if pm_parts else None
 
     # ── 7. Diluted EPS ──────────────────────────────────────────────────────
-    eps_vals = _extract_ts_series(ts_df, ["DilutedEPS", "BasicEPS"])
-    diluted_eps = eps_vals[-1] if eps_vals else _safe_float(yf_info.get("trailingEps"))
+    eps_vals = _ex_usd(["DilutedEPS", "BasicEPS"])
+    _yf_eps_usd = _safe_float(yf_info.get("trailingEps"))
+    diluted_eps = eps_vals[-1] if eps_vals else ((_yf_eps_usd * sc_trade_fx) if _yf_eps_usd is not None else None)
     eps_growth = _calc_yoy_growth(eps_vals)
     if eps_growth is None:
         eps_growth = earnings_growth
@@ -4298,12 +5266,12 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
         buyback_score = round(0.5 * freq_score + 0.5 * rate_score, 1)
 
     # ── 9. Free Cash Flow & 10. Operating Cash Flow ─────────────────────────
-    fcf_vals = _extract_ts_series(ts_df, ["FreeCashFlow"])
-    ocf_vals = _extract_ts_series(ts_df, ["OperatingCashFlow"])
-    capex_vals = _extract_ts_series(ts_df, ["CapitalExpenditure"])
+    fcf_vals = _ex_usd(["FreeCashFlow"])
+    ocf_vals = _ex_usd(["OperatingCashFlow"])
+    capex_vals = _ex_usd(["CapitalExpenditure"])
 
-    operating_cash_flow = ocf_vals[-1] if ocf_vals else _safe_float(yf_info.get("operatingCashflow"))
-    free_cash_flow = fcf_vals[-1] if fcf_vals else _safe_float(yf_info.get("freeCashflow"))
+    operating_cash_flow = ocf_vals[-1] if ocf_vals else _yf_fin_usd("operatingCashflow")
+    free_cash_flow = fcf_vals[-1] if fcf_vals else _yf_fin_usd("freeCashflow")
     if free_cash_flow is None and operating_cash_flow is not None and capex_vals:
         free_cash_flow = operating_cash_flow - abs(capex_vals[-1])
 
@@ -4317,12 +5285,12 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
     fcf_growth_score = fcf_consistency
 
     # ── 11. Total Assets & 12. Total Liabilities ────────────────────────────
-    assets_vals = _extract_ts_series(ts_df, ["TotalAssets"])
-    liab_vals = _extract_ts_series(ts_df, ["TotalLiabilitiesNetMinorityInterest"])
-    eq_vals = _extract_ts_series(ts_df, ["StockholdersEquity", "CommonStockEquity"])
+    assets_vals = _ex_usd(["TotalAssets"])
+    liab_vals = _ex_usd(["TotalLiabilitiesNetMinorityInterest"])
+    eq_vals = _ex_usd(["StockholdersEquity", "CommonStockEquity"])
 
-    total_assets = assets_vals[-1] if assets_vals else _safe_float(yf_info.get("totalAssets"))
-    total_liabilities = liab_vals[-1] if liab_vals else _safe_float(yf_info.get("totalLiab"))
+    total_assets = assets_vals[-1] if assets_vals else _yf_fin_usd("totalAssets")
+    total_liabilities = liab_vals[-1] if liab_vals else _yf_fin_usd("totalLiab")
     stockholders_equity = eq_vals[-1] if eq_vals else (
         (total_assets - total_liabilities) if (total_assets is not None and total_liabilities is not None) else None
     )
@@ -4336,11 +5304,11 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
         balance_ratio = round(total_assets / total_liabilities, 2)
 
     # ── 13. Total Debt & 14. Cash on Hand ───────────────────────────────────
-    debt_vals = _extract_ts_series(ts_df, ["TotalDebt", "LongTermDebt"])
-    cash_vals = _extract_ts_series(ts_df, ["CashCashEquivalentsAndShortTermInvestments", "CashAndCashEquivalents"])
+    debt_vals = _ex_usd(["TotalDebt", "LongTermDebt"])
+    cash_vals = _ex_usd(["CashCashEquivalentsAndShortTermInvestments", "CashAndCashEquivalents"])
 
-    total_debt = debt_vals[-1] if debt_vals else (_safe_float(yf_info.get("totalDebt")) or 0.0)
-    total_cash = cash_vals[-1] if cash_vals else (_safe_float(yf_info.get("totalCash")) or 0.0)
+    total_debt = debt_vals[-1] if debt_vals else (_yf_fin_usd("totalDebt") or 0.0)
+    total_cash = cash_vals[-1] if cash_vals else (_yf_fin_usd("totalCash") or 0.0)
     net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else None
 
     cash_to_debt = None
@@ -4433,8 +5401,12 @@ def score_single_stock_from_ts(sym: str, ts_df: pd.DataFrame, meta_info: dict = 
         lr = liab_to_assets_pct if liab_to_assets_pct is not None else 55.0
         leverage_composite = round(0.55 * dr + 0.45 * lr, 2)  # lower is better
 
-    price = meta_info.get("current_price") or _safe_float(yf_info.get("currentPrice")) or _safe_float(yf_info.get("regularMarketPrice")) or 0.0
-    mcap = meta_info.get("market_cap") or _safe_float(yf_info.get("marketCap")) or 0.0
+    _p_meta = _safe_float(meta_info.get("current_price"))
+    _p_yf = _safe_float(yf_info.get("currentPrice")) or _safe_float(yf_info.get("regularMarketPrice"))
+    price = _p_meta if (_p_meta and sc_trade_curr == "USD") else ((_p_meta or _p_yf or 0.0) * sc_trade_fx)
+    _mc_meta = _safe_float(meta_info.get("market_cap"))
+    _mc_yf = _safe_float(yf_info.get("marketCap"))
+    mcap = _mc_meta if (_mc_meta and sc_trade_curr == "USD") else ((_mc_meta or _mc_yf or 0.0) * sc_trade_fx)
 
     return {
         "ticker":                 sym,
@@ -4779,14 +5751,17 @@ if st.session_state.page_selector == "Dashboard":
         with st.spinner(tr("pulling_data").format(ticker=ticker_input)):
             df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q, history, info = fetch_financial_data(ticker_input)
             if info:
-                currency = info.get("currency", "USD")
-                st.session_state.currency_symbol = "₪" if currency in ["ILA", "ILS"] else ("£" if currency in ["GBp", "GBP"] else ("€" if currency == "EUR" else "$"))
+                currency = info.get("_trade_currency") or info.get("currency", "USD")
+                st.session_state.currency_symbol = currency_symbol_for(currency)
 
             if history is not None and not history.empty:
                 # --- Precompute Valuation & Financial Metrics (True 10-Year Historical Series) ---
-                shares_out = info.get('sharesOutstanding', 1)
-                if not shares_out or pd.isna(shares_out) or shares_out <= 0:
-                    shares_out = 1
+                shares_out = _get_effective_shares(info)
+                trade_curr = _norm_currency_code(info.get("_trade_currency") or info.get("currency", "USD")) if info else "USD"
+                fin_curr = _norm_currency_code(info.get("_financial_currency") or info.get("financialCurrency") or trade_curr) if info else trade_curr
+                fx_fin_to_trade, fx_series = get_fx_data(fin_curr, trade_curr)
+                if not fx_fin_to_trade or fx_fin_to_trade <= 0:
+                    fx_fin_to_trade = (info.get("_fx_fin_to_trade") if info else None) or 1.0
 
                 h_idx_naive = pd.to_datetime(history.index).tz_localize(None)
 
@@ -4856,6 +5831,15 @@ if st.session_state.page_selector == "Dashboard":
 
                     if not combined_eps_pts.empty:
                         eps_daily = combined_eps_pts.reindex(h_idx_naive.union(combined_eps_pts.index)).sort_index().ffill().bfill().reindex(h_idx_naive)
+                        # Convert statement EPS from fin_curr to trade_curr before comparing with price or TTM trailing_eps
+                        if fin_curr != trade_curr:
+                            if fx_series is not None and not fx_series.empty:
+                                h_dates_norm = pd.to_datetime(h_idx_naive).normalize()
+                                fx_daily = fx_series.reindex(h_dates_norm.union(fx_series.index)).sort_index().ffill().bfill().reindex(h_dates_norm)
+                                fx_daily = fx_daily.where(fx_daily > 0, fx_fin_to_trade)
+                                eps_daily = pd.Series(eps_daily.values * fx_daily.values, index=h_idx_naive)
+                            else:
+                                eps_daily = eps_daily * fx_fin_to_trade
                         if trailing_eps and not pd.isna(trailing_eps) and trailing_eps != 0:
                             eps_daily.loc[h_idx_naive > combined_eps_pts.index[-1]] = float(trailing_eps)
                         eps_daily.index = history.index
@@ -5234,6 +6218,11 @@ if st.session_state.page_selector == "Dashboard":
                     df_fin = (df_fin_q.tail(max_slice) if df_fin_q is not None and not df_fin_q.empty else df_fin_q) if is_quarterly else (df_fin_a.tail(max_slice) if df_fin_a is not None and not df_fin_a.empty else df_fin_a)
                     df_bs = (df_bs_q.tail(max_slice) if df_bs_q is not None and not df_bs_q.empty else df_bs_q) if is_quarterly else (df_bs_a.tail(max_slice) if df_bs_a is not None and not df_bs_a.empty else df_bs_a)
                     df_cf = (df_cf_q.tail(max_slice) if df_cf_q is not None and not df_cf_q.empty else df_cf_q) if is_quarterly else (df_cf_a.tail(max_slice) if df_cf_a is not None and not df_cf_a.empty else df_cf_a)
+                    _tab2_fin_curr = _norm_currency_code(info.get("_financial_currency") or info.get("financialCurrency") or "USD")
+                    if _tab2_fin_curr != "USD":
+                        df_fin = _convert_statement_df_to_usd(df_fin, _tab2_fin_curr, is_quarterly=is_quarterly)
+                        df_bs = _convert_statement_df_to_usd(df_bs, _tab2_fin_curr, is_quarterly=is_quarterly)
+                        df_cf = _convert_statement_df_to_usd(df_cf, _tab2_fin_curr, is_quarterly=is_quarterly)
                     change_label = tr("qoq_change") if is_quarterly else tr("yoy_change")
                     x_label = tr("quarter") if is_quarterly else tr("year")
                     time_prefix = tr("timeframe_quarterly").split()[0] if is_quarterly else tr("timeframe_annual").split()[0]
@@ -5254,11 +6243,24 @@ if st.session_state.page_selector == "Dashboard":
                                 if st.session_state.language == "en"
                                 else f"מציג {n_periods} שנים ({_yr_min} – {_yr_max} | נבחרו {selected_years_tab2} שנים אחורה)"
                             )
+                        if _tab2_fin_curr != "USD":
+                            _rep_curr_note = (
+                                f" &nbsp;|&nbsp; Reported in <strong style='color:#f0b90b;'>{_tab2_fin_curr}</strong> → Converted to <strong style='color:#60a5fa;'>USD ($)</strong>"
+                                if st.session_state.language == "en"
+                                else f" &nbsp;|&nbsp; מטבע דוחות מקור: <strong style='color:#f0b90b;'>{_tab2_fin_curr}</strong> ← מומר ל-<strong style='color:#60a5fa;'>USD ($)</strong>"
+                            )
+                        else:
+                            _rep_curr_note = (
+                                f" &nbsp;|&nbsp; Reporting Currency: <strong style='color:#60a5fa;'>USD ($)</strong>"
+                                if st.session_state.language == "en"
+                                else f" &nbsp;|&nbsp; מטבע דוחות: <strong style='color:#60a5fa;'>USD ($)</strong>"
+                            )
                         st.markdown(
                             f'<div style="background:#1a2035;border:1px solid #2a2e39;border-left:3px solid #2962ff;'
                             f'border-radius:6px;padding:8px 14px;margin-bottom:12px;font-size:12px;color:#848e9c;">'
                             f'📅 <strong style="color:#d1d4dc;">{coverage_note}</strong> &#x2014; '
-                            f'{"Source: SEC EDGAR (10-K / 10-Q) & Yahoo Finance" if st.session_state.language == "en" else "מקור: דוחות SEC EDGAR (10-K / 10-Q) ו-Yahoo Finance"}'
+                            f'{"Source: SEC EDGAR (10-K / 10-Q), Yahoo Finance & International Filings" if st.session_state.language == "en" else "מקור: SEC EDGAR (10-K / 10-Q), Yahoo Finance והשלמת דוחות בינלאומיים"}'
+                            f'{_rep_curr_note}'
                             f'</div>',
                             unsafe_allow_html=True
                         )
@@ -5326,103 +6328,6 @@ if st.session_state.page_selector == "Dashboard":
                             if fig_cor:
                                 col_f4.plotly_chart(fig_cor, use_container_width=True)
 
-                        # ── Dedicated YoY Growth (%) Charts (Revenue Growth % & Profitability Growth %) ──
-                        st.markdown("---")
-                        _is_he_g = (st.session_state.language == "he")
-                        st.subheader(
-                            "📊 צמיחת הכנסות וצמיחת רווחיות באחוזים (YoY Growth %)"
-                            if _is_he_g
-                            else "📊 Revenue Growth (%) & Profitability Growth (%) — YoY"
-                        )
-
-                        _g_col1, _g_col2, _g_col3 = st.columns([1.2, 1.2, 1.6])
-                        with _g_col1:
-                            _g_chart_type = st.selectbox(
-                                "Chart Type / תצוגה" if _is_he_g else "Chart Type",
-                                options=["Quarterly (רבעוני)" if _is_he_g else "Quarterly", "Annual (שנתי)" if _is_he_g else "Annual"],
-                                index=0,
-                                key="yoy_growth_chart_type"
-                            )
-                        with _g_col2:
-                            _g_view_mode = st.selectbox(
-                                "View / חישוב צמיחה" if _is_he_g else "View",
-                                options=["YOY Growth (מול שנה שעברה)" if _is_he_g else "YOY Growth", "QoQ / Period Growth (מול תקופה קודמת)" if _is_he_g else "QoQ / Period Growth"],
-                                index=0,
-                                key="yoy_growth_view_mode"
-                            )
-                        with _g_col3:
-                            _prof_default_idx = 0 if earnings_choice == "Net Income (Bottom Line)" else 1
-                            _g_prof_metric = st.selectbox(
-                                "מדד רווחיות (Profitability Metric)" if _is_he_g else "Profitability Metric",
-                                options=[
-                                    "Net Income (רווח נקי)" if _is_he_g else "Net Income",
-                                    "Operating Income / EBIT (רווח תפעולי)" if _is_he_g else "Operating Income / EBIT",
-                                    "Gross Profit (רווח גולמי)" if _is_he_g else "Gross Profit",
-                                ],
-                                index=_prof_default_idx,
-                                key="yoy_growth_prof_metric"
-                            )
-
-                        _g_is_q = "Quarterly" in _g_chart_type or "רבעוני" in _g_chart_type
-                        _g_mode = "yoy" if "YOY" in _g_view_mode else "qoq"
-                        _g_df_full = df_fin_q if _g_is_q else df_fin_a
-                        _g_max_periods = (selected_years_tab2 * 4) if _g_is_q else selected_years_tab2
-                        _g_mode_lbl = "YOY Growth" if _g_mode == "yoy" else ("QoQ Growth" if _g_is_q else "YoY Growth")
-                        _g_tf_lbl = ("רבעוני" if _g_is_q else "שנתי") if _is_he_g else ("Quarterly" if _g_is_q else "Annual")
-
-                        if _g_df_full is not None and not _g_df_full.empty:
-                            # 1. Revenue Growth (%) Bar Chart
-                            _g_rev_col = "Total Revenue" if "Total Revenue" in _g_df_full.columns else ("Operating Revenue" if "Operating Revenue" in _g_df_full.columns else None)
-                            if _g_rev_col:
-                                _rev_g_title = (
-                                    f"🟥 צמיחת הכנסות באחוזים — Total Revenues ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
-                                    if _is_he_g
-                                    else f"🟥 Total Revenues — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
-                                )
-                                fig_rev_yoy = create_yoy_growth_bar_chart(
-                                    _g_df_full,
-                                    _g_rev_col,
-                                    _rev_g_title,
-                                    is_quarterly=_g_is_q,
-                                    max_periods=_g_max_periods,
-                                    bar_color="#f24e4e",
-                                    neg_color="#991b1b",
-                                    growth_mode=_g_mode,
-                                )
-                                if fig_rev_yoy:
-                                    st.plotly_chart(fig_rev_yoy, use_container_width=True)
-
-                            # 2. Profitability Growth (%) Bar Chart
-                            if "Net Income" in _g_prof_metric:
-                                _g_prof_col = "Net Income" if "Net Income" in _g_df_full.columns else None
-                                _prof_lbl = "רווח נקי (Net Income)" if _is_he_g else "Net Income"
-                            elif "Operating" in _g_prof_metric:
-                                _g_prof_col = "Operating Income" if "Operating Income" in _g_df_full.columns else ("EBIT" if "EBIT" in _g_df_full.columns else None)
-                                _prof_lbl = "רווח תפעולי (Operating Income)" if _is_he_g else "Operating Income / EBIT"
-                            else:
-                                _g_prof_col = "Gross Profit" if "Gross Profit" in _g_df_full.columns else None
-                                _prof_lbl = "רווח גולמי (Gross Profit)" if _is_he_g else "Gross Profit"
-
-                            if _g_prof_col:
-                                _prof_g_title = (
-                                    f"🟥 צמיחת רווחיות באחוזים — {_prof_lbl} ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
-                                    if _is_he_g
-                                    else f"🟥 Profitability Growth ({_prof_lbl}) — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
-                                )
-                                fig_prof_yoy = create_yoy_growth_bar_chart(
-                                    _g_df_full,
-                                    _g_prof_col,
-                                    _prof_g_title,
-                                    is_quarterly=_g_is_q,
-                                    max_periods=_g_max_periods,
-                                    bar_color="#f24e4e",
-                                    neg_color="#991b1b",
-                                    growth_mode=_g_mode,
-                                )
-                                if fig_prof_yoy:
-                                    st.plotly_chart(fig_prof_yoy, use_container_width=True)
-
-                        st.markdown("---")
                         # --- Margin Charts (Gross + Net/Op side by side) ---
                         col_mg1, col_mg2 = st.columns(2)
 
@@ -5927,6 +6832,11 @@ if st.session_state.page_selector == "Dashboard":
                         is_he_tab4 = (st.session_state.get("language", "en") == "he")
 
                         # WACC / model assumptions info box
+                        _val_fin_curr = val_meta.get('fin_currency', 'USD') if val_meta else 'USD'
+                        _val_trade_curr = val_meta.get('trade_currency', 'USD') if val_meta else 'USD'
+                        _val_fin_sym = val_meta.get('fin_symbol', cs()) if val_meta else cs()
+                        _val_trade_sym = val_meta.get('trade_symbol', cs()) if val_meta else cs()
+                        _val_fx = val_meta.get('fx_fin_to_trade', 1.0) if val_meta else 1.0
                         if val_meta:
                             wacc_val = val_meta.get('wacc', discount_rate)
                             beta_val = val_meta.get('beta', 1.1)
@@ -5945,15 +6855,30 @@ if st.session_state.page_selector == "Dashboard":
                                 f"Terminal Growth: **{tg_val:.1f}%** | "
                                 f"Models: **{len(val_models)}**"
                             )
+                            if _val_fin_curr != _val_trade_curr:
+                                _iv_fin_list = [v.get('intrinsic_value_fin', v['intrinsic_value']) for v in val_models.values()]
+                                _avg_iv_fin = sum(_iv_fin_list) / len(_iv_fin_list)
+                                if is_he_tab4:
+                                    st.success(
+                                        f"💱 **המרת מטבע אוטומטית:** הדוחות הכספיים מדווחים ב-**{_val_fin_curr}** ← "
+                                        f"כל 9 הערכות השווי חושבו ב-**{_val_fin_curr}** (ממוצע: **{_val_fin_sym}{_avg_iv_fin:,.2f}**) "
+                                        f"והומרו ל-**{_val_trade_curr}** לפי שער `1 {_val_fin_curr} = {_val_fx:.4f} {_val_trade_curr}` → **{_val_trade_sym}{simple_iv:,.2f}**"
+                                    )
+                                else:
+                                    st.success(
+                                        f"💱 **Currency Conversion:** Financial statements reported in **{_val_fin_curr}** → "
+                                        f"all 9 models calculated in **{_val_fin_curr}** (avg: **{_val_fin_sym}{_avg_iv_fin:,.2f}**) "
+                                        f"and converted to **{_val_trade_curr}** at `1 {_val_fin_curr} = {_val_fx:.4f} {_val_trade_curr}` → **{_val_trade_sym}{simple_iv:,.2f}**"
+                                    )
 
                         # Main consensus metrics
                         upside_5y_pct = ((simple_fp - current_price) / current_price) * 100 if current_price > 0 else 0.0
                         mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
                         site_val_lbl = "💎 הערכת שווי היום (ממוצע)" if is_he_tab4 else "💎 Site Valuation™ (Today)"
-                        mc1.metric(site_val_lbl, f"{cs()}{simple_iv:,.2f}", f"{upside_pct:+.1f}%")
+                        mc1.metric(site_val_lbl, f"{_val_trade_sym}{simple_iv:,.2f}", f"{upside_pct:+.1f}%")
                         target_5y_lbl = f"🚀 יעד לעוד {val_years} שנים (ממוצע)" if is_he_tab4 else f"🚀 {val_years}-Year Target (Avg)"
-                        mc2.metric(target_5y_lbl, f"{cs()}{simple_fp:,.2f}", f"{upside_5y_pct:+.1f}%")
-                        mc3.metric(tr("current_market_price"), f"{cs()}{current_price:,.2f}")
+                        mc2.metric(target_5y_lbl, f"{_val_trade_sym}{simple_fp:,.2f}", f"{upside_5y_pct:+.1f}%")
+                        mc3.metric(tr("current_market_price"), f"{_val_trade_sym}{current_price:,.2f}")
                         if simple_iv > current_price:
                             mc4.metric(tr("consensus_margin_safety"), f"{margin_of_safety:.2f}%", "▲ " + tr("undervalued"))
                         else:
@@ -5983,7 +6908,7 @@ if st.session_state.page_selector == "Dashboard":
                                 base_fcf_ps = [v['intrinsic_value'] for k, v in val_models.items() if 'DFCF-Terminal' in k]
                                 base_fcf_ps = base_fcf_ps[0] if base_fcf_ps else simple_iv
 
-                                # Recompute DCF for each scenario
+                                # Recompute DCF for each scenario (convert FCF from fin_curr to trade_curr)
                                 fcf_real = None
                                 if df_cf_a is not None and not df_cf_a.empty and 'Free Cash Flow' in df_cf_a.columns:
                                     fcf_s_sens = df_cf_a['Free Cash Flow'].dropna()
@@ -5991,8 +6916,8 @@ if st.session_state.page_selector == "Dashboard":
                                         fcf_real = fcf_s_sens.iloc[-1]
                                 if not fcf_real:
                                     fcf_real = info.get('freeCashflow') or 0
-                                s_out = info.get('sharesOutstanding', 1) or 1
-                                fcf_ps_base = fcf_real / s_out if fcf_real > 0 else (simple_iv * 0.05)
+                                s_out = _get_effective_shares(info)
+                                fcf_ps_base = (fcf_real * _val_fx / s_out) if (fcf_real and fcf_real > 0) else (simple_iv * 0.05)
 
                                 sens_rows = []
                                 for dg in growth_scenarios:
@@ -6006,7 +6931,7 @@ if st.session_state.page_selector == "Dashboard":
                                         fcf_n = fcf_ps_base * ((1 + g) ** val_years)
                                         tv = fcf_n * (1 + tg_s) / (w - tg_s)
                                         iv_s = pv + tv / ((1 + w) ** val_years)
-                                        row[f"WACC {base_wacc + dw:.1f}%"] = f"{cs()}{iv_s:.1f}"
+                                        row[f"WACC {base_wacc + dw:.1f}%"] = f"{_val_trade_sym}{iv_s:.1f}"
                                     sens_rows.append(row)
 
                                 sens_df = pd.DataFrame(sens_rows).set_index('Growth Rate')
@@ -6022,23 +6947,26 @@ if st.session_state.page_selector == "Dashboard":
                                 iv = val_data['intrinsic_value']
                                 upside_iv = ((iv - current_price) / current_price * 100) if current_price > 0 else 0
                                 verdict = "✅" if iv >= current_price else "❌"
-                                model_rows.append({
-                                    "Model": name,
-                                    "Intrinsic Value": f"{cs()}{iv:,.2f}",
-                                    "Upside IV": f"{'▲' if upside_iv >= 0 else '▼'}{abs(upside_iv):.1f}%",
-                                    f"{val_years}Y Target": f"{cs()}{fv:,.2f}",
-                                    "Verdict": verdict,
-                                })
+                                row_dict = {"Model": name}
+                                if _val_fin_curr != _val_trade_curr:
+                                    row_dict[f"Native ({_val_fin_curr})"] = f"{_val_fin_sym}{val_data.get('intrinsic_value_fin', iv):,.2f}"
+                                row_dict[f"Intrinsic ({_val_trade_curr})" if _val_fin_curr != _val_trade_curr else "Intrinsic Value"] = f"{_val_trade_sym}{iv:,.2f}"
+                                row_dict["Upside IV"] = f"{'▲' if upside_iv >= 0 else '▼'}{abs(upside_iv):.1f}%"
+                                row_dict[f"{val_years}Y Target"] = f"{_val_trade_sym}{fv:,.2f}"
+                                row_dict["Verdict"] = verdict
+                                model_rows.append(row_dict)
                             # Add Average (Site Valuation) summary row
                             avg_upside_iv = ((simple_iv - current_price) / current_price * 100) if current_price > 0 else 0
                             avg_row_name = "⭐ הערכת שווי של האתר (ממוצע)" if is_he_tab4 else "⭐ Site Valuation™ (Average)"
-                            model_rows.append({
-                                "Model": avg_row_name,
-                                "Intrinsic Value": f"{cs()}{simple_iv:,.2f}",
-                                "Upside IV": f"{'▲' if avg_upside_iv >= 0 else '▼'}{abs(avg_upside_iv):.1f}%",
-                                f"{val_years}Y Target": f"{cs()}{simple_fp:,.2f}",
-                                "Verdict": "✅" if simple_iv >= current_price else "❌",
-                            })
+                            avg_row = {"Model": avg_row_name}
+                            if _val_fin_curr != _val_trade_curr:
+                                _avg_iv_fin_tbl = sum(v.get('intrinsic_value_fin', v['intrinsic_value']) for v in val_models.values()) / len(val_models)
+                                avg_row[f"Native ({_val_fin_curr})"] = f"{_val_fin_sym}{_avg_iv_fin_tbl:,.2f}"
+                            avg_row[f"Intrinsic ({_val_trade_curr})" if _val_fin_curr != _val_trade_curr else "Intrinsic Value"] = f"{_val_trade_sym}{simple_iv:,.2f}"
+                            avg_row["Upside IV"] = f"{'▲' if avg_upside_iv >= 0 else '▼'}{abs(avg_upside_iv):.1f}%"
+                            avg_row[f"{val_years}Y Target"] = f"{_val_trade_sym}{simple_fp:,.2f}"
+                            avg_row["Verdict"] = "✅" if simple_iv >= current_price else "❌"
+                            model_rows.append(avg_row)
                             st.dataframe(pd.DataFrame(model_rows).set_index("Model"), use_container_width=True)
 
                             st.markdown("---")
@@ -6051,9 +6979,9 @@ if st.session_state.page_selector == "Dashboard":
                                     upside = ((iv - current_price) / current_price * 100) if current_price > 0 else 0
                                     model_cagr = (((fv / current_price) ** (1 / val_years) - 1) * 100) if (current_price > 0 and fv > 0) else 0.0
                                     st.markdown(f"**Method:** {desc_translated}")
-                                    st.markdown(f"**{val_years}-Year Target:** `{cs()}{fv:.2f}`")
+                                    st.markdown(f"**{val_years}-Year Target:** `{_val_trade_sym}{fv:.2f}`")
                                     st.markdown(f"**CAGR:** `{model_cagr:.1f}%`")
-                                    st.markdown(f"**Intrinsic Value (PV):** `{cs()}{iv:.2f}` ({'▲ Undervalued' if upside >= 0 else '▼ Overvalued'} {abs(upside):.1f}%)")
+                                    st.markdown(f"**Intrinsic Value (PV):** `{_val_trade_sym}{iv:.2f}` ({'▲ Undervalued' if upside >= 0 else '▼ Overvalued'} {abs(upside):.1f}%)")
 
                     elif current_price and current_price > 0:
                         st.warning(tr("minimum_models_warning").format(num_models=len(val_models)))
@@ -6148,10 +7076,23 @@ if st.session_state.page_selector == "Dashboard":
                                     # --- OVERRIDE WITH LIVE TTM DATA IF LATEST YEAR IS SELECTED (To Match Tab 4 perfectly) ---
                                     is_latest_year = (selected_year == available_years[0])
 
+                                    tm_trade_curr = _norm_currency_code(info.get("_trade_currency") or info.get("currency", "USD"))
+                                    tm_fin_curr = _norm_currency_code(info.get("_financial_currency") or info.get("financialCurrency") or tm_trade_curr)
+                                    tm_fx_fin_to_trade, tm_fx_series = get_fx_data(tm_fin_curr, tm_trade_curr)
+                                    if not tm_fx_fin_to_trade or tm_fx_fin_to_trade <= 0:
+                                        tm_fx_fin_to_trade = info.get("_fx_fin_to_trade") or 1.0
+                                    tm_fx_hist = tm_fx_fin_to_trade
+                                    if tm_fx_series is not None and not tm_fx_series.empty:
+                                        _fx_yr = tm_fx_series[tm_fx_series.index.year <= selected_year]
+                                        if not _fx_yr.empty and float(_fx_yr.iloc[-1]) > 0:
+                                            tm_fx_hist = float(_fx_yr.iloc[-1])
+                                    hist_price_fin = float(hist_price) / (tm_fx_hist if tm_fx_hist > 0 else 1.0)
+
                                     if is_latest_year:
                                         hist_shares = shares_out
                                         ttm_eps = info.get('trailingEps')
-                                        if ttm_eps: hist_eps = ttm_eps
+                                        if ttm_eps:
+                                            hist_eps = float(ttm_eps) / (tm_fx_fin_to_trade if tm_fx_fin_to_trade > 0 else 1.0)
 
                                         ttm_rev = info.get('totalRevenue')
                                         if ttm_rev and shares_out > 0:
@@ -6161,12 +7102,12 @@ if st.session_state.page_selector == "Dashboard":
                                         if ttm_fcf and shares_out > 0:
                                             hist_fcf_per_share = ttm_fcf / shares_out
 
-                                    hist_pe = (hist_price / hist_eps) if hist_eps > 0 else 15.0
-                                    hist_ps = (hist_price / hist_rev_per_share) if hist_rev_per_share > 0 else 3.0
-                                    hist_pfcf = (hist_price / hist_fcf_per_share) if hist_fcf_per_share > 0 else 15.0
+                                    hist_pe = (hist_price_fin / hist_eps) if hist_eps > 0 else 15.0
+                                    hist_ps = (hist_price_fin / hist_rev_per_share) if hist_rev_per_share > 0 else 3.0
+                                    hist_pfcf = (hist_price_fin / hist_fcf_per_share) if hist_fcf_per_share > 0 else 15.0
 
                                     default_exit_pe = min(max(avg_pe if is_latest_year else hist_pe, 10.0), 25.0)
-                                    target_ps_info = info.get('priceToSalesTrailing12Months', 3.0)
+                                    target_ps_info = hist_ps if tm_fin_curr != tm_trade_curr else info.get('priceToSalesTrailing12Months', 3.0)
                                     default_exit_ps = min(max(target_ps_info if is_latest_year else hist_ps, 0.5), 10.0)
                                     
                                     target_fcf_info = info.get('priceToFreeCashflow')
@@ -6183,6 +7124,11 @@ if st.session_state.page_selector == "Dashboard":
                                         if rg_info is not None: def_rev_g = rg_info * 100
 
                                     st.markdown("---")
+                                    if tm_fin_curr != tm_trade_curr:
+                                        st.caption(
+                                            f"💱 Base starting metrics are in company reporting currency ({tm_fin_curr}); "
+                                            f"valuation results are converted to {tm_trade_curr} ({cs()})."
+                                        )
                                     st.markdown(f"**{tr('base_starting_metrics')}**")
                                     col_m1, col_m2, col_m3 = st.columns(3)
                                     user_eps = col_m1.number_input(tr("base_eps"), value=float(hist_eps), step=0.1,
@@ -6219,9 +7165,11 @@ if st.session_state.page_selector == "Dashboard":
                                         hist_info = info.copy()
                                         # Override only the editable base metrics while keeping original multiples and ratios.
                                         hist_info['sharesOutstanding'] = hist_shares
+                                        hist_info['impliedSharesOutstanding'] = hist_shares
                                         hist_info['currentPrice'] = hist_price
                                         hist_info['trailingEps'] = user_eps
-                                        # Derive total revenue and free cash flow from per‑share values provided by the user.
+                                        hist_info['_trailing_eps_currency'] = tm_fin_curr
+                                        # Derive total revenue and free cash flow from per-share values provided by the user.
                                         hist_info['totalRevenue'] = user_rev_ps * hist_shares
                                         hist_info['freeCashflow'] = user_fcf_ps * hist_shares
                                         # Growth rates are taken from the editable fields.
@@ -6241,7 +7189,7 @@ if st.session_state.page_selector == "Dashboard":
 
                                         hist_equity = hist_bs.get('Stockholders Equity', hist_bs.get('Total Assets', 0) - hist_bs.get('Total Liabilities Net Minority Interest', 0))
                                         if pd.isna(hist_equity) or hist_equity <= 0:
-                                            hist_equity = hist_shares * (hist_price / 3.0)
+                                            hist_equity = hist_shares * (hist_price_fin / 3.0)
 
                                         hist_bv = hist_equity / hist_shares
                                         hist_roe = (hist_fin.get('Net Income', 0) / hist_equity) if hist_equity > 0 else 0.12
@@ -6257,7 +7205,14 @@ if st.session_state.page_selector == "Dashboard":
 
                                         hist_info = {
                                             'sharesOutstanding': hist_shares,
+                                            'impliedSharesOutstanding': hist_shares,
                                             'currentPrice': hist_price,
+                                            'currency': tm_trade_curr,
+                                            'financialCurrency': tm_fin_curr,
+                                            '_trade_currency': tm_trade_curr,
+                                            '_financial_currency': tm_fin_curr,
+                                            '_fx_fin_to_trade': tm_fx_hist,
+                                            '_trailing_eps_currency': tm_fin_curr,
                                             'trailingEps': user_eps,
                                             'totalRevenue': user_rev_ps * hist_shares,
                                             'freeCashflow': user_fcf_ps * hist_shares,
@@ -6914,7 +7869,7 @@ if st.session_state.page_selector == "Dashboard":
                 # TAB 9: FINANCIAL PROJECTIONS
                 # ==========================================
                 with tab9:
-                    render_financial_forecasting_tab(df_fin_a)
+                    render_financial_forecasting_tab(df_fin_a, fin_curr=fin_curr)
                     render_manual_valuation_calculator(info, df_fin_a, ticker_input)
 
             else:
@@ -6994,8 +7949,18 @@ elif st.session_state.page_selector == "Compare":
             add_comparison_row("Current Price", info1.get('currentPrice'), info2.get('currentPrice'), "currency")
             
             mc1 = info1.get('marketCap')
+            _mc1_curr = _norm_currency_code(info1.get("_trade_currency") or info1.get("currency", "USD"))
+            if mc1 and _mc1_curr != "USD":
+                _fx_mc1, _ = get_fx_data(_mc1_curr, "USD")
+                if _fx_mc1 and _fx_mc1 > 0:
+                    mc1 = float(mc1) * float(_fx_mc1)
             mc1 = (mc1 / 1e9) if mc1 else None
             mc2 = info2.get('marketCap')
+            _mc2_curr = _norm_currency_code(info2.get("_trade_currency") or info2.get("currency", "USD"))
+            if mc2 and _mc2_curr != "USD":
+                _fx_mc2, _ = get_fx_data(_mc2_curr, "USD")
+                if _fx_mc2 and _fx_mc2 > 0:
+                    mc2 = float(mc2) * float(_fx_mc2)
             mc2 = (mc2 / 1e9) if mc2 else None
             add_comparison_row("Market Cap (Billion USD)", mc1, mc2, "x")
             
@@ -7047,19 +8012,26 @@ elif st.session_state.page_selector == "Compare":
             st.markdown("---")
             st.subheader(get_label("Financial Statements Comparison"))
 
+            _cmp_fc1 = _norm_currency_code(info1.get("_financial_currency") or info1.get("financialCurrency") or "USD")
+            _cmp_fc2 = _norm_currency_code(info2.get("_financial_currency") or info2.get("financialCurrency") or "USD")
+            df_fin1_usd = _convert_statement_df_to_usd(df_fin1, _cmp_fc1, is_quarterly=False) if _cmp_fc1 != "USD" else df_fin1
+            df_fin2_usd = _convert_statement_df_to_usd(df_fin2, _cmp_fc2, is_quarterly=False) if _cmp_fc2 != "USD" else df_fin2
+            df_cf1_usd = _convert_statement_df_to_usd(df_cf1, _cmp_fc1, is_quarterly=False) if _cmp_fc1 != "USD" else df_cf1
+            df_cf2_usd = _convert_statement_df_to_usd(df_cf2, _cmp_fc2, is_quarterly=False) if _cmp_fc2 != "USD" else df_cf2
+
             # 1. Revenue Comparison
             st.write(f"##### {get_label('Annual Revenue')}")
-            rev_col1 = 'Total Revenue' if (df_fin1 is not None and not df_fin1.empty and 'Total Revenue' in df_fin1.columns) else (
-                'Operating Revenue' if (df_fin1 is not None and not df_fin1.empty and 'Operating Revenue' in df_fin1.columns) else None)
-            rev_col2 = 'Total Revenue' if (df_fin2 is not None and not df_fin2.empty and 'Total Revenue' in df_fin2.columns) else (
-                'Operating Revenue' if (df_fin2 is not None and not df_fin2.empty and 'Operating Revenue' in df_fin2.columns) else None)
+            rev_col1 = 'Total Revenue' if (df_fin1_usd is not None and not df_fin1_usd.empty and 'Total Revenue' in df_fin1_usd.columns) else (
+                'Operating Revenue' if (df_fin1_usd is not None and not df_fin1_usd.empty and 'Operating Revenue' in df_fin1_usd.columns) else None)
+            rev_col2 = 'Total Revenue' if (df_fin2_usd is not None and not df_fin2_usd.empty and 'Total Revenue' in df_fin2_usd.columns) else (
+                'Operating Revenue' if (df_fin2_usd is not None and not df_fin2_usd.empty and 'Operating Revenue' in df_fin2_usd.columns) else None)
             
             fig_rev = go.Figure()
-            if rev_col1 and not df_fin1[rev_col1].dropna().empty:
-                s1 = df_fin1[rev_col1] / 1e9
+            if rev_col1 and not df_fin1_usd[rev_col1].dropna().empty:
+                s1 = df_fin1_usd[rev_col1] / 1e9
                 fig_rev.add_trace(go.Bar(x=s1.index, y=s1, name=f"{t1} - {tr('revenue')}", marker_color='#3182CE'))
-            if rev_col2 and not df_fin2[rev_col2].dropna().empty:
-                s2 = df_fin2[rev_col2] / 1e9
+            if rev_col2 and not df_fin2_usd[rev_col2].dropna().empty:
+                s2 = df_fin2_usd[rev_col2] / 1e9
                 fig_rev.add_trace(go.Bar(x=s2.index, y=s2, name=f"{t2} - {tr('revenue')}", marker_color='#DD6B20'))
             fig_rev.update_layout(
                 barmode='group',
@@ -7072,15 +8044,15 @@ elif st.session_state.page_selector == "Compare":
 
             # 2. Net Income Comparison
             st.write(f"##### {get_label('Annual Net Income')}")
-            ni_col1 = 'Net Income' if (df_fin1 is not None and not df_fin1.empty and 'Net Income' in df_fin1.columns) else None
-            ni_col2 = 'Net Income' if (df_fin2 is not None and not df_fin2.empty and 'Net Income' in df_fin2.columns) else None
+            ni_col1 = 'Net Income' if (df_fin1_usd is not None and not df_fin1_usd.empty and 'Net Income' in df_fin1_usd.columns) else None
+            ni_col2 = 'Net Income' if (df_fin2_usd is not None and not df_fin2_usd.empty and 'Net Income' in df_fin2_usd.columns) else None
             
             fig_ni = go.Figure()
-            if ni_col1 and not df_fin1[ni_col1].dropna().empty:
-                s1 = df_fin1[ni_col1] / 1e9
+            if ni_col1 and not df_fin1_usd[ni_col1].dropna().empty:
+                s1 = df_fin1_usd[ni_col1] / 1e9
                 fig_ni.add_trace(go.Bar(x=s1.index, y=s1, name=f"{t1} - {tr('net_income_bottom_line')}", marker_color='#3182CE'))
-            if ni_col2 and not df_fin2[ni_col2].dropna().empty:
-                s2 = df_fin2[ni_col2] / 1e9
+            if ni_col2 and not df_fin2_usd[ni_col2].dropna().empty:
+                s2 = df_fin2_usd[ni_col2] / 1e9
                 fig_ni.add_trace(go.Bar(x=s2.index, y=s2, name=f"{t2} - {tr('net_income_bottom_line')}", marker_color='#DD6B20'))
             fig_ni.update_layout(
                 barmode='group',
@@ -7093,15 +8065,15 @@ elif st.session_state.page_selector == "Compare":
 
             # 3. Free Cash Flow Comparison
             st.write(f"##### {get_label('Annual Free Cash Flow (FCF)')}")
-            fcf_col1 = 'Free Cash Flow' if (df_cf1 is not None and not df_cf1.empty and 'Free Cash Flow' in df_cf1.columns) else None
-            fcf_col2 = 'Free Cash Flow' if (df_cf2 is not None and not df_cf2.empty and 'Free Cash Flow' in df_cf2.columns) else None
+            fcf_col1 = 'Free Cash Flow' if (df_cf1_usd is not None and not df_cf1_usd.empty and 'Free Cash Flow' in df_cf1_usd.columns) else None
+            fcf_col2 = 'Free Cash Flow' if (df_cf2_usd is not None and not df_cf2_usd.empty and 'Free Cash Flow' in df_cf2_usd.columns) else None
             
             fig_fcf = go.Figure()
-            if fcf_col1 and not df_cf1[fcf_col1].dropna().empty:
-                s1 = df_cf1[fcf_col1] / 1e9
+            if fcf_col1 and not df_cf1_usd[fcf_col1].dropna().empty:
+                s1 = df_cf1_usd[fcf_col1] / 1e9
                 fig_fcf.add_trace(go.Bar(x=s1.index, y=s1, name=f"{t1} - {tr('free_cash_flow')}", marker_color='#3182CE'))
-            if fcf_col2 and not df_cf2[fcf_col2].dropna().empty:
-                s2 = df_cf2[fcf_col2] / 1e9
+            if fcf_col2 and not df_cf2_usd[fcf_col2].dropna().empty:
+                s2 = df_cf2_usd[fcf_col2] / 1e9
                 fig_fcf.add_trace(go.Bar(x=s2.index, y=s2, name=f"{t2} - {tr('free_cash_flow')}", marker_color='#DD6B20'))
             fig_fcf.update_layout(
                 barmode='group',
