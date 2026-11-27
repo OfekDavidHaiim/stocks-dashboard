@@ -3277,8 +3277,123 @@ def get_fx_data(from_curr: str, to_curr: str):
     return 1.0, pd.Series(dtype=float)
 
 
+def _append_partial_year_from_quarters(df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q):
+    """
+    If the company has reported 1-4 quarters for a fiscal year newer than the latest annual
+    filing in `df_fin_a` (e.g., 2026 Q1-Q3 reported so far before the 2026 10-K), synthesize
+    the Year-To-Date (YTD) annual row by summing flow items (Income Statement & Cash Flow)
+    and taking the latest snapshot for point-in-time items (Balance Sheet & Share Counts).
+    Returns (df_fin_a, df_bs_a, df_cf_a, partial_meta_dict_or_None).
+    """
+    try:
+        if df_fin_q is None or df_fin_q.empty:
+            return df_fin_a, df_bs_a, df_cf_a, None
+
+        def _q_year(q_idx):
+            s = str(q_idx).strip()
+            if len(s) >= 4 and s[:4].isdigit():
+                return int(s[:4])
+            return None
+
+        q_years = {}
+        for q_idx in df_fin_q.index:
+            yr = _q_year(q_idx)
+            if yr is not None:
+                q_years.setdefault(yr, []).append(str(q_idx))
+
+        if not q_years:
+            return df_fin_a, df_bs_a, df_cf_a, None
+
+        max_ann_yr = max([int(y) for y in df_fin_a.index if str(y).isdigit()], default=0)
+        newer_years = sorted([yr for yr in q_years.keys() if yr > max_ann_yr])
+        if not newer_years:
+            return df_fin_a, df_bs_a, df_cf_a, None
+
+        partial_meta = None
+        for yr in newer_years:
+            qs = sorted(q_years[yr])
+            if not qs:
+                continue
+
+            # 1. Income Statement YTD: sum flow metrics, latest for share counts
+            sub_fin = df_fin_q.loc[qs]
+            fin_row = {}
+            for col in sub_fin.columns:
+                s = pd.to_numeric(sub_fin[col], errors="coerce").dropna()
+                if s.empty:
+                    continue
+                if "Share" in str(col):
+                    fin_row[col] = float(s.iloc[-1])
+                else:
+                    fin_row[col] = float(s.sum())
+
+            if "Total Revenue" in fin_row and "Cost Of Revenue" in fin_row and "Gross Profit" not in fin_row:
+                fin_row["Gross Profit"] = fin_row["Total Revenue"] - fin_row["Cost Of Revenue"]
+            elif "Total Revenue" in fin_row and "Gross Profit" in fin_row and "Cost Of Revenue" not in fin_row:
+                fin_row["Cost Of Revenue"] = fin_row["Total Revenue"] - fin_row["Gross Profit"]
+
+            if fin_row:
+                if df_fin_a is None or df_fin_a.empty:
+                    df_fin_a = pd.DataFrame([fin_row], index=[yr])
+                else:
+                    df_fin_a = df_fin_a.copy()
+                    for k, v in fin_row.items():
+                        df_fin_a.loc[yr, k] = v
+                    df_fin_a = df_fin_a.sort_index()
+
+            # 2. Cash Flow YTD: sum flow metrics
+            if df_cf_q is not None and not df_cf_q.empty:
+                cf_qs = [q for q in qs if q in df_cf_q.index]
+                if cf_qs:
+                    sub_cf = df_cf_q.loc[cf_qs]
+                    cf_row = {}
+                    for col in sub_cf.columns:
+                        s = pd.to_numeric(sub_cf[col], errors="coerce").dropna()
+                        if not s.empty:
+                            cf_row[col] = float(s.sum())
+                    if "Operating Cash Flow" in cf_row and "Capital Expenditure" in cf_row and "Free Cash Flow" not in cf_row:
+                        cf_row["Free Cash Flow"] = cf_row["Operating Cash Flow"] - abs(cf_row["Capital Expenditure"])
+                    if cf_row:
+                        if df_cf_a is None or df_cf_a.empty:
+                            df_cf_a = pd.DataFrame([cf_row], index=[yr])
+                        else:
+                            df_cf_a = df_cf_a.copy()
+                            for k, v in cf_row.items():
+                                df_cf_a.loc[yr, k] = v
+                            df_cf_a = df_cf_a.sort_index()
+
+            # 3. Balance Sheet YTD: latest reported quarter snapshot (point-in-time)
+            if df_bs_q is not None and not df_bs_q.empty:
+                bs_qs = [q for q in qs if q in df_bs_q.index]
+                if bs_qs:
+                    sub_bs = df_bs_q.loc[bs_qs]
+                    bs_row = {}
+                    for col in sub_bs.columns:
+                        s = pd.to_numeric(sub_bs[col], errors="coerce").dropna()
+                        if not s.empty:
+                            bs_row[col] = float(s.iloc[-1])
+                    if bs_row:
+                        if df_bs_a is None or df_bs_a.empty:
+                            df_bs_a = pd.DataFrame([bs_row], index=[yr])
+                        else:
+                            df_bs_a = df_bs_a.copy()
+                            for k, v in bs_row.items():
+                                df_bs_a.loc[yr, k] = v
+                            df_bs_a = df_bs_a.sort_index()
+
+            partial_meta = {
+                "year": int(yr),
+                "quarters": qs,
+                "n_quarters": len(qs),
+            }
+
+        return df_fin_a, df_bs_a, df_cf_a, partial_meta
+    except Exception:
+        return df_fin_a, df_bs_a, df_cf_a, None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financial_data(ticker_symbol: str, _cache_v: int = 10):
+def fetch_financial_data(ticker_symbol: str, _cache_v: int = 11):
 
     stock = yf.Ticker(ticker_symbol)
 
@@ -3546,6 +3661,13 @@ def fetch_financial_data(ticker_symbol: str, _cache_v: int = 10):
             info.setdefault("currentRatio", ca_v / cl_v)
     except Exception:
         pass
+
+    # ── Synthesize partial/YTD year from reported quarters if current year 10-K is not yet filed ──
+    df_fin_a, df_bs_a, df_cf_a, _partial_meta = _append_partial_year_from_quarters(
+        df_fin_a, df_bs_a, df_cf_a, df_fin_q, df_bs_q, df_cf_q
+    )
+    if _partial_meta:
+        info["_partial_year_meta"] = _partial_meta
 
     info["_raw_currency"] = raw_trade_curr
     info["currency"] = trade_curr
@@ -3821,6 +3943,17 @@ def calculate_valuations(info, df_fin, avg_pe, growth_rate, discount_rate=10.0, 
     """
     valuations = {}
     shares_out = _get_effective_shares(info)
+
+    # Exclude incomplete YTD year (< 4 quarters) from valuation multiples & growth regressions
+    _p_meta = info.get("_partial_year_meta") if info else None
+    if _p_meta and _p_meta.get("n_quarters", 4) < 4:
+        _p_yr = _p_meta.get("year")
+        if df_fin is not None and not df_fin.empty and _p_yr in df_fin.index:
+            df_fin = df_fin[df_fin.index != _p_yr]
+        if df_bs is not None and not df_bs.empty and _p_yr in df_bs.index:
+            df_bs = df_bs[df_bs.index != _p_yr]
+        if df_cf is not None and not df_cf.empty and _p_yr in df_cf.index:
+            df_cf = df_cf[df_cf.index != _p_yr]
 
     current_price = info.get('currentPrice')
     if not current_price or pd.isna(current_price) or current_price <= 0:
@@ -6223,6 +6356,26 @@ if st.session_state.page_selector == "Dashboard":
                         df_fin = _convert_statement_df_to_usd(df_fin, _tab2_fin_curr, is_quarterly=is_quarterly)
                         df_bs = _convert_statement_df_to_usd(df_bs, _tab2_fin_curr, is_quarterly=is_quarterly)
                         df_cf = _convert_statement_df_to_usd(df_cf, _tab2_fin_curr, is_quarterly=is_quarterly)
+                    _p_meta_t2 = info.get("_partial_year_meta") if info else None
+                    _p_ytd_label = None
+                    if not is_quarterly and _p_meta_t2:
+                        _p_yr = _p_meta_t2.get("year")
+                        _p_nq = _p_meta_t2.get("n_quarters", 0)
+                        _p_qs = _p_meta_t2.get("quarters", [])
+                        if _p_yr is not None and _p_nq > 0 and _p_nq < 4:
+                            _p_ytd_label = f"{_p_yr} ({_p_nq}Q YTD)"
+                            for _df_name in ("df_fin", "df_bs", "df_cf"):
+                                _d = locals().get(_df_name)
+                                if _d is not None and not _d.empty and _p_yr in _d.index:
+                                    _d = _d.copy()
+                                    _d.index = [_p_ytd_label if idx == _p_yr else idx for idx in _d.index]
+                                    if _df_name == "df_fin":
+                                        df_fin = _d
+                                    elif _df_name == "df_bs":
+                                        df_bs = _d
+                                    else:
+                                        df_cf = _d
+
                     change_label = tr("qoq_change") if is_quarterly else tr("yoy_change")
                     x_label = tr("quarter") if is_quarterly else tr("year")
                     time_prefix = tr("timeframe_quarterly").split()[0] if is_quarterly else tr("timeframe_annual").split()[0]
@@ -6264,6 +6417,19 @@ if st.session_state.page_selector == "Dashboard":
                             f'</div>',
                             unsafe_allow_html=True
                         )
+                        if _p_ytd_label and _p_meta_t2:
+                            _q_span = f"{_p_meta_t2['quarters'][0]}–{_p_meta_t2['quarters'][-1]}" if len(_p_meta_t2.get('quarters', [])) > 1 else _p_meta_t2['quarters'][0]
+                            _ytd_msg = (
+                                f"📌 <strong>{_p_ytd_label}</strong>: שנת {_p_meta_t2['year']} טרם הסתיימה — מוצגת סכימה מצטברת של <strong>{_p_meta_t2['n_quarters']} רבעונים</strong> שדווחו עד כה ({_q_span}). נתוני מאזן משקפים את הרבעון האחרון שדווח."
+                                if st.session_state.language == "he"
+                                else f"📌 <strong>{_p_ytd_label}</strong>: {_p_meta_t2['year']} is still in progress — showing cumulative sum of <strong>{_p_meta_t2['n_quarters']} reported quarters</strong> so far ({_q_span}). Balance sheet reflects the latest reported quarter."
+                            )
+                            st.markdown(
+                                f'<div style="background:#1f2437;border:1px solid #2a2e39;border-left:3px solid #f0b90b;'
+                                f'border-radius:6px;padding:7px 14px;margin-bottom:12px;font-size:12px;color:#d1d4dc;">'
+                                f'{_ytd_msg}</div>',
+                                unsafe_allow_html=True
+                            )
 
                     if df_fin is not None and not df_fin.empty:
                         earnings_choice = st.radio(
@@ -7006,7 +7172,9 @@ if st.session_state.page_selector == "Dashboard":
                     st.markdown(tr("time_machine_description"))
 
                     if df_fin_a is not None and not df_fin_a.empty:
-                        available_years = sorted(df_fin_a.index.tolist(), reverse=True)
+                        _p_meta_t5 = info.get("_partial_year_meta") if info else None
+                        _p_yr_t5 = _p_meta_t5.get("year") if (_p_meta_t5 and _p_meta_t5.get("n_quarters", 4) < 4) else None
+                        available_years = sorted([y for y in df_fin_a.index.tolist() if y != _p_yr_t5], reverse=True)
                         current_year = pd.Timestamp.now().year
                         valid_years = available_years
 
