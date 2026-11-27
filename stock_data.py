@@ -18,6 +18,18 @@ import requests
 import os
 import json
 
+from advanced_charts import (
+    create_sankey_income_statement,
+    create_yoy_growth_bar_chart,
+    create_valuation_bands_chart,
+    fetch_earnings_surprise_data,
+    create_earnings_surprise_chart,
+)
+from forensic_engine import compute_forensic_analysis, generate_investment_memo_html
+from portfolio_xray import render_portfolio_xray
+from screener_v2 import render_screener_v2_hub
+from market_pulse import render_market_pulse_page
+
 WATCHLISTS_FILE = "watchlists.json"
 
 def load_watchlists():
@@ -5823,6 +5835,7 @@ def run_screener_scan(progress_bar=None, status_text=None, max_workers: int = 20
         "universe_size": len(rows),
         "top_20":        top,
         "by_sector":     by_sector,
+        "all_stocks":    rows,
     }
     try:
         with open(SCREENER_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -5852,8 +5865,9 @@ st.set_page_config(page_title="Comprehensive Stock Dashboard", layout="wide")
 
 # --- Sidebar Navigation ---
 st.sidebar.title(tr("navigation"))
-pages = ["Dashboard", "Compare", "Watchlist", "Portfolio", "Screener"]
+pages = ["Market Pulse", "Dashboard", "Compare", "Watchlist", "Portfolio", "Screener"]
 page_format_func = lambda x: (
+    ("🌐 Market Pulse" if st.session_state.language == "en" else "🌐 דופק השוק (Market Pulse)") if x == "Market Pulse" else
     tr("dashboard") if x == "Dashboard" else
     tr("compare_stocks") if x == "Compare" else
     tr("watchlist") if x == "Watchlist" else
@@ -6113,6 +6127,100 @@ if st.session_state.page_selector == "Dashboard":
                 )
                 st.markdown(_moat_html, unsafe_allow_html=True)
 
+                # --- Forensic Quality, Master Conviction Score (0-100) & Institutional Investment Memo ---
+                try:
+                    forensic = compute_forensic_analysis(
+                        ticker_input, info, df_fin_a, df_bs_a, df_cf_a,
+                        valuations=valuations, moat=moat, lang=st.session_state.language
+                    )
+                    _fm_sc = forensic["master_score"]
+                    _fm_gr = forensic["grade"]
+                    _fm_col = forensic["master_color"]
+                    _fm_verd = forensic["verdict_he"] if is_rtl else forensic["verdict_en"]
+                    _fp = forensic["piotroski"]
+                    _fz = forensic["altman_z"]
+                    _fr = forensic["roic_wacc"]
+                    _z_txt = f"{_fz['score']:.2f}" if _fz["score"] is not None else "N/A"
+                    _roic_txt = f"{_fr['roic']:.1f}%" if _fr["roic"] is not None else "N/A"
+                    _sp_txt = f"{_fr['spread']:+.1f}%" if _fr["spread"] is not None else "N/A"
+
+                    _forensic_hdr_html = (
+                        f'<div style="background:#1c2030;border:1px solid #2a2e39;border-left:4px solid {_fm_col};'
+                        f'padding:16px 20px;border-radius:10px;margin-bottom:14px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;">'
+                        f'<div>'
+                        f'<div style="font-size:11px;color:#848e9c;text-transform:uppercase;font-weight:700;">🚨 {"ציון-על ואיכות פורנזית (Master Conviction Score)" if is_rtl else "Master Conviction Score & Forensic Quality Engine"}</div>'
+                        f'<div style="display:flex;align-items:baseline;gap:12px;margin-top:4px;">'
+                        f'<span style="font-size:38px;font-weight:900;color:{_fm_col};line-height:1;">{_fm_sc}</span>'
+                        f'<span style="font-size:15px;color:#848e9c;font-weight:700;">/100</span>'
+                        f'<span style="background:{_fm_col};color:#fff;font-weight:800;font-size:13px;padding:3px 10px;border-radius:6px;">{_fm_gr} · {_fm_verd}</span>'
+                        f'</div></div>'
+                        f'<div style="display:flex;gap:14px;flex-wrap:wrap;">'
+                        f'<div style="background:#131722;border:1px solid #2a2e39;border-top:2px solid {_fp["color"]};border-radius:8px;padding:8px 14px;text-align:center;min-width:118px;">'
+                        f'<div style="font-size:10px;color:#848e9c;font-weight:700;">PIOTROSKI F-SCORE</div>'
+                        f'<div style="font-size:19px;font-weight:800;color:{_fp["color"]};">{_fp["score"]}/{_fp["applicable"] or 9}</div>'
+                        f'<div style="font-size:9px;color:#848e9c;">{_fp["zone_he"] if is_rtl else _fp["zone_en"]}</div></div>'
+                        f'<div style="background:#131722;border:1px solid #2a2e39;border-top:2px solid {_fz["color"]};border-radius:8px;padding:8px 14px;text-align:center;min-width:118px;">'
+                        f'<div style="font-size:10px;color:#848e9c;font-weight:700;">ALTMAN Z-SCORE</div>'
+                        f'<div style="font-size:19px;font-weight:800;color:{_fz["color"]};">{_z_txt}</div>'
+                        f'<div style="font-size:9px;color:#848e9c;">{_fz["zone_he"] if is_rtl else _fz["zone_en"]}</div></div>'
+                        f'<div style="background:#131722;border:1px solid #2a2e39;border-top:2px solid {_fr["color"]};border-radius:8px;padding:8px 14px;text-align:center;min-width:135px;">'
+                        f'<div style="font-size:10px;color:#848e9c;font-weight:700;">ROIC vs WACC ({_fr["wacc"]:.1f}%)</div>'
+                        f'<div style="font-size:19px;font-weight:800;color:{_fr["color"]};">{_roic_txt} <span style="font-size:12px;">({_sp_txt})</span></div>'
+                        f'<div style="font-size:9px;color:#848e9c;">{_fr["zone_he"] if is_rtl else _fr["zone_en"]}</div></div>'
+                        f'</div></div></div>'
+                    )
+                    st.markdown(_forensic_hdr_html, unsafe_allow_html=True)
+
+                    _f_exp_lbl = (
+                        f"🔬 פירוט איכות פורנזית, דגלים ירוקים/אדומים ({len(forensic['green_flags'])}🟢 / {len(forensic['red_flags'])}🚩) וייצוא דו״ח אנליסט"
+                        if is_rtl
+                        else f"🔬 Forensic Breakdown, Green/Red Flags ({len(forensic['green_flags'])}🟢 / {len(forensic['red_flags'])}🚩) & Export Analyst Memo"
+                    )
+                    with st.expander(_f_exp_lbl, expanded=False):
+                        fc_bull, fc_bear = st.columns(2)
+                        with fc_bull:
+                            st.markdown(f"**{'🟢 דגלים ירוקים ויתרונות (Bull Case)' if is_rtl else '🟢 Green Flags & Strengths (Bull Case)'}**")
+                            if forensic["green_flags"]:
+                                for gf in forensic["green_flags"]:
+                                    st.success(f"✅ {gf}")
+                            else:
+                                st.caption("—" if is_rtl else "No major green flags detected.")
+                        with fc_bear:
+                            st.markdown(f"**{'🔴 דגלים אדומים וסיכונים (Bear Case)' if is_rtl else '🔴 Red Flags & Risks (Bear Case)'}**")
+                            if forensic["red_flags"]:
+                                for rf in forensic["red_flags"]:
+                                    st.error(f"🚩 {rf}")
+                            else:
+                                st.info("לא זוהו דגלים אדומים חריגים!" if is_rtl else "No major red flags detected!")
+
+                        st.markdown("---")
+                        st.markdown(f"**{'📋 צ׳קליסט Piotroski F-Score (9 בדיקות פורנזיות)' if is_rtl else '📋 Piotroski F-Score 9-Point Forensic Checklist'}**")
+                        _p_tbl = pd.DataFrame([
+                            {
+                                ("סטטוס" if is_rtl else "Pass"): ("✅" if c["passed"] is True else ("❌" if c["passed"] is False else "➖")),
+                                ("בדיקה" if is_rtl else "Criterion"): c["name"],
+                                ("נתון" if is_rtl else "Reading"): c["detail"],
+                            }
+                            for c in _fp["checks"]
+                        ])
+                        st.dataframe(_p_tbl, use_container_width=True, hide_index=True)
+
+                        _memo_html = generate_investment_memo_html(
+                            ticker_input, info, forensic, moat, valuations,
+                            currency_sym=cs(), lang=st.session_state.language
+                        )
+                        st.download_button(
+                            label="📄 " + ("הורד דו״ח אנליסט מוסדי (HTML — ניתן להדפיס ל-PDF)" if is_rtl else "Download Institutional Investment Memo (HTML / Print-to-PDF)"),
+                            data=_memo_html.encode("utf-8"),
+                            file_name=f"{ticker_input}_Investment_Memo.html",
+                            mime="text/html",
+                            key=f"btn_dl_memo_{ticker_input}",
+                            use_container_width=True,
+                        )
+                except Exception:
+                    pass
+
 
                 # --- Quick Actions Expander ---
 
@@ -6316,6 +6424,86 @@ if st.session_state.page_selector == "Dashboard":
                     else:
                         col_p2.info(tr("pe_ratio_unavailable"))
 
+                    # ── FEATURE 3A: 10-YEAR HISTORICAL VALUATION PRICE BANDS (FASTGRAPHS / PETER LYNCH) ──
+                    st.markdown("---")
+                    _is_he_t1 = (st.session_state.language == "he")
+                    st.subheader(
+                        "📈 רצועות שווי היסטוריות ל-10 שנים (Valuation Price Bands — FastGraphs)"
+                        if _is_he_t1
+                        else "📈 10-Year Historical Valuation Price Bands (FastGraphs / Peter Lynch)"
+                    )
+                    _band_metric = st.radio(
+                        "בחר מכפיל לרצועות השווי:" if _is_he_t1 else "Select Valuation Band Metric:",
+                        options=["P/E", "P/FCF", "P/S"],
+                        horizontal=True,
+                        key="t1_val_band_metric",
+                    )
+                    fig_bands, band_stats = create_valuation_bands_chart(
+                        history=history,
+                        df_fin_a=df_fin_a, df_fin_q=df_fin_q,
+                        df_cf_a=df_cf_a, df_cf_q=df_cf_q,
+                        hist_shares=hist_shares_series,
+                        info=info,
+                        ticker_symbol=ticker_input,
+                        band_metric=_band_metric,
+                        currency_sym=cs(),
+                        fx_fin_to_trade=fx_fin_to_trade,
+                        fx_series=fx_series,
+                        fin_curr=fin_curr,
+                        trade_curr=trade_curr,
+                        lang=st.session_state.language,
+                    )
+                    if fig_bands and band_stats:
+                        _b_col = band_stats["status_color"]
+                        _b_st = band_stats["status_he"] if _is_he_t1 else band_stats["status_en"]
+                        st.markdown(
+                            f'<div style="background:#1c2030;border:1px solid #2a2e39;border-left:4px solid {_b_col};'
+                            f'border-radius:8px;padding:10px 16px;margin-bottom:12px;font-size:13px;color:#d1d4dc;">'
+                            f'<span style="background:{_b_col};color:#fff;font-weight:800;font-size:11px;padding:3px 9px;border-radius:5px;">{_b_st}</span> &nbsp;|&nbsp; '
+                            f'{"מכפיל נוכחי" if _is_he_t1 else "Current"} {_band_metric}: <b>{band_stats["current_multiple"]:.1f}x</b> &nbsp;|&nbsp; '
+                            f'{"חציון 10 שנים" if _is_he_t1 else "10Y Median"}: <b>{band_stats["median_multiple"]:.1f}x</b> &nbsp;|&nbsp; '
+                            f'{"אחוזון היסטורי" if _is_he_t1 else "10Y Percentile"}: <b>{band_stats["percentile"]:.0f}%</b> &nbsp;|&nbsp; '
+                            f'{"מחיר לפי חציון היסטורי" if _is_he_t1 else "Implied Fair Price @ Median"}: <b>{cs()}{band_stats["fair_price_at_median"]:,.2f}</b>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.plotly_chart(fig_bands, use_container_width=True)
+                    else:
+                        st.info("Not enough positive fundamental history to render Valuation Price Bands for this metric." if not _is_he_t1 else "אין מספיק נתונים חיוביים כדי להציג רצועות שווי עבור מכפיל זה.")
+
+                    # ── FEATURE 3B: EARNINGS SURPRISE & POST-EARNINGS 1-DAY REACTION TRACKER ──
+                    st.markdown("---")
+                    st.subheader(
+                        "🎯 מעקב הפתעות רווחים (Earnings Surprise) ותגובת המניה לאחר דוח"
+                        if _is_he_t1
+                        else "🎯 Earnings Surprise & Post-Earnings Reaction Tracker"
+                    )
+                    df_surp, next_earn = fetch_earnings_surprise_data(ticker_input)
+                    if next_earn.get("date"):
+                        _d_u = next_earn.get("days_until")
+                        _est_s = f" | {'צפי EPS' if _is_he_t1 else 'Consensus EPS'}: <b>{cs()}{next_earn['eps_estimate']:.2f}</b>" if next_earn.get("eps_estimate") is not None else ""
+                        st.markdown(
+                            f'<div style="background:#152038;border:1px solid #2962ff60;border-left:4px solid #2962ff;'
+                            f'border-radius:8px;padding:10px 16px;margin-bottom:12px;font-size:13px;color:#e2e8f0;">'
+                            f'📅 <strong>{"מועד הדוח הרבעוני הבא" if _is_he_t1 else "Next Earnings Date"}:</strong> '
+                            f'<b style="color:#60a5fa;">{next_earn["date"]}</b> '
+                            f'({f"בעוד {_d_u} ימים" if _is_he_t1 else f"in {_d_u} days"}){_est_s}'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                    fig_surp, df_surp_enr, surp_sum = create_earnings_surprise_chart(
+                        df_surp, history, ticker_input, currency_sym=cs(), lang=st.session_state.language
+                    )
+                    if fig_surp and surp_sum:
+                        es1, es2, es3, es4 = st.columns(4)
+                        es1.metric("אחוז עקיפת תחזיות (Beat Rate)" if _is_he_t1 else "Beat Rate", f"{surp_sum['beat_rate']:.0f}%", f"{surp_sum['beats']}/{surp_sum['total']} Qtrs")
+                        es2.metric("הפתעת EPS ממוצעת" if _is_he_t1 else "Avg EPS Surprise", f"{surp_sum['avg_surprise']:+.1f}%")
+                        es3.metric("תגובת מניה ממוצעת (1D)" if _is_he_t1 else "Avg 1D Reaction", f"{surp_sum['avg_post_move']:+.1f}%" if surp_sum.get("avg_post_move") is not None else "N/A")
+                        es4.metric("תנודתיות ממוצעת בדוח (±1D)" if _is_he_t1 else "Avg Earnings Move (±1D)", f"±{surp_sum['avg_abs_move']:.1f}%" if surp_sum.get("avg_abs_move") is not None else "N/A")
+                        st.plotly_chart(fig_surp, use_container_width=True)
+                    else:
+                        st.info("Quarterly earnings surprise history is not available for this ticker." if not _is_he_t1 else "היסטוריית הפתעות EPS רבעוניות אינה זמינה עבור טיקר זה.")
+
                 # ==========================================
                 # TAB 2: FINANCIAL STATEMENTS
                 # ==========================================
@@ -6494,6 +6682,114 @@ if st.session_state.page_selector == "Dashboard":
                             if fig_cor:
                                 col_f4.plotly_chart(fig_cor, use_container_width=True)
 
+                        # ── FEATURE 1: INTERACTIVE SANKEY INCOME STATEMENT (APP ECONOMY INSIGHTS STYLE) ──
+                        st.markdown("---")
+                        _is_he_t2 = (st.session_state.language == "he")
+                        st.subheader(
+                            "🌊 תרשים זרימת הכנסות ורווחים (Sankey Income Statement)"
+                            if _is_he_t2
+                            else "🌊 Interactive Sankey Income Statement (Revenue → Net Income Flow)"
+                        )
+                        _sankey_periods = list(df_fin.index)[::-1]
+                        if _sankey_periods:
+                            _sk_col1, _ = st.columns([1.4, 3])
+                            _sel_sk_p = _sk_col1.selectbox(
+                                "בחר תקופה לתרשים הזרימה (10 שנים / YTD):" if _is_he_t2 else "Select Period for Sankey Flow (10Y / YTD):",
+                                options=_sankey_periods,
+                                index=0,
+                                key=f"sankey_period_{ticker_input}_{'q' if is_quarterly else 'a'}",
+                            )
+                            fig_sankey = create_sankey_income_statement(
+                                df_fin, _sel_sk_p, ticker_symbol=ticker_input, currency_sym="$", lang=st.session_state.language
+                            )
+                            if fig_sankey:
+                                st.plotly_chart(fig_sankey, use_container_width=True)
+
+                        # ── RESTORED QUALTRIM-STYLE YOY GROWTH (%) CHARTS (REVENUE & PROFITABILITY) ──
+                        st.markdown("---")
+                        st.subheader(
+                            "📊 צמיחת הכנסות וצמיחת רווחיות באחוזים (YoY Growth %)"
+                            if _is_he_t2
+                            else "📊 Revenue Growth (%) & Profitability Growth (%) — YoY"
+                        )
+                        _g_col1, _g_col2, _g_col3 = st.columns([1.2, 1.2, 1.6])
+                        with _g_col1:
+                            _g_chart_type = st.selectbox(
+                                "Chart Type / תצוגה" if _is_he_t2 else "Chart Type",
+                                options=["Quarterly (רבעוני)" if _is_he_t2 else "Quarterly", "Annual (שנתי)" if _is_he_t2 else "Annual"],
+                                index=0,
+                                key="yoy_growth_chart_type",
+                            )
+                        with _g_col2:
+                            _g_view_mode = st.selectbox(
+                                "View / חישוב צמיחה" if _is_he_t2 else "View",
+                                options=["YOY Growth (מול שנה שעברה)" if _is_he_t2 else "YOY Growth", "QoQ / Period Growth (מול תקופה קודמת)" if _is_he_t2 else "QoQ / Period Growth"],
+                                index=0,
+                                key="yoy_growth_view_mode",
+                            )
+                        with _g_col3:
+                            _prof_default_idx = 0 if earnings_choice == "Net Income (Bottom Line)" else 1
+                            _g_prof_metric = st.selectbox(
+                                "מדד רווחיות (Profitability Metric)" if _is_he_t2 else "Profitability Metric",
+                                options=[
+                                    "Net Income (רווח נקי)" if _is_he_t2 else "Net Income",
+                                    "Operating Income / EBIT (רווח תפעולי)" if _is_he_t2 else "Operating Income / EBIT",
+                                    "Gross Profit (רווח גולמי)" if _is_he_t2 else "Gross Profit",
+                                ],
+                                index=_prof_default_idx,
+                                key="yoy_growth_prof_metric",
+                            )
+
+                        _g_is_q = "Quarterly" in _g_chart_type or "רבעוני" in _g_chart_type
+                        _g_mode = "yoy" if "YOY" in _g_view_mode else "qoq"
+                        _g_df_full = df_fin_q if _g_is_q else df_fin_a
+                        _g_max_periods = (selected_years_tab2 * 4) if _g_is_q else selected_years_tab2
+                        _g_mode_lbl = "YOY Growth" if _g_mode == "yoy" else ("QoQ Growth" if _g_is_q else "YoY Growth")
+                        _g_tf_lbl = ("רבעוני" if _g_is_q else "שנתי") if _is_he_t2 else ("Quarterly" if _g_is_q else "Annual")
+
+                        if _g_df_full is not None and not _g_df_full.empty:
+                            _g_rev_col = "Total Revenue" if "Total Revenue" in _g_df_full.columns else ("Operating Revenue" if "Operating Revenue" in _g_df_full.columns else None)
+                            if _g_rev_col:
+                                _rev_g_title = (
+                                    f"🟥 צמיחת הכנסות באחוזים — Total Revenues ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
+                                    if _is_he_t2
+                                    else f"🟥 Total Revenues — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
+                                )
+                                fig_rev_yoy = create_yoy_growth_bar_chart(
+                                    _g_df_full, _g_rev_col, _rev_g_title,
+                                    is_quarterly=_g_is_q, max_periods=_g_max_periods,
+                                    bar_color="#f24e4e", neg_color="#991b1b", growth_mode=_g_mode,
+                                    df_q_for_ytd=df_fin_q, partial_meta=_p_meta_t2,
+                                )
+                                if fig_rev_yoy:
+                                    st.plotly_chart(fig_rev_yoy, use_container_width=True)
+
+                            if "Net Income" in _g_prof_metric:
+                                _g_prof_col = "Net Income" if "Net Income" in _g_df_full.columns else None
+                                _prof_lbl = "רווח נקי (Net Income)" if _is_he_t2 else "Net Income"
+                            elif "Operating" in _g_prof_metric:
+                                _g_prof_col = "Operating Income" if "Operating Income" in _g_df_full.columns else ("EBIT" if "EBIT" in _g_df_full.columns else None)
+                                _prof_lbl = "רווח תפעולי (Operating Income)" if _is_he_t2 else "Operating Income / EBIT"
+                            else:
+                                _g_prof_col = "Gross Profit" if "Gross Profit" in _g_df_full.columns else None
+                                _prof_lbl = "רווח גולמי (Gross Profit)" if _is_he_t2 else "Gross Profit"
+
+                            if _g_prof_col:
+                                _prof_g_title = (
+                                    f"🟥 צמיחת רווחיות באחוזים — {_prof_lbl} ({_g_mode_lbl} % | {_g_tf_lbl} · {selected_years_tab2} שנים)"
+                                    if _is_he_t2
+                                    else f"🟥 Profitability Growth ({_prof_lbl}) — {_g_mode_lbl} (%) ({_g_tf_lbl} · {selected_years_tab2} Years)"
+                                )
+                                fig_prof_yoy = create_yoy_growth_bar_chart(
+                                    _g_df_full, _g_prof_col, _prof_g_title,
+                                    is_quarterly=_g_is_q, max_periods=_g_max_periods,
+                                    bar_color="#f24e4e", neg_color="#991b1b", growth_mode=_g_mode,
+                                    df_q_for_ytd=df_fin_q, partial_meta=_p_meta_t2,
+                                )
+                                if fig_prof_yoy:
+                                    st.plotly_chart(fig_prof_yoy, use_container_width=True)
+
+                        st.markdown("---")
                         # --- Margin Charts (Gross + Net/Op side by side) ---
                         col_mg1, col_mg2 = st.columns(2)
 
@@ -9158,6 +9454,18 @@ elif st.session_state.page_selector == "Portfolio":
                             save_portfolio(st.session_state.portfolio_dict)
                             st.rerun()
 
+    # ── FEATURE 2: PORTFOLIO X-RAY & HEDGE-FUND QUANT RISK ENGINE ──
+    if portfolio_data:
+        render_portfolio_xray(
+            portfolio_data=portfolio_data,
+            calculate_stock_metrics_fn=calculate_stock_metrics,
+            fetch_financial_data_fn=fetch_financial_data,
+            calculate_valuations_fn=calculate_valuations,
+            usd_rate=usd_rate,
+            display_currency=st.session_state.display_currency,
+            lang=st.session_state.language,
+        )
+
 
 
 # ==========================================
@@ -9220,6 +9528,10 @@ elif st.session_state.page_selector == "Screener":
         st.warning("No results in cache. Please re-scan.")
         st.stop()
 
+    st.markdown("---")
+
+    # ── FEATURE 4: SCREENER 2.0 (INTERACTIVE FINVIZ HEATMAP, LEGEND PRESETS & BARGAIN HUNTER) ──
+    render_screener_v2_hub(cache, lang=st.session_state.language)
     st.markdown("---")
 
     # ── Shared formatting helpers ──────────────────────────────────────────────
@@ -9524,6 +9836,20 @@ elif st.session_state.page_selector == "Screener":
         | 14 | **יתרת מזומנים (Cash on Hand)** | **5%** | יחס מזומנים לחוב (`Cash / Debt`) ושיעור המזומנים מסך הנכסים |
         | 15 | **יחסי מינוף (Leverage Ratios)** | **6%** | יחס חוב לנכסים (`Debt / Assets %`) והתחייבויות לנכסים (`Liabilities / Assets %`) — **נמוך יותר = ציון גבוה יותר** |
         """)
+
+
+# ==========================================
+# PAGE 6: MARKET PULSE COMMAND CENTER & SMART WATCHLIST ALERTS
+# ==========================================
+elif st.session_state.page_selector == "Market Pulse":
+    render_market_pulse_page(
+        watchlists_dict=st.session_state.get("watchlists", {}),
+        active_watchlist=st.session_state.get("active_watchlist", "Main Watchlist"),
+        fetch_financial_data_fn=fetch_financial_data,
+        calculate_valuations_fn=calculate_valuations,
+        fetch_earnings_fn=fetch_earnings_surprise_data,
+        lang=st.session_state.language,
+    )
 
 
 # --- Execution Wrapper ---
